@@ -38,22 +38,24 @@ pub(super) async fn restore(
     } else {
         Preparation::Unavailable(input)
     };
-    let mut lock = super::output_restore_lock(workspace)?;
-    let _guard = lock.write().map_err(|source| Error::RestoreOutput {
-        path: super::output_restore_lock_path(workspace)
-            .display()
-            .to_string(),
-        source,
-    })?;
-    if super::existing_output_matches_digest(&destination, output.digest) {
-        return Ok(());
-    }
-    match prepared {
-        Preparation::Ready(tree) => tree.publish(&output.rel, &destination),
-        Preparation::Unavailable(input) => {
-            super::restore_prefetched_output(&output.rel, &destination, input)
+    super::commit::run(|| {
+        let mut lock = super::output_restore_lock(workspace)?;
+        let _guard = lock.write().map_err(|source| Error::RestoreOutput {
+            path: super::output_restore_lock_path(workspace)
+                .display()
+                .to_string(),
+            source,
+        })?;
+        if super::existing_output_matches_digest(&destination, output.digest) {
+            return Ok(());
         }
-    }
+        match prepared {
+            Preparation::Ready(tree) => tree.publish(&output.rel, &destination),
+            Preparation::Unavailable(input) => {
+                super::restore_prefetched_output(&output.rel, &destination, input)
+            }
+        }
+    })
 }
 
 #[cfg(test)]

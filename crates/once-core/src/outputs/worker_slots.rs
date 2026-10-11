@@ -43,6 +43,10 @@ impl WorkerSlots {
     pub(super) fn release(&mut self, index: usize) {
         self.available.push(index);
     }
+
+    pub(super) fn retire(&mut self, index: usize) {
+        self.owners[index] = None;
+    }
 }
 
 #[cfg(test)]

@@ -20,7 +20,9 @@ use crate::{Error, OutputSymlinkMode, Result, WorkspacePath};
 
 const RESTORE_PREFETCH_CONCURRENCY: usize = 16;
 
+mod commit;
 mod legacy_hash;
+mod prefetch;
 mod worker_slots;
 use worker_slots::{WorkerSlot, WorkerSlots};
 
@@ -40,7 +42,7 @@ pub(crate) async fn restore(
         return Ok(());
     }
     let staging = std::sync::Arc::new(StagingDir::create(workspace_root)?);
-    let prefetched = prefetch_output_blobs(&outputs, cache, &staging).await?;
+    let prefetched = prefetch::restore(&outputs, cache, &staging).await?;
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     let mut prefetched = prefetched;
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -53,24 +55,24 @@ pub(crate) async fn restore(
         )
         .await;
     }
-    let mut lock = output_restore_lock(workspace_root)?;
-    let _guard = lock.write().map_err(|source| Error::RestoreOutput {
-        path: output_restore_lock_path(workspace_root)
-            .display()
-            .to_string(),
-        source,
-    })?;
-    for output in prefetched {
-        let PrefetchedOutput {
-            rel, digest, blob, ..
-        } = output;
-        let abs = workspace_root.join(&rel);
-        if existing_output_matches_digest(&abs, digest) {
-            continue;
+    commit::run(|| {
+        let mut lock = output_restore_lock(workspace_root)?;
+        let _guard = lock.write().map_err(|source| Error::RestoreOutput {
+            path: output_restore_lock_path(workspace_root)
+                .display()
+                .to_string(),
+            source,
+        })?;
+        for output in prefetched {
+            let PrefetchedOutput { rel, digest, blob } = output;
+            let abs = workspace_root.join(&rel);
+            if existing_output_matches_digest(&abs, digest) {
+                continue;
+            }
+            restore_prefetched_output(&rel, &abs, blob.into_reader()?)?;
         }
-        restore_prefetched_output(&rel, &abs, blob.into_reader()?)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn output_restore_lock(workspace_root: &Path) -> Result<RwLock<std::fs::File>> {
@@ -146,11 +148,11 @@ async fn outputs_needing_restore(
             path: "cached output validation".to_string(),
             source: std::io::Error::other(source.to_string()),
         })?;
-        slots.release(slot);
         if !matches {
             outputs.insert(path, digest);
         }
         if let Some((path, digest)) = pending.pop_front() {
+            slots.release(slot);
             spawn_output_validation(
                 &mut tasks,
                 workspace_root,
@@ -158,6 +160,8 @@ async fn outputs_needing_restore(
                 digest,
                 slots.take().expect("completed validation slot"),
             );
+        } else {
+            slots.retire(slot);
         }
     }
     for (path, digest) in &result.outputs {
@@ -261,77 +265,7 @@ fn existing_output_matches_digest_owned(
         || digest_raw_file(path, &metadata).is_ok_and(|digest| digest == expected)
 }
 
-async fn prefetch_output_blobs(
-    result: &ActionResult,
-    cache: &CacheProvider,
-    staging_dir: &std::sync::Arc<StagingDir>,
-) -> Result<Vec<PrefetchedOutput>> {
-    let mut outputs = result
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(index, (rel, digest))| (index, rel.clone(), *digest))
-        .collect::<VecDeque<_>>();
-    let output_count = outputs.len();
-
-    let mut tasks = JoinSet::new();
-    while tasks.len() < RESTORE_PREFETCH_CONCURRENCY {
-        let Some((index, rel, digest)) = outputs.pop_front() else {
-            break;
-        };
-        spawn_prefetch(&mut tasks, cache.clone(), staging_dir, index, rel, digest);
-    }
-
-    let mut blobs: Vec<Option<PrefetchedOutput>> = (0..output_count).map(|_| None).collect();
-    while let Some(joined) = tasks.join_next().await {
-        let output = joined.map_err(|source| Error::RestoreOutput {
-            path: "cached output prefetch".to_string(),
-            source: std::io::Error::other(source.to_string()),
-        })??;
-        let index = output.index;
-        blobs[index] = Some(output);
-        if let Some((index, rel, digest)) = outputs.pop_front() {
-            spawn_prefetch(&mut tasks, cache.clone(), staging_dir, index, rel, digest);
-        }
-    }
-    blobs
-        .into_iter()
-        .enumerate()
-        .map(|(index, output)| {
-            output.ok_or_else(|| Error::RestoreOutput {
-                path: format!("cached output prefetch[{index}]"),
-                source: std::io::Error::other("prefetch task did not produce an output"),
-            })
-        })
-        .collect()
-}
-
-fn spawn_prefetch(
-    tasks: &mut JoinSet<Result<PrefetchedOutput>>,
-    cache: CacheProvider,
-    staging_dir: &std::sync::Arc<StagingDir>,
-    index: usize,
-    rel: String,
-    digest: Digest,
-) {
-    let staging_dir = std::sync::Arc::clone(staging_dir);
-    let parent = staging_dir.path().to_path_buf();
-    let owner = (staging_dir, crate::resource_scope::current());
-    // The download runs on its own task, so it takes the caller's transfer
-    // observer with it; otherwise the bytes it pulls go unreported.
-    tasks.spawn(once_cas::transfer::propagate(async move {
-        let blob = cache.stage_blob_guarded(&digest, &parent, owner).await?;
-        Ok(PrefetchedOutput {
-            index,
-            rel,
-            digest,
-            blob,
-        })
-    }));
-}
-
 struct PrefetchedOutput {
-    index: usize,
     rel: String,
     digest: Digest,
     blob: once_cas::StagedBlob,
