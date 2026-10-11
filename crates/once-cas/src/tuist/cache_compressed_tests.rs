@@ -224,7 +224,7 @@ async fn a_complete_frame_without_transport_eof_does_not_publish() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guarded_staging_retains_remote_decoder_resources_after_cancellation() {
     struct Guard {
         entered: Option<tokio::sync::oneshot::Sender<()>>,
@@ -277,13 +277,19 @@ async fn guarded_staging_retains_remote_decoder_resources_after_cancellation() {
     .await
     .unwrap();
     task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
     tokio::time::timeout(Duration::from_secs(5), ready)
         .await
         .unwrap()
         .unwrap();
     assert!(resources.try_acquire().is_err());
+    assert_eq!(
+        std::fs::read_dir(cache.local.scratch_dir())
+            .unwrap()
+            .count(),
+        0
+    );
     release.send(()).unwrap();
+    assert!(task.await.unwrap_err().is_cancelled());
     let permit = tokio::time::timeout(Duration::from_secs(5), resources.acquire())
         .await
         .unwrap()
