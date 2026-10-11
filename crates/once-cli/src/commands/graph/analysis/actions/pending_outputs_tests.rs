@@ -234,6 +234,58 @@ async fn arg_file_mutation_restores_its_cached_tree_before_execution() {
 }
 
 #[tokio::test]
+async fn a_parent_input_replacement_keeps_overwritten_child_overlays_pending() {
+    for later_reader in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = CacheProvider::Local(once_cas::Cas::open(cache_root.path()));
+        std::fs::create_dir(workspace.path().join("seed")).unwrap();
+        std::fs::write(workspace.path().join("seed/item.txt"), b"parent bytes").unwrap();
+        let tree: DeclaredAction = serde_json::from_value(serde_json::json!({
+            "inputs": ["seed"], "outputs": ["tree"], "identifier": "tree",
+            "operation": {"kind": "copy_path", "sources": ["seed"], "destination": "tree", "mode": "tree"}
+        })).unwrap();
+        let overlay = write("tree/item.txt", b"overlay bytes", true);
+        let prefix = vec![tree, overlay];
+        run(workspace.path(), &cache, prefix.clone()).await;
+        std::fs::remove_dir_all(workspace.path().join("tree")).unwrap();
+        let mut actions = prefix;
+        actions.push(serde_json::from_value(serde_json::json!({
+            "inputs": ["tree"], "outputs": ["copy"], "identifier": "copy",
+            "depends_on_prior_actions": false,
+            "operation": {"kind": "copy_path", "sources": ["tree"], "destination": "copy", "mode": "tree"}
+        })).unwrap());
+        if later_reader {
+            actions.push(copy("tree/item.txt", "read.txt", true));
+        }
+        let outcome = run(workspace.path(), &cache, actions).await;
+        assert_eq!(
+            std::fs::read(workspace.path().join("copy/item.txt")).unwrap(),
+            b"parent bytes"
+        );
+        if later_reader {
+            assert_eq!(
+                std::fs::read(workspace.path().join("read.txt")).unwrap(),
+                b"overlay bytes"
+            );
+        } else {
+            assert!(!outcome.available_inputs["tree/item.txt"].materialized);
+            assert!(outcome
+                .cached_results
+                .iter()
+                .any(|result| { result.outputs.contains_key("tree/item.txt") }));
+        }
+        materialize_prior_cached_results(workspace.path(), &cache, &outcome.cached_results, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(workspace.path().join("tree/item.txt")).unwrap(),
+            b"overlay bytes"
+        );
+    }
+}
+
+#[tokio::test]
 async fn miss_overwriting_cached_output_cannot_be_replaced_by_late_replay() {
     let workspace = tempfile::tempdir().unwrap();
     let cache_root = tempfile::tempdir().unwrap();

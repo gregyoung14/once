@@ -42,6 +42,7 @@ mod partial_cache_benchmarks;
 #[cfg(all(test, unix))]
 mod pending_admission_tests;
 mod pending_outputs;
+mod preparation;
 mod runner;
 mod scheduling;
 
@@ -1163,33 +1164,7 @@ async fn execute_declared_admitted(
     action: &Action,
     declared: &DeclaredAction,
 ) -> Result<(once_core::Outcome, pending_outputs::Restoration)> {
-    let restored_outputs = pending_outputs::restore(
-        context.workspace,
-        context.cache,
-        &context
-            .prior_cached_results
-            .all()
-            .cloned()
-            .collect::<Vec<_>>(),
-        context.available_inputs,
-        declared,
-        context.source_digest_cache,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "materializing prerequisites for action {} for {} ({})",
-            context.index, context.target_id, context.identifier
-        )
-    })?;
-    prepare_declared_command_paths(context.workspace, declared)
-        .await
-        .with_context(|| {
-            format!(
-                "preparing action {} for {} ({})",
-                context.index, context.target_id, context.identifier
-            )
-        })?;
+    let restored_outputs = preparation::restore(context, declared).await?;
     let result = match context.output_observer {
         Some(observer) => {
             once_core::run_uncached_observed(
@@ -1321,20 +1296,7 @@ async fn run_uncacheable_admitted(
     declared: &DeclaredAction,
 ) -> Result<DeclaredActionOutcome> {
     let action_digest = action.digest();
-    let restored_outputs = pending_outputs::restore(
-        context.workspace,
-        context.cache,
-        &context
-            .prior_cached_results
-            .all()
-            .cloned()
-            .collect::<Vec<_>>(),
-        context.available_inputs,
-        declared,
-        context.source_digest_cache,
-    )
-    .await?;
-    prepare_declared_command_paths(context.workspace, declared).await?;
+    let restored_outputs = preparation::restore(&context, declared).await?;
     let result = run_uncached_action(
         &action,
         context.workspace,

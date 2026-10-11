@@ -103,6 +103,12 @@ pub(super) async fn restore(
             outputs,
         };
         restore_outputs(workspace, cache, &result, digests).await?;
+        restored.retain(|path| {
+            !result
+                .outputs
+                .keys()
+                .any(|parent| path != parent && Path::new(path).starts_with(parent))
+        });
         restored.extend(result.outputs.into_keys());
     }
     tracing::trace!(
