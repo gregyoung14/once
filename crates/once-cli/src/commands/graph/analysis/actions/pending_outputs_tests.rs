@@ -1,5 +1,33 @@
 use super::super::*;
 
+#[tokio::test]
+async fn a_batched_miss_does_not_mark_its_cached_sibling_materialized() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let cache = CacheProvider::Local(once_cas::Cas::open(cache_root.path()));
+    let actions = |bytes: &[u8], destination: &str| {
+        vec![
+            write("cached", b"cached bytes", false),
+            write("miss", bytes, false),
+            copy("cached", destination, false),
+        ]
+    };
+    run(workspace.path(), &cache, actions(b"first", "first-copy")).await;
+    for path in ["cached", "miss", "first-copy"] {
+        std::fs::remove_file(workspace.path().join(path)).unwrap();
+    }
+    let outcome = run(workspace.path(), &cache, actions(b"second", "second-copy")).await;
+    assert_eq!(outcome.result.exit_code, 0);
+    assert_eq!(
+        std::fs::read(workspace.path().join("second-copy")).unwrap(),
+        b"cached bytes"
+    );
+    assert_eq!(
+        std::fs::read(workspace.path().join("miss")).unwrap(),
+        b"second"
+    );
+}
+
 fn write(path: &str, bytes: &[u8], ordered: bool) -> DeclaredAction {
     serde_json::from_value(serde_json::json!({
         "outputs": [path], "depends_on_prior_actions": ordered, "identifier": path,
