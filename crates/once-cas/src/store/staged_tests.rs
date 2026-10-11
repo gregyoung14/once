@@ -230,9 +230,14 @@ async fn cancellation_retains_decoder_owner_and_private_lease_until_worker_finis
         .unwrap()
         .path();
     assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(std::fs::read_dir(directory)
-        .unwrap()
-        .any(|entry| { entry.unwrap().metadata().unwrap().len() == 1024 * 1024 }));
+    assert!(std::fs::read_dir(directory).unwrap().any(|entry| {
+        std::fs::File::open(entry.unwrap().path())
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len()
+            == 1024 * 1024
+    }));
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while parent.exists() || !dropped.load(std::sync::atomic::Ordering::SeqCst) {

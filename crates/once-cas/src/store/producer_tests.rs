@@ -180,9 +180,14 @@ async fn cancelling_after_actual_writes_retains_worker_guard_and_cleans_scratch(
         .await
         .unwrap()
         .unwrap();
-    assert!(std::fs::read_dir(cas.scratch_dir())
-        .unwrap()
-        .any(|entry| entry.unwrap().metadata().unwrap().len() >= 512 * 1024));
+    assert!(std::fs::read_dir(cas.scratch_dir()).unwrap().any(|entry| {
+        std::fs::File::open(entry.unwrap().path())
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len()
+            >= 512 * 1024
+    }));
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert!(resources.try_acquire().is_err());

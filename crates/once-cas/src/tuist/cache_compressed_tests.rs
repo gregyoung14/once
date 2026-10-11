@@ -244,8 +244,8 @@ async fn cancelling_compressed_streams_cleans_scratch_and_releases_waiters() {
                 let started = reads.load(std::sync::atomic::Ordering::SeqCst) >= target_reads;
                 let written = std::fs::read_dir(cache.local.scratch_dir()).is_ok_and(|entries| {
                     entries.filter_map(std::result::Result::ok).any(|entry| {
-                        entry
-                            .metadata()
+                        std::fs::File::open(entry.path())
+                            .and_then(|file| file.metadata())
                             .is_ok_and(|metadata| metadata.len() >= 128 * 1024)
                     })
                 });
