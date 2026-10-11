@@ -6,6 +6,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use crate::tuist::{TuistCache, TuistCacheConfig};
 use crate::{ActionResult, Cas, Digest, GcReport, Result, Stats};
 
+mod producer;
+
 const TUIST_STREAM_REMOTE_UPLOAD_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The cache a command talks to: a local store, optionally fronting a
@@ -104,6 +106,41 @@ impl CacheProvider {
             Self::Tuist(cache) => {
                 cache.ensure_blob_local(digest).await?;
                 cache.local().copy_blob_to_file(digest, destination).await
+            }
+        }
+    }
+
+    /// Stage a blob for opaque read-only access under an existing directory.
+    ///
+    /// Raw immutable storage can be pinned without copying. Compressed storage
+    /// and filesystems without hardlink support use bounded decoding instead.
+    pub async fn stage_blob(&self, digest: &Digest, parent: &Path) -> Result<crate::StagedBlob> {
+        self.stage_blob_guarded(digest, parent, ()).await
+    }
+
+    /// Stage a blob while retaining an owner through blocking decoding work.
+    ///
+    /// Cancellation retains the owner through remote ingestion and local decoding,
+    /// and retains private staging until decoding finishes. The completed lease
+    /// does not retain the owner.
+    pub async fn stage_blob_guarded<G: Send + 'static>(
+        &self,
+        digest: &Digest,
+        parent: &Path,
+        guard: G,
+    ) -> Result<crate::StagedBlob> {
+        match self {
+            Self::Local(cas) => cas.stage_blob_guarded(digest, parent, guard).await,
+            Self::Tuist(cache) => {
+                // Share a Send-only guard without adding a Sync bound to the API.
+                let owner = std::sync::Arc::new(std::sync::Mutex::new(guard));
+                cache
+                    .ensure_blob_local_guarded(digest, std::sync::Arc::clone(&owner))
+                    .await?;
+                cache
+                    .local()
+                    .stage_blob_guarded(digest, parent, owner)
+                    .await
             }
         }
     }

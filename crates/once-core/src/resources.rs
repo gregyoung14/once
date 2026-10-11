@@ -332,6 +332,13 @@ pub struct ResourcePermit {
     request: ResourceRequest,
 }
 
+impl ResourcePermit {
+    pub(crate) fn try_additional_default(&self) -> Option<Self> {
+        use futures::FutureExt;
+        self.pool.acquire(ResourceRequest::default()).now_or_never()
+    }
+}
+
 impl Drop for ResourcePermit {
     fn drop(&mut self) {
         {

@@ -13,11 +13,21 @@ use crate::directory_blob::{
     write_directory_blob,
 };
 use crate::file_blob::{
-    digest_file_blob, file_blob_header, restore_file_blob_from_reader, FILE_BLOB_MAGIC,
+    digest_file_blob, digest_raw_file, file_blob_header, restore_file_blob_from_reader,
+    write_file_blob, FILE_BLOB_MAGIC,
 };
 use crate::{Error, OutputSymlinkMode, Result, WorkspacePath};
 
 const RESTORE_PREFETCH_CONCURRENCY: usize = 16;
+
+mod commit;
+mod legacy_hash;
+mod prefetch;
+mod worker_slots;
+use worker_slots::{WorkerSlot, WorkerSlots};
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+mod single;
 
 /// Materialize every cached output blob to its declared workspace path.
 /// On cache hit this is what makes a downstream action see a file the
@@ -31,29 +41,38 @@ pub(crate) async fn restore(
     if outputs.outputs.is_empty() {
         return Ok(());
     }
-    let staging = StagingDir::create(workspace_root)?;
-    let prefetched = prefetch_output_blobs(&outputs, cache, staging.path()).await?;
-    let mut lock = output_restore_lock(workspace_root)?;
-    let _guard = lock.write().map_err(|source| Error::RestoreOutput {
-        path: output_restore_lock_path(workspace_root)
-            .display()
-            .to_string(),
-        source,
-    })?;
-    for output in prefetched {
-        let PrefetchedOutput {
-            rel,
-            digest,
-            blob_path,
-            ..
-        } = output;
-        let abs = workspace_root.join(&rel);
-        if existing_output_matches_digest(&abs, digest) {
-            continue;
-        }
-        restore_prefetched_output(&rel, &abs, &blob_path)?;
+    let staging = std::sync::Arc::new(StagingDir::create(workspace_root)?);
+    let prefetched = prefetch::restore(&outputs, cache, &staging).await?;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    let mut prefetched = prefetched;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    if let Some(permit) = crate::resource_scope::current().filter(|_| prefetched.len() == 1) {
+        return single::restore(
+            prefetched.pop().expect("single prefetched output"),
+            workspace_root,
+            std::sync::Arc::clone(&staging),
+            permit,
+        )
+        .await;
     }
-    Ok(())
+    commit::run(|| {
+        let mut lock = output_restore_lock(workspace_root)?;
+        let _guard = lock.write().map_err(|source| Error::RestoreOutput {
+            path: output_restore_lock_path(workspace_root)
+                .display()
+                .to_string(),
+            source,
+        })?;
+        for output in prefetched {
+            let PrefetchedOutput { rel, digest, blob } = output;
+            let abs = workspace_root.join(&rel);
+            if existing_output_matches_digest(&abs, digest) {
+                continue;
+            }
+            restore_prefetched_output(&rel, &abs, blob.into_reader()?)?;
+        }
+        Ok(())
+    })
 }
 
 fn output_restore_lock(workspace_root: &Path) -> Result<RwLock<std::fs::File>> {
@@ -80,11 +99,7 @@ fn output_restore_lock_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".once/locks/output-restore.lock")
 }
 
-fn restore_prefetched_output(rel: &str, abs: &Path, blob_path: &Path) -> Result<()> {
-    let mut blob = std::fs::File::open(blob_path).map_err(|source| Error::RestoreOutput {
-        path: rel.to_string(),
-        source,
-    })?;
+fn restore_prefetched_output(rel: &str, abs: &Path, mut blob: impl Read + Seek) -> Result<()> {
     let mut prefix = [0_u8; 32];
     let mut read = 0;
     while read < prefix.len() {
@@ -121,16 +136,15 @@ async fn outputs_needing_restore(
         .iter()
         .map(|(path, digest)| (path.clone(), *digest))
         .collect::<VecDeque<_>>();
+    let mut slots = WorkerSlots::new(pending.len().min(RESTORE_PREFETCH_CONCURRENCY));
     let mut tasks = JoinSet::new();
-    while tasks.len() < RESTORE_PREFETCH_CONCURRENCY {
-        let Some((path, digest)) = pending.pop_front() else {
-            break;
-        };
-        spawn_output_validation(&mut tasks, workspace_root, path, digest);
+    while let Some(slot) = slots.take() {
+        let (path, digest) = pending.pop_front().expect("available validation slot");
+        spawn_output_validation(&mut tasks, workspace_root, path, digest, slot);
     }
     let mut outputs = BTreeMap::new();
     while let Some(joined) = tasks.join_next().await {
-        let (path, digest, matches) = joined.map_err(|source| Error::RestoreOutput {
+        let (slot, path, digest, matches) = joined.map_err(|source| Error::RestoreOutput {
             path: "cached output validation".to_string(),
             source: std::io::Error::other(source.to_string()),
         })?;
@@ -138,7 +152,16 @@ async fn outputs_needing_restore(
             outputs.insert(path, digest);
         }
         if let Some((path, digest)) = pending.pop_front() {
-            spawn_output_validation(&mut tasks, workspace_root, path, digest);
+            slots.release(slot);
+            spawn_output_validation(
+                &mut tasks,
+                workspace_root,
+                path,
+                digest,
+                slots.take().expect("completed validation slot"),
+            );
+        } else {
+            slots.retire(slot);
         }
     }
     for (path, digest) in &result.outputs {
@@ -160,19 +183,30 @@ async fn outputs_needing_restore(
 }
 
 fn spawn_output_validation(
-    tasks: &mut JoinSet<(String, Digest, bool)>,
+    tasks: &mut JoinSet<(usize, String, Digest, bool)>,
     workspace_root: &Path,
     path: String,
     digest: Digest,
+    slot: WorkerSlot,
 ) {
     let absolute = workspace_root.join(&path);
-    tasks.spawn_blocking(move || {
-        let matches = existing_output_matches_digest(&absolute, digest);
-        (path, digest, matches)
-    });
+    tasks.spawn_blocking(crate::resource_scope::owned_blocking(move || {
+        let matches =
+            existing_output_matches_digest_owned(&absolute, digest, slot.owner.as_deref());
+        (slot.index, path, digest, matches)
+    }));
 }
 
 fn existing_output_matches_digest(path: &Path, expected: Digest) -> bool {
+    let owner = crate::resource_scope::current();
+    existing_output_matches_digest_owned(path, expected, owner.as_deref())
+}
+
+fn existing_output_matches_digest_owned(
+    path: &Path,
+    expected: Digest,
+    owner: Option<&crate::ResourcePermit>,
+) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -189,87 +223,52 @@ fn existing_output_matches_digest(path: &Path, expected: Digest) -> bool {
             .into_iter()
             .any(|mode| digest_directory_blob(path, mode).is_ok_and(|digest| digest == expected));
     }
-    if metadata.is_file()
-        && digest_file_blob(path, &metadata).is_ok_and(|digest| digest == expected)
-    {
-        return true;
+    if !metadata.is_file() {
+        return false;
     }
-    metadata.is_file()
-        && std::fs::read(path).is_ok_and(|bytes| Digest::of_bytes(&bytes) == expected)
-}
-
-async fn prefetch_output_blobs(
-    result: &ActionResult,
-    cache: &CacheProvider,
-    staging_dir: &Path,
-) -> Result<Vec<PrefetchedOutput>> {
-    let mut outputs = result
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(index, (rel, digest))| (index, rel.clone(), *digest))
-        .collect::<VecDeque<_>>();
-    let output_count = outputs.len();
-
-    let mut tasks = JoinSet::new();
-    while tasks.len() < RESTORE_PREFETCH_CONCURRENCY {
-        let Some((index, rel, digest)) = outputs.pop_front() else {
-            break;
-        };
-        spawn_prefetch(&mut tasks, cache.clone(), staging_dir, index, rel, digest);
-    }
-
-    let mut blobs: Vec<Option<PrefetchedOutput>> = (0..output_count).map(|_| None).collect();
-    while let Some(joined) = tasks.join_next().await {
-        let output = joined.map_err(|source| Error::RestoreOutput {
-            path: "cached output prefetch".to_string(),
-            source: std::io::Error::other(source.to_string()),
-        })??;
-        let index = output.index;
-        blobs[index] = Some(output);
-        if let Some((index, rel, digest)) = outputs.pop_front() {
-            spawn_prefetch(&mut tasks, cache.clone(), staging_dir, index, rel, digest);
+    if metadata.len() >= 1024 * 1024 {
+        if let Some(extra) = owner.and_then(crate::ResourcePermit::try_additional_default) {
+            let metadata = &metadata;
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let cancel = &stop;
+            return std::thread::scope(|scope| {
+                let raw = std::thread::Builder::new()
+                    .name("once-output-hash".to_string())
+                    .spawn_scoped(scope, move || {
+                        let _extra = extra;
+                        legacy_hash::digest_file(path, metadata, cancel)
+                            .is_ok_and(|digest| digest == expected)
+                    });
+                let modern =
+                    digest_file_blob(path, metadata).is_ok_and(|digest| digest == expected);
+                if modern {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                match raw {
+                    Ok(raw) => {
+                        let legacy = raw
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                        modern || legacy
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "output hash worker unavailable; validating serially");
+                        modern
+                            || digest_raw_file(path, metadata)
+                                .is_ok_and(|digest| digest == expected)
+                    }
+                }
+            });
         }
     }
-    blobs
-        .into_iter()
-        .enumerate()
-        .map(|(index, output)| {
-            output.ok_or_else(|| Error::RestoreOutput {
-                path: format!("cached output prefetch[{index}]"),
-                source: std::io::Error::other("prefetch task did not produce an output"),
-            })
-        })
-        .collect()
-}
-
-fn spawn_prefetch(
-    tasks: &mut JoinSet<Result<PrefetchedOutput>>,
-    cache: CacheProvider,
-    staging_dir: &Path,
-    index: usize,
-    rel: String,
-    digest: Digest,
-) {
-    let blob_path = staging_dir.join(format!("{index}.blob"));
-    // The download runs on its own task, so it takes the caller's transfer
-    // observer with it; otherwise the bytes it pulls go unreported.
-    tasks.spawn(once_cas::transfer::propagate(async move {
-        cache.copy_blob_to_file(&digest, &blob_path).await?;
-        Ok(PrefetchedOutput {
-            index,
-            rel,
-            digest,
-            blob_path,
-        })
-    }));
+    digest_file_blob(path, &metadata).is_ok_and(|digest| digest == expected)
+        || digest_raw_file(path, &metadata).is_ok_and(|digest| digest == expected)
 }
 
 struct PrefetchedOutput {
-    index: usize,
     rel: String,
     digest: Digest,
-    blob_path: PathBuf,
+    blob: once_cas::StagedBlob,
 }
 
 struct StagingDir {
@@ -352,7 +351,22 @@ pub(crate) async fn capture(
                 });
             }
         };
-        let digest = if metadata.is_dir() {
+        let digest = if let Some(guard) = crate::resource_scope::current() {
+            let produce = move |mut writer: &mut dyn Write| {
+                if metadata.is_dir() {
+                    write_directory_blob(&abs, symlink_mode, &mut writer)
+                } else {
+                    write_file_blob(&abs, &metadata, &mut writer)
+                }
+            };
+            if let Some(extra) = guard.try_additional_default() {
+                cache
+                    .put_produced_pipelined((guard, extra), produce)
+                    .await?
+            } else {
+                cache.put_produced(guard, produce).await?
+            }
+        } else if metadata.is_dir() {
             let staging = StagingDir::create(workspace_root)?;
             let blob_path = staging.path().join("directory.blob");
             let output_path = blob_path.clone();
@@ -401,6 +415,10 @@ pub(crate) async fn capture(
 }
 
 #[cfg(test)]
+#[path = "capture_producer_tests.rs"]
+mod producer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use once_cas::Cas;
@@ -412,6 +430,39 @@ mod tests {
         let cas_root = tmp.path().join("cas");
         std::fs::create_dir(&workspace).unwrap();
         (tmp, workspace, CacheProvider::Local(Cas::open(cas_root)))
+    }
+
+    #[tokio::test]
+    async fn owned_large_file_validation_preserves_modern_legacy_and_full_pool_fallback() {
+        use crate::{with_resource_permit, ResourceLimits, ResourcePool, ResourceRequest};
+        use futures::FutureExt;
+        use std::sync::Arc;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("file");
+        let bytes = vec![7; 2 * 1024 * 1024];
+        std::fs::write(&path, &bytes).unwrap();
+        let modern = digest_file_blob(&path, &std::fs::metadata(&path).unwrap()).unwrap();
+        let legacy = Digest::of_bytes(&bytes);
+        for cpu in [1, 2] {
+            let pool = Arc::new(ResourcePool::new(ResourceLimits::new(
+                cpu,
+                1024 * 1024 * 1024,
+            )));
+            let permit = pool.acquire(ResourceRequest::default()).await;
+            with_resource_permit(permit, async {
+                assert!(existing_output_matches_digest(&path, modern));
+                assert!(existing_output_matches_digest(&path, legacy));
+                assert!(!existing_output_matches_digest(
+                    &path,
+                    Digest::of_bytes(b"wrong")
+                ));
+            })
+            .await;
+            assert!(pool
+                .acquire(ResourceRequest::new(cpu, 1024 * 1024 * 1024))
+                .now_or_never()
+                .is_some());
+        }
     }
 
     #[cfg(unix)]

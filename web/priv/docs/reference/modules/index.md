@@ -767,7 +767,11 @@ phases during import; executing such a record fails until those settings resolve
 - `depends_on_prior_actions`: `True` by default. When true, each action key
   includes prior actions declared by the same target and acts as an ordering
   barrier. With `False`, declared input and output paths determine ordering;
-  every consumed generated file must be listed in `inputs`.
+  every consumed generated file must be listed in `inputs`. On a cache miss,
+  unrelated cached outputs remain deferred until an ordered action or a requested
+  output needs them. Declared filesystem changes that overlap cached outputs,
+  including uncertain path aliases, retain conservative restoration before
+  execution. This does not change action keys.
 - `intermediate`: `False` by default. Set `True` on an action whose outputs only
   later actions of the same target read, such as a step that feeds the next
   one. When the action is a cache hit, its outputs stay in the cache instead of

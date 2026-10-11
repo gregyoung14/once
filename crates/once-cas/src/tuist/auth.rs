@@ -305,7 +305,7 @@ mod tests {
             )
             .unwrap();
 
-        let token = auth.token().unwrap();
+        let token = with_ci_env(&[], || auth.token().unwrap());
 
         assert_eq!(token, "access-1");
     }
@@ -402,7 +402,7 @@ mod tests {
             )
             .unwrap();
 
-        let token = auth.token().unwrap();
+        let token = with_ci_env(&[], || auth.token().unwrap());
         let request = server.request();
         let stored = storage.load(&key).unwrap().unwrap();
 

@@ -17,6 +17,7 @@
 
 mod actions;
 mod analysis_memo;
+mod materialization;
 mod output_state;
 mod resolution_cache;
 mod scheduler;
@@ -502,6 +503,7 @@ impl BuildSession {
             &self.workspace,
             &self.cache,
             Some(&self.source_digest_cache),
+            &self.resources,
         )
         .await
         .with_context(|| format!("materializing outputs for {}", target.label.id))?;
@@ -575,6 +577,7 @@ impl BuildSession {
                         &self.workspace,
                         &self.cache,
                         Some(&self.source_digest_cache),
+                        &self.resources,
                     )
                     .await
                     .with_context(|| {
@@ -882,19 +885,16 @@ async fn materialize_cached_outputs(
     workspace: &Path,
     cache: &CacheProvider,
     source_digest_cache: Option<&SourceDigestCache>,
+    resources: &Arc<ResourcePool>,
 ) -> Result<()> {
-    for result in &outcome.cached_results {
-        match source_digest_cache {
-            Some(digests) => digests
-                .materialize_outputs(result, workspace, cache)
-                .await
-                .map_err(anyhow::Error::from)?,
-            None => once_core::materialize_outputs(result, workspace, cache)
-                .await
-                .map_err(anyhow::Error::from)?,
-        }
-    }
-    Ok(())
+    materialization::restore(
+        &outcome.cached_results,
+        workspace,
+        cache,
+        source_digest_cache,
+        resources,
+    )
+    .await
 }
 
 /// Resolve the executables declared by the graph's tools to concrete

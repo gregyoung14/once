@@ -4,12 +4,32 @@ use futures::StreamExt;
 use std::pin::Pin;
 use tonic::Response;
 
+#[path = "cache_download_benchmarks.rs"]
+mod benchmarks;
+#[path = "cache_compressed_tests.rs"]
+mod compressed;
+#[path = "cache_download_tests.rs"]
+mod downloads;
+#[path = "cache_paced_benchmarks.rs"]
+mod paced;
+
+#[derive(Default)]
+struct StreamOptions {
+    failures: Vec<Status>,
+    stalls: bool,
+    compressed: Option<Vec<std::result::Result<bytestream::ReadResponse, Status>>>,
+    chunk_delay: Duration,
+}
+
 #[derive(Clone)]
 struct BlobServer {
     chunks: Vec<std::result::Result<bytestream::ReadResponse, Status>>,
     failures: Vec<Status>,
     reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stalls: bool,
+    compressed: Option<Vec<std::result::Result<bytestream::ReadResponse, Status>>>,
+    chunk_delay: Duration,
+    wire_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[tonic::async_trait]
@@ -35,7 +55,34 @@ impl ByteStream for BlobServer {
                 failure.clone()
             )]))));
         }
-        let chunks = stream::iter(self.chunks.clone());
+        let compressed = request
+            .get_ref()
+            .resource_name
+            .contains("compressed-blobs/zstd/");
+        let chunks = if compressed {
+            self.compressed
+                .clone()
+                .ok_or_else(|| Status::unimplemented("compression unavailable"))?
+        } else {
+            self.chunks.clone()
+        };
+        let delay = self.chunk_delay;
+        let wire_bytes = Arc::clone(&self.wire_bytes);
+        let chunks = stream::iter(chunks).then(move |chunk| {
+            let wire_bytes = Arc::clone(&wire_bytes);
+            async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if let Ok(response) = &chunk {
+                    wire_bytes.fetch_add(
+                        u64::try_from(response.data.len()).unwrap(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                chunk
+            }
+        });
         if self.stalls {
             return Ok(Response::new(Box::pin(chunks.chain(stream::pending()))));
         }
@@ -78,12 +125,50 @@ async fn cache_for_failing_stream(
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (cache, server, reads, _) = cache_for_configured_stream(
+        temp,
+        digest,
+        chunks,
+        StreamOptions {
+            failures,
+            stalls,
+            ..StreamOptions::default()
+        },
+    )
+    .await;
+    (cache, server, reads)
+}
+
+async fn cache_for_configured_stream(
+    temp: &tempfile::TempDir,
+    digest: Digest,
+    chunks: Vec<std::result::Result<bytestream::ReadResponse, Status>>,
+    options: StreamOptions,
+) -> (
+    TuistCache,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let size_bytes = chunks
+        .iter()
+        .filter_map(|chunk| chunk.as_ref().ok())
+        .map(|chunk| i64::try_from(chunk.data.len()).unwrap())
+        .sum();
     let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wire_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let capabilities = RemoteCapabilities {
+        zstd_streams: options.compressed.is_some(),
+        ..RemoteCapabilities::default()
+    };
     let service = BlobServer {
         chunks,
-        failures,
+        failures: options.failures,
         reads: reads.clone(),
-        stalls,
+        stalls: options.stalls,
+        compressed: options.compressed,
+        chunk_delay: options.chunk_delay,
+        wire_bytes: Arc::clone(&wire_bytes),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -109,7 +194,7 @@ async fn cache_for_failing_stream(
         },
     )
     .unwrap();
-    let channel = Endpoint::from_shared(format!("http://{address}"))
+    let channel = grpc_endpoint(&format!("http://{address}"))
         .unwrap()
         .connect()
         .await
@@ -122,12 +207,51 @@ async fn cache_for_failing_stream(
         }))
         .unwrap();
     cache.auth_token_cache.set(Ok("test-token".into())).unwrap();
-    cache
-        .known_remote_blobs
-        .lock()
-        .await
-        .insert(digest, sha256_digest(b"test mapping").unwrap());
-    (cache, server, reads)
+    cache.known_remote_blobs.lock().await.insert(
+        digest,
+        reapi::Digest {
+            size_bytes,
+            ..sha256_digest(b"test mapping").unwrap()
+        },
+    );
+    *cache.capabilities_cache.lock().await = Some(capabilities);
+    (cache, server, reads, wire_bytes)
+}
+
+#[tokio::test]
+#[ignore = "manual transfer performance measurement"]
+async fn benchmark_large_stream_downloads() {
+    let mut state = 0x1234_5678_u64;
+    let bytes: Vec<u8> = (0..32 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    let digest = Digest::of_bytes(&bytes);
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let temp = tempfile::TempDir::new().unwrap();
+        let chunks = bytes
+            .chunks(256 * 1024)
+            .map(|chunk| {
+                Ok(bytestream::ReadResponse {
+                    data: chunk.to_vec(),
+                })
+            })
+            .collect();
+        let (cache, server) = cache_for_stream(&temp, digest, chunks).await;
+        let started = Instant::now();
+        cache.ensure_blob_local(&digest).await.unwrap();
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        server.abort();
+        assert_eq!(cache.local.get_blob(&digest).await.unwrap(), bytes);
+    }
+    samples.sort_by(f64::total_cmp);
+    println!("METRIC stream_download_ms={}", samples[3]);
+    println!("METRIC download_mib_per_s={}", 32_000.0 / samples[3]);
 }
 
 #[tokio::test]
@@ -291,10 +415,5 @@ async fn a_streamed_download_is_reported_once_and_a_local_blob_not_at_all() {
     assert_eq!(transfers.len(), 1, "{transfers:?}");
     assert_eq!(transfers[0].direction, TransferDirection::Download);
     assert_eq!(transfers[0].digest, digest);
-    // The size is the one the remote digest declares; the fixture maps every
-    // blob to the same placeholder remote digest.
-    assert_eq!(
-        transfers[0].size_bytes,
-        u64::try_from(sha256_digest(b"test mapping").unwrap().size_bytes).unwrap()
-    );
+    assert_eq!(transfers[0].size_bytes, u64::try_from(bytes.len()).unwrap());
 }

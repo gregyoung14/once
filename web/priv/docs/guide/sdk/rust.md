@@ -86,6 +86,60 @@ them by digest from action results, manifests, or other integration state.
 Prefer the file and stream methods for logs, archives, compiler outputs, and
 other payloads whose size is not tightly bounded.
 
+### Read-Only Blob Staging
+
+Use `cache.provider().stage_blob(&digest, parent).await` to prepare a blob for
+read-only, seekable access without loading the whole payload into memory.
+The parent directory must already exist and is owned by the caller. The
+returned `StagedBlob` owns its temporary storage; `into_reader()` transfers
+that ownership to a `StagedBlobReader` implementing synchronous `Read` and
+`Seek`. Neither type exposes a mutable file handle or storage path. Dropping
+the lease or its reader removes temporary storage.
+
+Raw immutable blobs can be pinned without copying on compatible filesystems.
+Compressed blobs and filesystems without hardlink support use bounded decoding.
+A successful lease remains readable if the cache subsequently removes the
+original blob. Ordinary `get_blob_to_file` and `copy_blob_to_file` destinations
+remain independent, mutable copies.
+
+`stage_blob_guarded(&digest, parent, guard)` additionally retains a
+`Send + 'static` owner through remote ingestion and local blocking decoding.
+If staging is cancelled, active workers keep their owner until they finish;
+a local decoder also retains and then removes its private temporary directory.
+The completed lease does not retain the guard. A cancelled operation can drop
+the guard on a blocking worker thread after the calling future has been dropped.
+The existing cache selection, remote retrieval and publication defaults are
+unchanged. These APIs do not execute actions or create runtime sessions.
+
+### Owned Blob Producers
+
+The lower-level provider also offers `put_produced(guard, producer)` for
+synchronous serializers. The owned producer runs on a blocking worker and
+writes sequential bytes through `std::io::Write`, avoiding an intermediate
+serialized file. Both arguments must be `Send + 'static`. Use `()` as the
+guard when no additional lifetime reservation is needed.
+
+```rust
+let digest = cache.provider().put_produced((), |writer| {
+    writer.write_all(b"generated content")
+}).await?;
+```
+
+The guard stays with the worker through encoding and durable local publication.
+Dropping the future removes its scratch paths immediately; subsequent writes
+fail, but a producer already doing other blocking work keeps its guard until
+that work ends. Producers must bound their own buffers. No blob is published
+unless the producer and final encoding succeed. Remote mirroring follows the
+same size-bounded policy as `put_stream`; existing cache defaults are unchanged.
+
+Integrations that already own capacity for two workers can opt into
+`put_produced_pipelined(guard, producer)`. Its guard must cover both workers.
+Digest calculation overlaps encoding through a one-chunk queue with chunks
+capped at 512 KiB. The producer joins the digest worker on success, errors and
+cancellation before releasing the guard. When extra capacity is unavailable,
+use the serial `put_produced` method instead of waiting while holding a partial
+reservation. Blob bytes, digest validation and durable publication are unchanged.
+
 ### Action Keys
 
 `ActionKeyBuilder` gives cached automation a versioned, unambiguous identity.
@@ -157,6 +211,8 @@ level Once modules.
 | `Digest` | Identifies blobs and action cache entries. |
 | `ActionResult` | Stores an action exit code, stdout digest, stderr digest, and output digests. |
 | `Stats` | Reports local cache size and entry counts. |
+| `StagedBlob` | Owns temporary storage for read-only blob access. |
+| `StagedBlobReader` | Reads and seeks within a staged blob while retaining its storage lease. |
 | `CacheProvider` | Provides lower-level cache access for integrations that already own a provider. |
 | `TuistCacheConfig` | Configures a manually constructed Tuist cache provider. |
 | `ActionKeyBuilder` | Builds a versioned action digest from ordered, labeled inputs. |

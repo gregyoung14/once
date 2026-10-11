@@ -24,7 +24,7 @@ mod termination;
 
 use std::process::ExitCode;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> ExitCode {
     startup::run().await
 }

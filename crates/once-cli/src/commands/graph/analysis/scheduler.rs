@@ -80,6 +80,7 @@ impl<'a> BuildScheduler<'a> {
                     &self.context.workspace,
                     &self.context.cache,
                     Some(&self.context.source_digest_cache),
+                    &self.context.resources,
                 ),
             )
             .await

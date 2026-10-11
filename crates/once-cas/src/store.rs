@@ -1,18 +1,21 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::atomic::Ordering;
-
 use tokio::fs::{self, File};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::filesystem::{
     ensure_dir, rename_into_place, write_atomically, write_durably, write_with_durable_contents,
-    TMP_COUNTER,
 };
 use crate::{blob, ActionResult, Digest, Error, Result};
 
-const STREAM_CHUNK: usize = 64 * 1024;
+mod copy;
+mod producer;
+mod staged;
+mod stream;
+
+pub use staged::{StagedBlob, StagedBlobReader};
+
+const STREAM_CHUNK: usize = 256 * 1024;
 
 /// Local content-addressed store rooted at a workspace `.once/` directory.
 ///
@@ -83,27 +86,6 @@ impl Cas {
         }
     }
 
-    /// Write a blob's contents to `destination`, streaming rather than
-    /// buffering, and creating parent directories as needed.
-    pub async fn copy_blob_to_file(&self, digest: &Digest, destination: &Path) -> Result<()> {
-        let stored_path = self.blob_path(digest);
-        if !fs::try_exists(&stored_path).await.unwrap_or(false) {
-            return Err(Error::BlobNotFound(*digest));
-        }
-        let output_path = destination.to_path_buf();
-        let error_path = output_path.clone();
-        tokio::task::spawn_blocking(move || blob::decode_file(&stored_path, &output_path))
-            .await
-            .map_err(|source| Error::Io {
-                path: error_path.clone(),
-                source: io::Error::other(source.to_string()),
-            })?
-            .map_err(|source| Error::Io {
-                path: error_path,
-                source,
-            })
-    }
-
     pub(crate) fn action_path(&self, digest: &Digest) -> PathBuf {
         Self::shard_path(&self.actions_dir(), digest, ".json")
     }
@@ -146,122 +128,49 @@ impl Cas {
     /// Memory use while reading is bounded by `STREAM_CHUNK` regardless
     /// of the input size - this is the path subprocess stdout/stderr go
     /// through, so a multi-GB linker log doesn't OOM the executor. The
-    /// stream is hashed and written to a scratch file in one pass; on
-    /// completion the scratch file is optionally compressed, then
-    /// renamed into place or discarded if the blob already exists. On
+    /// stream is hashed, written and compressed as bytes arrive. On completion,
+    /// the selected scratch representation is renamed into place or discarded
+    /// if the blob already exists. On
     /// returned error or cancellation, temporary files are cleaned up.
     /// A process crash can leave scratch files that future cache invocations ignore.
     pub async fn put_stream<R: AsyncRead + Unpin>(&self, reader: R) -> Result<Digest> {
-        let (tmp, digest) = self.stream_to_tmp("stream", reader).await?;
-        self.commit_stream(tmp, &digest).await?;
+        let scratch = self.scratch_dir();
+        ensure_dir(&scratch).await?;
+        let (stored, digest, file) = stream::prepare(&scratch, reader).await?;
+        let final_path = self.blob_path(&digest);
+        if !fs::try_exists(&final_path).await.unwrap_or(false) {
+            File::from_std(file)
+                .sync_all()
+                .await
+                .map_err(|source| Error::Io {
+                    path: stored.to_path_buf(),
+                    source,
+                })?;
+            rename_into_place(&stored, &final_path).await?;
+        }
         Ok(digest)
     }
 
-    async fn commit_stream(&self, tmp: tempfile::TempPath, digest: &Digest) -> Result<()> {
-        let final_path = self.blob_path(digest);
-        if fs::try_exists(&final_path).await.unwrap_or(false) {
-            return Ok(());
-        }
-
-        let stored_tmp = self.prepare_blob_tmp(tmp).await?;
-        if fs::try_exists(&final_path).await.unwrap_or(false) {
-            return Ok(());
-        }
-
-        rename_into_place(&stored_tmp, &final_path).await
+    pub(crate) fn remote_window_limit_exceeded(error: &Error) -> bool {
+        stream::window_limit_exceeded(error)
     }
 
-    /// Stream `reader` into the scratch dir and compute the BLAKE3 of
-    /// the bytes. The caller is responsible for renaming the returned
-    /// tmp path into its final location.
-    async fn stream_to_tmp<R: AsyncRead + Unpin>(
+    pub(crate) async fn mirror_remote_stream<R: AsyncRead + Unpin, G: Send + 'static>(
         &self,
-        prefix: &str,
         reader: R,
-    ) -> Result<(tempfile::TempPath, Digest)> {
-        let scratch = self.scratch_dir();
-        ensure_dir(&scratch).await?;
-        let temporary = tempfile::Builder::new()
-            .prefix(&format!("{prefix}-"))
-            .make_in(&scratch, |path| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-            })
-            .map_err(|source| Error::Io {
-                path: scratch,
-                source,
-            })?;
-        let (file, temporary_path) = temporary.into_parts();
-        let tmp = temporary_path.to_path_buf();
-        let digest = self
-            .write_stream_to(&tmp, File::from_std(file), reader)
-            .await?;
-        Ok((temporary_path, digest))
-    }
-
-    async fn write_stream_to<R: AsyncRead + Unpin>(
-        &self,
-        tmp: &Path,
-        mut file: File,
-        mut reader: R,
+        expected: u64,
+        compressed: bool,
+        guard: G,
     ) -> Result<Digest> {
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; STREAM_CHUNK];
-        loop {
-            let n = reader.read(&mut buf).await.map_err(|source| Error::Io {
-                path: tmp.to_path_buf(),
-                source,
-            })?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            file.write_all(&buf[..n])
-                .await
-                .map_err(|source| Error::Io {
-                    path: tmp.to_path_buf(),
-                    source,
-                })?;
-        }
-        file.sync_all().await.map_err(|source| Error::Io {
-            path: tmp.to_path_buf(),
-            source,
-        })?;
-        Ok(Digest::from_bytes(*hasher.finalize().as_bytes()))
-    }
-
-    async fn prepare_blob_tmp(&self, raw_tmp: tempfile::TempPath) -> Result<tempfile::TempPath> {
         let scratch = self.scratch_dir();
         ensure_dir(&scratch).await?;
-        let pid = process::id();
-        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let encoded_tmp = scratch.join(format!("zstd-{pid}-{seq}"));
-        let raw_path = raw_tmp.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let encoded_tmp =
-                tempfile::TempPath::try_from_path(encoded_tmp).map_err(|source| Error::Io {
-                    path: raw_tmp.to_path_buf(),
-                    source,
-                })?;
-            let encoded =
-                blob::encode_file(&raw_tmp, &encoded_tmp).map_err(|source| Error::Io {
-                    path: raw_tmp.to_path_buf(),
-                    source,
-                })?;
-            if encoded.should_store {
-                Ok(encoded_tmp)
-            } else {
-                Ok(raw_tmp)
-            }
-        })
-        .await
-        .map_err(|source| Error::Io {
-            path: raw_path,
-            source: io::Error::other(source.to_string()),
-        })?
+        let (stored, digest) =
+            stream::ingest_remote(&scratch, reader, expected, compressed, guard).await?;
+        let final_path = self.blob_path(&digest);
+        if !fs::try_exists(&final_path).await.unwrap_or(false) {
+            rename_into_place(&stored, &final_path).await?;
+        }
+        Ok(digest)
     }
 
     /// Read a content-addressed blob.
@@ -326,5 +235,11 @@ impl Cas {
     }
 }
 
+#[cfg(test)]
+#[path = "store/compression_benchmarks.rs"]
+mod compression_benchmarks;
+#[cfg(test)]
+#[path = "store/stream_publication_tests.rs"]
+mod stream_publication_tests;
 #[cfg(test)]
 mod tests;

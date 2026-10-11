@@ -1,6 +1,7 @@
 mod auth;
 mod cache;
 mod file_body;
+mod flights;
 mod projects;
 mod retry;
 mod stall;

@@ -33,6 +33,16 @@ use super::output_state;
 use super::source_digest_cache::SourceDigestCache;
 use super::{AvailableInput, BuildOutcome, PerActionOutcome};
 
+#[cfg(test)]
+mod capture_benchmarks;
+#[cfg(test)]
+mod capture_contention_benchmarks;
+#[cfg(test)]
+mod partial_cache_benchmarks;
+#[cfg(all(test, unix))]
+mod pending_admission_tests;
+mod pending_outputs;
+mod preparation;
 mod runner;
 mod scheduling;
 
@@ -64,6 +74,7 @@ struct DeclaredActionOutcome {
     cache_state: EvidenceCacheState,
     result: ActionResult,
     evidence_record: Option<EvidenceRecord>,
+    restored_outputs: pending_outputs::Restoration,
     /// Wall time spent hashing inputs, writing arg files, and
     /// building the action digest (the "prepare" phase). Rendered as
     /// a distinct sub-span so cache-hit runs still show what
@@ -138,11 +149,6 @@ impl DeclaredActionsState {
         per_action: Option<PerActionOutcome>,
         policy: &CachedResultPolicy,
     ) {
-        let restored = if outcome.cache_state == EvidenceCacheState::Hit {
-            Vec::new()
-        } else {
-            self.restored_before(policy)
-        };
         self.per_action_outcomes.extend(per_action);
         self.prior_actions_digest = Some(extend_prior_actions_digest(
             self.prior_actions_digest,
@@ -184,19 +190,12 @@ impl DeclaredActionsState {
                 .iter()
                 .map(|(path, digest)| (path.clone(), *digest)),
         );
+        pending_outputs::mark_restored(self, &outcome.restored_outputs);
         for path in outcome.result.outputs.keys() {
             if policy.intermediate {
                 self.intermediate_outputs.insert(path.clone());
             } else {
                 self.intermediate_outputs.remove(path);
-            }
-        }
-        // What was restored before the action ran is on disk now, possibly
-        // with the action's changes inside it, so it must not be restored
-        // again for a later reader.
-        for path in restored {
-            if let Some(input) = self.available_inputs.get_mut(&path) {
-                input.materialized = true;
             }
         }
         track_cached_result(&mut self.cached_results, &outcome, policy, false);
@@ -212,21 +211,6 @@ impl DeclaredActionsState {
             restored_at_end: &self.cached_results,
             intermediate: &self.pending_intermediate,
         }
-    }
-
-    /// Paths of the pending outputs an action under `policy` found restored
-    /// before it ran.
-    fn restored_before(&self, policy: &CachedResultPolicy) -> Vec<String> {
-        let pending = self.pending();
-        let results = if policy.restores_prior {
-            pending.all().cloned().collect::<Vec<_>>()
-        } else {
-            overlapping_results(pending.all(), &policy.touched)
-        };
-        results
-            .into_iter()
-            .flat_map(|result| result.outputs.into_keys())
-            .collect()
     }
 
     fn take_evidence_records(&mut self) -> Vec<EvidenceRecord> {
@@ -509,7 +493,7 @@ pub(super) struct PendingResults<'a> {
 }
 
 impl<'a> PendingResults<'a> {
-    fn all(self) -> impl Iterator<Item = &'a ActionResult> {
+    fn all(self) -> impl DoubleEndedIterator<Item = &'a ActionResult> {
         self.restored_at_end.iter().chain(self.intermediate)
     }
 }
@@ -586,30 +570,6 @@ fn contains(outer: &str, inner: &str) -> bool {
 /// Whether one path is the other or contains it.
 fn paths_overlap(left: &str, right: &str) -> bool {
     left == right || contains(left, right) || contains(right, left)
-}
-
-/// The waiting outputs that would undo part of what the action does if they
-/// were restored after it ran.
-fn overlapping_results<'a>(
-    results: impl Iterator<Item = &'a ActionResult>,
-    touched: &[TouchedPath],
-) -> Vec<ActionResult> {
-    results
-        .filter_map(|result| {
-            let outputs = result
-                .outputs
-                .iter()
-                .filter(|(path, _)| touched.iter().any(|touched| touched.conflicts_with(path)))
-                .map(|(path, digest)| (path.clone(), *digest))
-                .collect::<BTreeMap<_, _>>();
-            (!outputs.is_empty()).then_some(ActionResult {
-                exit_code: 0,
-                stdout: None,
-                stderr: None,
-                outputs,
-            })
-        })
-        .collect()
 }
 
 /// Keep one list of pending cache hits current after `outcome`: the outputs
@@ -895,33 +855,7 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
     let outcome = if cacheable {
         run_cacheable_declared_action(context, action, &declared).await
     } else {
-        materialize_prior_results_for(
-            workspace,
-            cache,
-            prior_cached_results,
-            &declared,
-            source_digest_cache,
-        )
-        .await?;
-        materialize_available_inputs(
-            workspace,
-            cache,
-            &declared,
-            available_inputs,
-            source_digest_cache,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "materializing inputs for action {index} for {target_id} ({identifier_for_error})"
-            )
-        })?;
-        prepare_declared_command_paths(workspace, &declared)
-            .await
-            .with_context(|| {
-                format!("preparing action {index} for {target_id} ({identifier_for_error})")
-            })?;
-        run_uncacheable_declared_action(context, action, declared.inherit_parent_env).await
+        run_uncacheable_declared_action(context, action, &declared).await
     };
     let execute_ms = i64::try_from(execute_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     outcome.map(|mut o| {
@@ -932,20 +866,21 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
 }
 
 async fn prepare_declared_command_paths(workspace: &Path, declared: &DeclaredAction) -> Result<()> {
-    if declared.operation.is_some() {
-        return Ok(());
+    if declared.operation.is_none() {
+        for path in &declared.clean_paths {
+            let path = workspace_path(path, "clean_paths entry")?;
+            remove_declared_path_if_exists(&path.resolve(workspace), path.as_str()).await?;
+        }
+        for path in &declared.create_dirs {
+            let path = workspace_path(path, "create_dirs entry")?;
+            tokio::fs::create_dir_all(path.resolve(workspace))
+                .await
+                .with_context(|| {
+                    format!("creating declared command directory `{}`", path.as_str())
+                })?;
+        }
     }
-    for path in &declared.clean_paths {
-        let path = workspace_path(path, "clean_paths entry")?;
-        remove_declared_path_if_exists(&path.resolve(workspace), path.as_str()).await?;
-    }
-    for path in &declared.create_dirs {
-        let path = workspace_path(path, "create_dirs entry")?;
-        tokio::fs::create_dir_all(path.resolve(workspace))
-            .await
-            .with_context(|| format!("creating declared command directory `{}`", path.as_str()))?;
-    }
-    Ok(())
+    materialize_declared_arg_files(workspace, &declared.arg_files)
 }
 
 async fn remove_declared_path_if_exists(abs: &Path, label: &str) -> Result<()> {
@@ -969,7 +904,8 @@ async fn run_cacheable_declared_action(
     action: Action,
     declared: &DeclaredAction,
 ) -> Result<DeclaredActionOutcome> {
-    let outcome = resolve_cacheable_declared_action(&context, &action, declared).await?;
+    let (outcome, restored_outputs) =
+        resolve_cacheable_declared_action(&context, &action, declared).await?;
     let exit_code = outcome.result.exit_code;
     if exit_code != 0 {
         record_declared_action_evidence(
@@ -1028,6 +964,7 @@ async fn run_cacheable_declared_action(
         cache_state,
         result: outcome.result,
         evidence_record,
+        restored_outputs,
         // The outer `run_declared_action` fills these in after
         // observing prepare + execute spans from the outside.
         prepare_ms: 0,
@@ -1039,7 +976,7 @@ async fn resolve_cacheable_declared_action(
     context: &DeclaredActionContext<'_>,
     action: &Action,
     declared: &DeclaredAction,
-) -> Result<once_core::Outcome> {
+) -> Result<(once_core::Outcome, pending_outputs::Restoration)> {
     // clean_paths and create_dirs model the command's own filesystem
     // setup, so they must only run when the command actually executes.
     // A cache hit does not run command setup. Removing a clean_paths entry on
@@ -1084,20 +1021,23 @@ async fn resolve_cacheable_declared_action(
         )
         .await?
         {
-            once_core::Outcome {
-                action: action_digest,
-                result,
-                cache: once_core::CacheState::Hit,
-            }
+            (
+                once_core::Outcome {
+                    action: action_digest,
+                    result,
+                    cache: once_core::CacheState::Hit,
+                },
+                pending_outputs::Restoration::default(),
+            )
         } else {
             execute_declared_cache_miss(context, action, declared).await?
         }
     } else {
         execute_declared_cache_miss(context, action, declared).await?
     };
-    if outcome.cache == once_core::CacheState::Miss {
+    if outcome.0.cache == once_core::CacheState::Miss {
         if let Some(cache) = context.source_digest_cache {
-            cache.record_outputs(&outcome.result, context.workspace);
+            cache.record_outputs(&outcome.0.result, context.workspace);
         }
     }
     Ok(outcome)
@@ -1155,47 +1095,24 @@ async fn execute_declared_cache_miss(
     context: &DeclaredActionContext<'_>,
     action: &Action,
     declared: &DeclaredAction,
-) -> Result<once_core::Outcome> {
-    let _permit = context
+) -> Result<(once_core::Outcome, pending_outputs::Restoration)> {
+    let permit = context
         .resources
         .acquire(action.resource_request().clone())
         .await;
-    materialize_prior_results_for(
-        context.workspace,
-        context.cache,
-        context.prior_cached_results,
-        declared,
-        context.source_digest_cache,
+    once_core::with_resource_permit(
+        permit,
+        Box::pin(execute_declared_admitted(context, action, declared)),
     )
     .await
-    .with_context(|| {
-        format!(
-            "materializing prior outputs for action {} for {} ({})",
-            context.index, context.target_id, context.identifier
-        )
-    })?;
-    materialize_available_inputs(
-        context.workspace,
-        context.cache,
-        declared,
-        context.available_inputs,
-        context.source_digest_cache,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "materializing inputs for action {} for {} ({})",
-            context.index, context.target_id, context.identifier
-        )
-    })?;
-    prepare_declared_command_paths(context.workspace, declared)
-        .await
-        .with_context(|| {
-            format!(
-                "preparing action {} for {} ({})",
-                context.index, context.target_id, context.identifier
-            )
-        })?;
+}
+
+async fn execute_declared_admitted(
+    context: &DeclaredActionContext<'_>,
+    action: &Action,
+    declared: &DeclaredAction,
+) -> Result<(once_core::Outcome, pending_outputs::Restoration)> {
+    let restored_outputs = preparation::restore(context, declared).await?;
     let result = match context.output_observer {
         Some(observer) => {
             once_core::run_uncached_observed(
@@ -1228,35 +1145,17 @@ async fn execute_declared_cache_miss(
                 )
             })?;
     }
-    Ok(once_core::Outcome {
-        action: action_digest,
-        result,
-        cache: once_core::CacheState::Miss,
-    })
+    Ok((
+        once_core::Outcome {
+            action: action_digest,
+            result,
+            cache: once_core::CacheState::Miss,
+        },
+        restored_outputs,
+    ))
 }
 
-/// Restore the cached outputs still waiting to be put on disk that the action
-/// can observe before it runs.
-///
-/// An action that depends on the ones before it may read any of them. One
-/// that doesn't declares what it reads, which `materialize_available_inputs`
-/// restores, so only the outputs it is about to write over, clean, or remove
-/// come back first, leaving the rest for the target's end.
-pub(super) async fn materialize_prior_results_for(
-    workspace: &Path,
-    cache: &CacheProvider,
-    pending: PendingResults<'_>,
-    declared: &DeclaredAction,
-    source_digest_cache: Option<&SourceDigestCache>,
-) -> Result<()> {
-    let results = if declared.depends_on_prior_actions {
-        pending.all().cloned().collect::<Vec<_>>()
-    } else {
-        overlapping_results(pending.all(), &touched_paths(declared))
-    };
-    materialize_prior_cached_results(workspace, cache, &results, source_digest_cache).await
-}
-
+#[cfg(test)]
 async fn materialize_prior_cached_results(
     workspace: &Path,
     cache: &CacheProvider,
@@ -1326,18 +1225,31 @@ async fn materialize_available_inputs(
 async fn run_uncacheable_declared_action(
     context: DeclaredActionContext<'_>,
     action: Action,
-    inherit_parent_env: bool,
+    declared: &DeclaredAction,
 ) -> Result<DeclaredActionOutcome> {
-    let action_digest = action.digest();
-    let _permit = context
+    let permit = context
         .resources
         .acquire(action.resource_request().clone())
         .await;
+    once_core::with_resource_permit(
+        permit,
+        Box::pin(run_uncacheable_admitted(context, action, declared)),
+    )
+    .await
+}
+
+async fn run_uncacheable_admitted(
+    context: DeclaredActionContext<'_>,
+    action: Action,
+    declared: &DeclaredAction,
+) -> Result<DeclaredActionOutcome> {
+    let action_digest = action.digest();
+    let restored_outputs = preparation::restore(&context, declared).await?;
     let result = run_uncached_action(
         &action,
         context.workspace,
         context.cache,
-        inherit_parent_env,
+        declared.inherit_parent_env,
     )
     .await
     .with_context(|| {
@@ -1401,6 +1313,7 @@ async fn run_uncacheable_declared_action(
         cache_state: EvidenceCacheState::Bypass,
         result,
         evidence_record,
+        restored_outputs,
         prepare_ms: 0,
         execute_ms: 0,
     })
