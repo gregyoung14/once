@@ -30,7 +30,7 @@ pub(super) fn chunks(
 }
 
 fn produce(
-    file: File,
+    file: impl Read,
     size: u64,
     zstd: bool,
     chunk_size: usize,
@@ -46,26 +46,17 @@ fn produce(
     } else {
         Box::new(source)
     };
-    let mut current = fill(&mut body, chunk_size)?;
     loop {
-        let next = fill(&mut body, chunk_size)?;
-        let last = next.is_empty();
+        let data = fill(&mut body, chunk_size)?;
+        let last = data.is_empty();
         if last && read.load(Ordering::Relaxed) != size {
             return Err(io::Error::other(
                 "staged blob did not match its declared size",
             ));
         }
-        if sender
-            .blocking_send(Ok(Chunk {
-                data: current,
-                last,
-            }))
-            .is_err()
-            || last
-        {
+        if sender.blocking_send(Ok(Chunk { data, last })).is_err() || last {
             return Ok(());
         }
-        current = next;
     }
 }
 
@@ -77,12 +68,12 @@ fn fill(reader: &mut dyn Read, size: usize) -> io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
-struct Counted {
-    inner: File,
+struct Counted<R> {
+    inner: R,
     read: Arc<AtomicU64>,
 }
 
-impl Read for Counted {
+impl<R: Read> Read for Counted<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buffer)?;
         self.read.fetch_add(read as u64, Ordering::Relaxed);
@@ -125,9 +116,9 @@ mod tests {
             .collect();
         let chunks = collect(&bytes, 10_000, false, 4_096).await.unwrap();
         let sizes: Vec<_> = chunks.iter().map(|chunk| chunk.data.len()).collect();
-        assert_eq!(sizes, [4_096, 4_096, 1_808]);
+        assert_eq!(sizes, [4_096, 4_096, 1_808, 0]);
         let finished: Vec<_> = chunks.iter().map(|chunk| chunk.last).collect();
-        assert_eq!(finished, [false, false, true]);
+        assert_eq!(finished, [false, false, false, true]);
         assert_eq!(joined(&chunks), bytes);
     }
 
@@ -145,6 +136,53 @@ mod tests {
             zstd::stream::decode_all(compressed.as_slice()).unwrap(),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn first_chunk_is_available_while_the_next_read_is_blocked() {
+        struct Gated {
+            bytes: io::Cursor<Vec<u8>>,
+            gate: Option<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Read for Gated {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.bytes.position() == 4 {
+                    if let Some(gate) = self.gate.take() {
+                        gate.recv().unwrap();
+                    }
+                }
+                self.bytes.read(buffer)
+            }
+        }
+        let (release, gate) = std::sync::mpsc::channel();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            produce(
+                Gated {
+                    bytes: io::Cursor::new(b"abcdefgh".to_vec()),
+                    gate: Some(gate),
+                },
+                8,
+                false,
+                4,
+                &sender,
+            )
+        });
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await;
+        release.send(()).unwrap();
+        let first = first
+            .expect("first chunk must not wait for the next read")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.data, b"abcd");
+        assert!(!first.last);
+        let mut tail = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            tail.push(chunk.unwrap());
+        }
+        worker.await.unwrap().unwrap();
+        assert_eq!(joined(&tail), b"efgh");
+        assert!(tail.last().unwrap().last);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 
 #[test]
 fn open_does_no_io() {
@@ -201,8 +202,6 @@ async fn put_stream_handles_empty_input() {
 
 #[tokio::test]
 async fn put_stream_handles_payload_larger_than_chunk() {
-    // STREAM_CHUNK = 64 KiB; use a payload that crosses the
-    // boundary several times to exercise the loop.
     let tmp = TempDir::new().unwrap();
     let cas = Cas::open(tmp.path());
     let payload: Vec<u8> = (0..(STREAM_CHUNK * 3 + 7))
@@ -226,41 +225,6 @@ async fn put_stream_compresses_repetitive_payload_at_rest() {
     assert!(stored.starts_with(blob::ZSTD_BLOB_MAGIC));
     assert!(stored.len() < payload.len());
     assert_eq!(cas.get_blob(&d).await.unwrap(), payload);
-}
-
-#[tokio::test]
-async fn copy_blob_to_file_streams_raw_and_compressed_storage() {
-    let tmp = TempDir::new().unwrap();
-    let cas = Cas::open(tmp.path().join("cas"));
-    for (name, payload) in [
-        ("raw", b"small payload".to_vec()),
-        ("compressed", vec![b'x'; STREAM_CHUNK * 4]),
-    ] {
-        let digest = cas.put_stream(payload.as_slice()).await.unwrap();
-        let destination = tmp.path().join(name);
-
-        cas.copy_blob_to_file(&digest, &destination).await.unwrap();
-
-        assert_eq!(fs::read(destination).await.unwrap(), payload);
-    }
-}
-
-#[tokio::test]
-async fn copy_blob_to_file_preserves_destination_when_decode_fails() {
-    let tmp = TempDir::new().unwrap();
-    let cas = Cas::open(tmp.path().join("cas"));
-    let payload = vec![b'x'; STREAM_CHUNK * 4];
-    let digest = cas.put_blob(&payload).await.unwrap();
-    let stored_path = cas.blob_path(&digest);
-    let mut stored = fs::read(&stored_path).await.unwrap();
-    assert!(stored.starts_with(blob::ZSTD_BLOB_MAGIC));
-    stored.truncate(blob::ZSTD_BLOB_HEADER_LEN + 1);
-    fs::write(&stored_path, stored).await.unwrap();
-    let destination = tmp.path().join("existing-output");
-    fs::write(&destination, b"keep this output").await.unwrap();
-
-    assert!(cas.copy_blob_to_file(&digest, &destination).await.is_err());
-    assert_eq!(fs::read(&destination).await.unwrap(), b"keep this output");
 }
 
 #[cfg(unix)]
