@@ -11,9 +11,9 @@ use once_frontend::analysis::{AnalysisResult, DeclaredActionOperation};
 use once_frontend::GraphTarget;
 
 use super::{
-    expose_target_tools, materialize_available_inputs, materialize_prior_results_for,
-    run_declared_action, scheduling, AvailableInput, BuildOutcome, DeclaredActionRun,
-    DeclaredActionsState, SourceDigestCache, EVIDENCE_FLUSH_BATCH_SIZE,
+    expose_target_tools, materialize_available_inputs, pending_outputs, run_declared_action,
+    scheduling, AvailableInput, BuildOutcome, DeclaredActionRun, DeclaredActionsState,
+    SourceDigestCache, EVIDENCE_FLUSH_BATCH_SIZE,
 };
 
 /// Materialise each declared action through the action cache, then
@@ -115,26 +115,27 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                 .iter()
                 .map(|action| state.input_action_digests(action, dep_action_digests))
                 .collect::<Vec<_>>();
+            let mut batch_inputs = state.available_inputs.clone();
             if batch.len() > 1 {
-                let _permit = resources.acquire(ResourceRequest::default()).await;
-                for action in &batch {
-                    materialize_prior_results_for(
-                        workspace,
-                        cache,
-                        state.pending(),
-                        action,
-                        source_digest_cache,
-                    )
-                    .await?;
-                    materialize_available_inputs(
-                        workspace,
-                        cache,
-                        action,
-                        &state.available_inputs,
-                        source_digest_cache,
-                    )
-                    .await?;
-                }
+                let permit = resources.acquire(ResourceRequest::default()).await;
+                once_core::with_resource_permit(permit, async {
+                    for action in &batch {
+                        let pending = state.pending().all().cloned().collect::<Vec<_>>();
+                        let restored = pending_outputs::restore(
+                            workspace,
+                            cache,
+                            &pending,
+                            &batch_inputs,
+                            action,
+                            source_digest_cache,
+                        )
+                        .await?;
+                        pending_outputs::mark_restored(&mut state, &restored);
+                        batch_inputs.clone_from(&state.available_inputs);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
             }
             for action in &batch {
                 state.outputs.extend(action.outputs.iter().cloned());
@@ -148,7 +149,7 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
             let outcomes =
                 futures::future::join_all(batch.into_iter().zip(&input_digests).enumerate().map(
                     |(offset, (declared, input_action_digests))| {
-                        let available_inputs = &state.available_inputs;
+                        let available_inputs = &batch_inputs;
                         Box::pin(async move {
                             let worker = workers.acquire().await;
                             let start_at = crate::bus_events::now_ms();
