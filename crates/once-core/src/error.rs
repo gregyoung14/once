@@ -24,6 +24,11 @@ pub enum Error {
     },
     #[error("remote provider `{provider}` is not supported yet")]
     UnsupportedRemoteProvider { provider: String },
+    #[error("executor `{executor}` does not support {requirement}; select an executor that supports this requirement")]
+    UnsupportedExecutorRequirement {
+        executor: String,
+        requirement: &'static str,
+    },
     #[error("remote provider `{provider}` is not configured: {message}")]
     RemoteProviderConfig { provider: String, message: String },
     #[error("remote provider `{provider}` request failed: {source}")]

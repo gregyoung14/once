@@ -79,11 +79,67 @@ and Daytona use one archive for each transfer so large dependency trees do not
 require one network request per file. The hosted image or template must
 provide `tar` for unpacking and packing those archives.
 
+## Executors And Resource Budgets
+
+An executor describes how an action runs. Its resource domain describes the
+capacity it consumes. Native processes and local Microsandbox virtual machines
+share the host's CPU and memory budget, even though Microsandbox uses the same
+prepared-command boundary as the hosted providers. Microsandbox guest memory
+and CPU settings come from the admitted host reservation. The default memory
+estimate is 250 MiB, so an undeclared guest no longer silently receives the
+runtime's larger default allocation. Guest memory is rounded down to whole
+mebibytes; a reservation below one mebibyte cannot start a guest.
+
+E2B and Daytona use a separate shared quota for outstanding requests. All
+hosted provider aliases share that quota, so adding another name does not add
+capacity within that scheduler. Its default is the number of default-sized
+local actions that fit in the host budget. These budgets belong to a shared
+scheduler within one process, not a machine-wide or account-wide quota.
+Separate CLI invocations do not share them. The service schedules its own physical machines; Once does not
+reserve the remote guest's CPU or memory estimate on your computer.
+
+A hosted request still reserves a fixed host-memory estimate for input
+packaging, transfers, stream capture, and output validation. `--memory-limit`
+controls admission against these estimates, not kernel-enforced process memory.
+The hosted adapters currently buffer command responses in full, so very large
+stdout/stderr can exceed the estimate. For high-volume logs, have the command
+write declared output files instead. Streamed or capped hosted response capture
+remains follow-on work.
+
+Cache probes do not reserve action memory. Restoring cached outputs uses a
+smaller, streaming-buffer estimate and does not need a host CPU slot or a remote
+request slot. Named shared-resource
+slots retain their host-wide meaning for the entire action, including hosted
+execution.
+
+A named infrastructure with `kind = "local"` selects native execution, including
+its usual sandbox and network policies. It retains a separate cache identity
+from an otherwise identical command without that binding. Provider names,
+resource estimates, and environment bindings remain part of action identity;
+Once does not yet claim that different providers run equivalent environments.
+
+Sandbox-provider adapters currently cannot enforce `--network deny` or
+stdout/stderr path redirection, or a non-default output-symlink policy. Once
+rejects these requirements instead of
+silently ignoring them. Selecting one executor never implicitly falls back to
+another executor on a command or infrastructure failure.
+
 ## Machine Cleanup
 
 Once waits for provider deletion after every normal success or failure. It
 also schedules deletion if the executing task is cancelled while a Tokio
-runtime is still active.
+runtime is still active. Execution-budget leases stay with that cleanup task
+until the cleanup attempt completes, rather than being returned as soon as the
+foreground task stops. A failed delete, lost create response, or runtime shutdown
+can still leave a machine unobserved by the client. The provider's lifetime
+policy remains necessary; a client request quota is not a guarantee about the
+number of live machines after transport failures.
+
+Microsandbox cleanup gives graceful stop up to ten seconds, then escalates to
+kill and wait for up to five seconds. Removing a stopped guest's persisted state
+has another ten-second limit. A kill timeout reports that the VM may still be
+running and leaves its persisted state intact. Local VMs have no hosted lifetime
+safety net, so an interrupted creation or failed kill may require manual cleanup.
 
 The hosted providers add a second line of defense:
 

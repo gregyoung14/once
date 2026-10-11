@@ -113,8 +113,18 @@ impl Client {
             .send()
             .await
             .map_err(http_error)?;
-        let mut sandbox: Sandbox = decode(response).await?;
+        let sandbox: Sandbox = decode(response).await?;
         tracing::debug!(provider = "daytona", sandbox = %sandbox.id, "created remote sandbox");
+        Ok(sandbox)
+    }
+
+    /// Polls a created sandbox until it starts. Callers register cleanup
+    /// before waiting so a failed or cancelled startup still deletes it.
+    pub(super) async fn wait_started(
+        &self,
+        mut sandbox: Sandbox,
+        timeout_ms: Option<u64>,
+    ) -> Result<Sandbox> {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs(timeout_ms));
         while sandbox.state.as_deref() != Some("started") {
             if matches!(

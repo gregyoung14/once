@@ -9,8 +9,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::stream::ActionOutputObserver;
 use crate::{
-    archive, contract, local, outputs, remote, Action, CopyPathMode, Error, OutputSymlinkMode,
-    PreparePathMode, Result, SandboxMode, WorkspacePath,
+    archive, contract, local, outputs, remote, Action, CopyPathMode, Error, ExecutionPermit,
+    Executor, OutputSymlinkMode, PreparePathMode, Result, SandboxMode, WorkspacePath,
 };
 
 pub(crate) async fn run(
@@ -39,6 +39,27 @@ pub(crate) async fn run_observed(
     validate_contract: bool,
     observer: Option<&dyn ActionOutputObserver>,
 ) -> Result<ActionResult> {
+    run_admitted(
+        action,
+        workspace_root,
+        cache,
+        stream_to_parent,
+        validate_contract,
+        observer,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_admitted(
+    action: &Action,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    stream_to_parent: bool,
+    validate_contract: bool,
+    observer: Option<&dyn ActionOutputObserver>,
+    lease: Option<ExecutionPermit>,
+) -> Result<ActionResult> {
     if let Action::RunCommand {
         outputs,
         output_symlink_mode,
@@ -52,6 +73,7 @@ pub(crate) async fn run_observed(
             stream_to_parent,
             validate_contract,
             observer,
+            lease,
         ))
         .await?;
         let completed = action.accepts_exit_code(result.exit_code);
@@ -538,6 +560,7 @@ async fn execute_command(
     stream_to_parent: bool,
     validate_contract: bool,
     observer: Option<&dyn ActionOutputObserver>,
+    lease: Option<ExecutionPermit>,
 ) -> Result<ActionResult> {
     let Action::RunCommand {
         argv,
@@ -571,11 +594,22 @@ async fn execute_command(
         network: *network,
     };
 
-    match (remote, stream_to_parent, sandbox) {
-        (Some(remote), _, _) => {
+    let executor = Executor::resolve(action)?;
+    if executor != Executor::Local {
+        if validate_contract {
+            return Err(executor.unsupported("filesystem contract auditing"));
+        }
+        if observer.is_some() {
+            return Err(executor.unsupported("live output observers"));
+        }
+    }
+    match (executor, stream_to_parent, sandbox) {
+        (Executor::Microsandbox | Executor::E2b | Executor::Daytona, _, _) => {
             remote::execute_command(
-                remote,
+                executor,
+                remote.as_deref().expect("remote executor has a binding"),
                 remote::PreparedCommand {
+                    lease,
                     argv,
                     env,
                     cwd: cwd.as_ref(),
@@ -591,7 +625,7 @@ async fn execute_command(
             )
             .await
         }
-        (None, _, SandboxMode::Inputs | SandboxMode::CopiedInputs) => {
+        (Executor::Local, _, SandboxMode::Inputs | SandboxMode::CopiedInputs) => {
             execute_sandboxed_command(
                 action,
                 invocation,
@@ -608,7 +642,7 @@ async fn execute_command(
             )
             .await
         }
-        (None, _, SandboxMode::Off) => match observer {
+        (Executor::Local, _, SandboxMode::Off) => match observer {
             Some(observer) => {
                 local::execute_command_observed(
                     invocation,

@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use once_cas::{ActionResult, CacheProvider, Digest};
 use once_core::{
-    tool_env, verify_reproducible, workspace_tool_command, workspace_tool_env, Action, CacheState,
-    EvidenceSubject, InputDigestBuilder, NetworkPolicy, OutputSymlinkMode, RemoteExecution,
+    tool_env, workspace_tool_command, workspace_tool_env, Action, CacheState, EvidenceSubject,
+    Executor, InputDigestBuilder, NetworkPolicy, OutputSymlinkMode, RemoteExecution,
     ReproducibilityReport, ResourceLimits, ResourceRequest, RunEventBus, RunOpts, SandboxMode,
     WorkspacePath, Xdg,
 };
@@ -171,7 +171,7 @@ pub async fn exec(
     // `run_exec_action` would detach the reporter mid-run and leave the
     // server's run row unfinalized.
     let body_result = if verify_reproducible {
-        verify_and_report(&workspace, cache, &action, output)
+        verify_and_report(&workspace, cache, &action, resource_limits, output)
             .await
             .map(|exit_code| ExecOutcome::Verify { exit_code })
     } else {
@@ -330,9 +330,12 @@ async fn verify_and_report(
     workspace: &Path,
     cache: &CacheProvider,
     action: &Action,
+    resource_limits: ResourceLimits,
     output: Output,
 ) -> Result<ExitCode> {
-    let report = verify_reproducible(action, workspace, cache)
+    let report = once_core::Runner::with_cache(cache.clone(), workspace, RunOpts::default())
+        .with_resource_limits(resource_limits)
+        .verify_reproducible(action)
         .await
         .context("verifying reproducibility")?;
     print_reproducibility_report(&report, output).await?;
@@ -584,7 +587,7 @@ async fn action_from_script_invocation(
     input_digest: Option<Digest>,
     dependencies: &[DependencyFingerprint],
 ) -> Result<Action> {
-    let mut argv = if invocation.remote.is_some() {
+    let mut argv = if uses_provider_environment(invocation.remote.as_ref())? {
         vec![invocation.runtime.clone()]
     } else {
         resolve_runtime(&invocation.workspace, &invocation.runtime).await?
@@ -626,6 +629,13 @@ async fn action_from_script_invocation(
 
 fn remote_execution(provider: Option<&str>) -> Option<RemoteExecution> {
     provider.map(RemoteExecution::provider)
+}
+
+fn uses_provider_environment(binding: Option<&RemoteExecution>) -> Result<bool> {
+    Ok(binding
+        .map(Executor::from_binding)
+        .transpose()?
+        .is_some_and(|executor| executor != Executor::Local))
 }
 
 fn resolve_script_remote(
@@ -1150,7 +1160,7 @@ async fn script_invocation_from_annotations(
         &runtime,
         &annotations.env_vars,
         explicit_env,
-        remote.is_some(),
+        uses_provider_environment(remote.as_ref())?,
     )
     .await?;
     let output_symlink_mode = output_symlink_mode(annotations.output_symlinks.as_deref())?;
@@ -1617,6 +1627,17 @@ mod tests {
         assert_eq!(runtime_args, &["-O".to_string()]);
         assert_eq!(script_arg, "scripts/build.py");
         assert_eq!(script_args, vec!["--flag".to_string()]);
+    }
+
+    #[test]
+    fn local_aliases_use_native_runtime_and_environment_resolution() {
+        assert!(!uses_provider_environment(None).unwrap());
+        let mut binding = RemoteExecution::provider("native-alias");
+        binding.executor = Some("local".to_string());
+        assert!(!uses_provider_environment(Some(&binding)).unwrap());
+        for name in ["e2b", "daytona", "microsandbox"] {
+            assert!(uses_provider_environment(Some(&RemoteExecution::provider(name))).unwrap());
+        }
     }
 
     #[test]

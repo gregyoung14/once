@@ -17,6 +17,7 @@ pub use once_presentation::{ActionContext, ActionPackage, ActionPlatform, Action
 mod evidence;
 mod execute;
 mod execution_path;
+mod executor;
 mod file_blob;
 mod input_digest;
 mod lint_results;
@@ -64,6 +65,7 @@ pub use evidence::{
 pub use execution_path::{
     resolve_execution_argv, resolve_execution_env, resolve_execution_value, EXECUTION_ROOT_MARKER,
 };
+pub use executor::{ExecutionPermit, Executor, ExecutorResources, ResourceDomain};
 pub use input_digest::{
     digest_source_path, InputDigestBuilder, InputFingerprintComponent, InputFingerprintManifest,
     INPUT_FINGERPRINT_SCHEMA,

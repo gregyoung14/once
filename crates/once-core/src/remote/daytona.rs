@@ -57,9 +57,10 @@ async fn execute_with_client(
             command.timeout_ms,
         )
         .await?;
-    let cleanup = SandboxCleanup::new(client.clone(), sandbox.id.clone());
+    let cleanup = SandboxCleanup::new(client.clone(), sandbox.id.clone(), command.lease.clone());
 
     let result = async {
+        let sandbox = client.wait_started(sandbox, command.timeout_ms).await?;
         let archive = create_input_archive(workspace_root, command.inputs, "daytona").await?;
         client
             .upload(&sandbox, archive.path(), archive.len(), INPUT_ARCHIVE)
@@ -216,7 +217,7 @@ fn shell_word(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::remote::test_server::{self, Response};
-    use crate::ResourceRequest;
+    use crate::{ExecutionPermit, Executor, ResourceRequest};
 
     #[test]
     fn command_quotes_argv() {
@@ -262,6 +263,7 @@ mod tests {
             resources: &resources,
             timeout_ms: None,
             success_exit_codes: &[0],
+            lease: None,
         };
         let client = Client::new(Config::for_test(url.clone(), format!("{url}/toolbox"))).unwrap();
 
@@ -275,7 +277,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = test_server::assert_ready(server).await.unwrap();
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(
@@ -311,6 +313,7 @@ mod tests {
             resources: &resources,
             timeout_ms: None,
             success_exit_codes: &[0],
+            lease: None,
         };
         let client = Client::new(Config::for_test(url.clone(), format!("{url}/toolbox"))).unwrap();
 
@@ -324,11 +327,163 @@ mod tests {
         )
         .await
         .unwrap_err();
-        let requests = server.await.unwrap();
+        let requests = test_server::assert_ready(server).await.unwrap();
 
         assert!(error.to_string().contains("500"));
         assert!(requests
             .iter()
             .any(|request| request.method == "DELETE" && request.path == "/sandbox/daytona-test"));
+    }
+
+    const STARTED: &str = r#"{"id":"daytona-test","state":"started","toolboxProxyUrl":null}"#;
+    const PENDING: &str = r#"{"id":"daytona-test","state":"pending_build","toolboxProxyUrl":null}"#;
+
+    async fn execute_true(
+        url: String,
+        workspace: &Path,
+        lease: Option<ExecutionPermit>,
+    ) -> Result<ActionResult> {
+        let cache = CacheProvider::open_local(workspace.join("cache"));
+        let argv = vec!["true".to_string()];
+        let env = BTreeMap::new();
+        let resources = ResourceRequest::default();
+        let command = PreparedCommand {
+            argv: &argv,
+            env: &env,
+            cwd: None,
+            inputs: &[],
+            outputs: &[],
+            resources: &resources,
+            timeout_ms: None,
+            success_exit_codes: &[0],
+            lease,
+        };
+        let client = Client::new(Config::for_test(url.clone(), format!("{url}/toolbox"))).unwrap();
+        execute_with_client(
+            &RemoteExecution::provider("daytona"),
+            command,
+            workspace,
+            &cache,
+            false,
+            client,
+        )
+        .await
+    }
+
+    fn deleted(requests: &[test_server::Request]) -> bool {
+        requests
+            .iter()
+            .any(|request| request.method == "DELETE" && request.path == "/sandbox/daytona-test")
+    }
+
+    async fn admit(resources: &crate::ExecutorResources) -> ExecutionPermit {
+        resources
+            .acquire(Executor::Daytona, &ResourceRequest::default())
+            .await
+    }
+
+    #[tokio::test]
+    async fn deletes_the_sandbox_when_startup_fails() {
+        let (url, server) = test_server::spawn(vec![
+            Response::json(PENDING),
+            Response::json(
+                r#"{"id":"daytona-test","state":"build_failed","toolboxProxyUrl":null}"#,
+            ),
+            Response::empty(204),
+        ])
+        .await;
+        let workspace = tempfile::tempdir().unwrap();
+
+        let error = test_server::assert_ready(execute_true(url, workspace.path(), None))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("build_failed"));
+        assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn lease_is_released_after_success_and_failure() {
+        let success = vec![
+            Response::json(STARTED),
+            Response::empty(200),
+            Response::json(r#"{"exitCode":0,"result":""}"#),
+            Response::json(r#"{"exitCode":0,"result":""}"#),
+            Response::empty(204),
+        ];
+        let failure = vec![
+            Response::json(STARTED),
+            Response::empty(500),
+            Response::empty(204),
+        ];
+        for (responses, succeeds) in [(success, true), (failure, false)] {
+            let resources = test_server::single_remote_quota();
+            let lease = admit(&resources).await;
+            let (url, server) = test_server::spawn(responses).await;
+            let workspace = tempfile::tempdir().unwrap();
+
+            let result =
+                test_server::assert_ready(execute_true(url, workspace.path(), Some(lease))).await;
+
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+            test_server::assert_ready(admit(&resources)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_keeps_the_lease_until_deletion_finishes() {
+        let resources = test_server::single_remote_quota();
+        let lease = admit(&resources).await;
+        let (poll, poll_hold) = Response::json(STARTED).held();
+        let (delete, delete_hold) = Response::empty(204).held();
+        let (url, server) = test_server::spawn(vec![Response::json(PENDING), poll, delete]).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut execution = Box::pin(execute_true(url, workspace.path(), Some(lease)));
+
+        test_server::assert_ready(async {
+            tokio::select! {
+                _ = &mut execution => panic!("execution finished while startup polling was held"),
+                _ = poll_hold.arrived => {}
+            }
+        })
+        .await;
+        drop(execution);
+        test_server::assert_pending(admit(&resources)).await;
+
+        poll_hold.release.send(()).unwrap();
+        test_server::assert_ready(delete_hold.arrived)
+            .await
+            .unwrap();
+        test_server::assert_pending(admit(&resources)).await;
+
+        delete_hold.release.send(()).unwrap();
+        assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+        test_server::assert_ready(admit(&resources)).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_explicit_cleanup_keeps_the_lease_until_deletion_finishes() {
+        let resources = test_server::single_remote_quota();
+        let lease = admit(&resources).await;
+        let (delete, delete_hold) = Response::empty(204).held();
+        let (url, server) =
+            test_server::spawn(vec![Response::json(STARTED), Response::empty(500), delete]).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut execution = Box::pin(execute_true(url, workspace.path(), Some(lease)));
+
+        test_server::assert_ready(async {
+            tokio::select! {
+                _ = &mut execution => panic!("execution finished while its deletion was held"),
+                _ = delete_hold.arrived => {}
+            }
+        })
+        .await;
+        drop(execution);
+        test_server::assert_pending(admit(&resources)).await;
+
+        delete_hold.release.send(()).unwrap();
+        assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+        test_server::assert_ready(admit(&resources)).await;
     }
 }

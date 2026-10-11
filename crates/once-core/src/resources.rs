@@ -23,9 +23,8 @@ pub struct ResourceRequest {
     /// Named "shared resource" slots the action needs to hold for the
     /// duration of its run. Plugins use this to declare that they
     /// compete for a typed, host-wide resource that the cpu/memory
-    /// axes can't model. The Pinned plugin, for example, asks for one
-    /// `ELIXIR_COMPILE_SLOT` so the runner schedules Pinned actions
-    /// in line with what the compile daemon can absorb.
+    /// axes can't model. These slots belong to the host domain, including
+    /// when the command itself runs remotely.
     ///
     /// Skipped from JSON when empty so existing actions (which don't
     /// request any named slots) keep their action digest stable.
@@ -268,7 +267,26 @@ impl ResourcePool {
     }
 
     pub async fn acquire(self: &Arc<Self>, request: ResourceRequest) -> ResourcePermit {
-        let request = request.bounded_by(&self.limits);
+        self.acquire_bounded(request.bounded_by(&self.limits)).await
+    }
+
+    pub(crate) async fn acquire_client(
+        self: &Arc<Self>,
+        memory_bytes: u64,
+        slots: BTreeMap<String, usize>,
+    ) -> ResourcePermit {
+        let mut request = ResourceRequest {
+            cpu_slots: 0,
+            memory_bytes,
+            slots,
+        }
+        .bounded_by(&self.limits);
+        // Client requests reserve buffers and host-wide slots, not guest CPUs.
+        request.cpu_slots = 0;
+        self.acquire_bounded(request).await
+    }
+
+    async fn acquire_bounded(self: &Arc<Self>, request: ResourceRequest) -> ResourcePermit {
         loop {
             let notified = self.notify.notified();
             {
@@ -330,6 +348,12 @@ fn can_acquire(state: &State, request: &ResourceRequest, limits: &ResourceLimits
 pub struct ResourcePermit {
     pool: Arc<ResourcePool>,
     request: ResourceRequest,
+}
+
+impl ResourcePermit {
+    pub(crate) fn request(&self) -> &ResourceRequest {
+        &self.request
+    }
 }
 
 impl Drop for ResourcePermit {

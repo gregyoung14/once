@@ -54,7 +54,7 @@ async fn execute_with_client(
     let sandbox = client
         .create(remote.environment.as_deref(), command.timeout_ms)
         .await?;
-    let cleanup = SandboxCleanup::new(client.clone(), sandbox.id.clone());
+    let cleanup = SandboxCleanup::new(client.clone(), sandbox.id.clone(), command.lease.clone());
 
     let result = async {
         let archive = create_input_archive(workspace_root, command.inputs, "e2b").await?;
@@ -190,7 +190,7 @@ fn workdir(cwd: Option<&WorkspacePath>) -> String {
 mod tests {
     use super::*;
     use crate::remote::test_server::{self, Response};
-    use crate::ResourceRequest;
+    use crate::{ExecutionPermit, Executor, ResourceRequest};
 
     #[test]
     fn output_paths_cannot_become_options() {
@@ -229,6 +229,7 @@ mod tests {
             resources: &resources,
             timeout_ms: None,
             success_exit_codes: &[0],
+            lease: None,
         };
         let client = Client::new(Config::for_test(url.clone(), url)).unwrap();
 
@@ -242,7 +243,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = test_server::assert_ready(server).await.unwrap();
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(
@@ -281,6 +282,7 @@ mod tests {
             resources: &resources,
             timeout_ms: None,
             success_exit_codes: &[0],
+            lease: None,
         };
         let client = Client::new(Config::for_test(url.clone(), url)).unwrap();
 
@@ -294,12 +296,145 @@ mod tests {
         )
         .await
         .unwrap_err();
-        let requests = server.await.unwrap();
+        let requests = test_server::assert_ready(server).await.unwrap();
 
         assert!(error.to_string().contains("500"));
         assert!(requests.iter().any(|request| {
             request.method == "DELETE" && request.path == "/sandboxes/e2b-test"
         }));
+    }
+
+    const CREATED: &str =
+        r#"{"sandboxID":"e2b-test","envdAccessToken":"access-token","envdVersion":"1.0.0"}"#;
+
+    async fn execute_true(
+        url: String,
+        workspace: &Path,
+        lease: Option<ExecutionPermit>,
+    ) -> Result<ActionResult> {
+        let cache = CacheProvider::open_local(workspace.join("cache"));
+        let argv = vec!["true".to_string()];
+        let env = BTreeMap::new();
+        let resources = ResourceRequest::default();
+        let command = PreparedCommand {
+            argv: &argv,
+            env: &env,
+            cwd: None,
+            inputs: &[],
+            outputs: &[],
+            resources: &resources,
+            timeout_ms: None,
+            success_exit_codes: &[0],
+            lease,
+        };
+        let client = Client::new(Config::for_test(url.clone(), url)).unwrap();
+        execute_with_client(
+            &RemoteExecution::provider("e2b"),
+            command,
+            workspace,
+            &cache,
+            false,
+            client,
+        )
+        .await
+    }
+
+    fn deleted(requests: &[test_server::Request]) -> bool {
+        requests
+            .iter()
+            .any(|request| request.method == "DELETE" && request.path == "/sandboxes/e2b-test")
+    }
+
+    async fn admit(resources: &crate::ExecutorResources) -> ExecutionPermit {
+        resources
+            .acquire(Executor::E2b, &ResourceRequest::default())
+            .await
+    }
+
+    #[tokio::test]
+    async fn lease_is_released_after_success_and_failure() {
+        let success = vec![
+            Response::json(CREATED),
+            Response::empty(200),
+            process_response_spec(&process_response(0)),
+            process_response_spec(&process_response(0)),
+            process_response_spec(&process_response(0)),
+            Response::empty(204),
+        ];
+        let failure = vec![
+            Response::json(CREATED),
+            Response::empty(500),
+            Response::empty(204),
+        ];
+        for (responses, succeeds) in [(success, true), (failure, false)] {
+            let resources = test_server::single_remote_quota();
+            let lease = admit(&resources).await;
+            let (url, server) = test_server::spawn(responses).await;
+            let workspace = tempfile::tempdir().unwrap();
+
+            let result =
+                test_server::assert_ready(execute_true(url, workspace.path(), Some(lease))).await;
+
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+            test_server::assert_ready(admit(&resources)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_execution_keeps_the_lease_until_deletion_finishes() {
+        let resources = test_server::single_remote_quota();
+        let lease = admit(&resources).await;
+        let (upload, upload_hold) = Response::empty(200).held();
+        let (delete, delete_hold) = Response::empty(204).held();
+        let (url, server) = test_server::spawn(vec![Response::json(CREATED), upload, delete]).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut execution = Box::pin(execute_true(url, workspace.path(), Some(lease)));
+
+        test_server::assert_ready(async {
+            tokio::select! {
+                _ = &mut execution => panic!("execution finished while its upload was held"),
+                _ = upload_hold.arrived => {}
+            }
+        })
+        .await;
+        drop(execution);
+        test_server::assert_pending(admit(&resources)).await;
+
+        upload_hold.release.send(()).unwrap();
+        test_server::assert_ready(delete_hold.arrived)
+            .await
+            .unwrap();
+        test_server::assert_pending(admit(&resources)).await;
+
+        delete_hold.release.send(()).unwrap();
+        assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+        test_server::assert_ready(admit(&resources)).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_explicit_cleanup_keeps_the_lease_until_deletion_finishes() {
+        let resources = test_server::single_remote_quota();
+        let lease = admit(&resources).await;
+        let (delete, delete_hold) = Response::empty(204).held();
+        let (url, server) =
+            test_server::spawn(vec![Response::json(CREATED), Response::empty(500), delete]).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut execution = Box::pin(execute_true(url, workspace.path(), Some(lease)));
+
+        test_server::assert_ready(async {
+            tokio::select! {
+                _ = &mut execution => panic!("execution finished while its deletion was held"),
+                _ = delete_hold.arrived => {}
+            }
+        })
+        .await;
+        drop(execution);
+        test_server::assert_pending(admit(&resources)).await;
+
+        delete_hold.release.send(()).unwrap();
+        assert!(deleted(&test_server::assert_ready(server).await.unwrap()));
+        test_server::assert_ready(admit(&resources)).await;
     }
 
     fn process_response(exit_code: i32) -> Vec<u8> {
@@ -322,6 +457,7 @@ mod tests {
             status: 200,
             content_type: "application/connect+json",
             body: body.to_vec(),
+            hold: None,
         }
     }
 }

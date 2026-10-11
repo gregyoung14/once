@@ -4,7 +4,7 @@ use std::path::Path;
 use once_cas::{ActionResult, CacheProvider, Digest};
 use serde::{Deserialize, Serialize};
 
-use crate::{run_uncached, Action, Result};
+use crate::{Action, Result, RunOpts, Runner};
 
 /// How many times an action is re-run to test reproducibility. Two is the
 /// minimum that can observe nondeterminism: one baseline run and one
@@ -113,23 +113,29 @@ pub async fn verify_reproducible(
     workspace_root: &Path,
     cache: &CacheProvider,
 ) -> Result<ReproducibilityReport> {
-    let mut results = Vec::with_capacity(TRIALS);
-    for _ in 0..TRIALS {
-        results.push(run_uncached(action, workspace_root, cache, false).await?);
+    Runner::with_cache(cache.clone(), workspace_root, RunOpts::default())
+        .verify_reproducible(action)
+        .await
+}
+
+impl Runner {
+    /// Re-run under this runner's admission budgets while bypassing action cache.
+    pub async fn verify_reproducible(&self, action: &Action) -> Result<ReproducibilityReport> {
+        let mut results = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            results.push(self.run_fresh(action, false).await?);
+        }
+        let mut differences = Vec::new();
+        for window in results.windows(2) {
+            differences.extend(compare(&window[0], &window[1]));
+        }
+        differences.dedup();
+        Ok(ReproducibilityReport {
+            reproducible: differences.is_empty(),
+            trials: TRIALS,
+            differences,
+        })
     }
-    let mut differences = Vec::new();
-    for window in results.windows(2) {
-        differences.extend(compare(&window[0], &window[1]));
-    }
-    // Collapse duplicate divergences so three or more trials do not repeat the
-    // same finding once per adjacent pair. Two trials never duplicate.
-    differences.dedup();
-    let reproducible = differences.is_empty();
-    Ok(ReproducibilityReport {
-        reproducible,
-        trials: TRIALS,
-        differences,
-    })
 }
 
 fn compare(first: &ActionResult, second: &ActionResult) -> Vec<ReproducibilityDifference> {

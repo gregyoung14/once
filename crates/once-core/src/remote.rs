@@ -3,7 +3,7 @@ use std::path::Path;
 
 use once_cas::{ActionResult, CacheProvider};
 
-use crate::{Error, RemoteExecution, ResourceRequest, Result, WorkspacePath};
+use crate::{ExecutionPermit, Executor, RemoteExecution, ResourceRequest, Result, WorkspacePath};
 
 mod archive;
 mod daytona;
@@ -15,6 +15,7 @@ mod path;
 mod test_server;
 
 pub(crate) struct PreparedCommand<'a> {
+    pub lease: Option<ExecutionPermit>,
     pub argv: &'a [String],
     pub env: &'a BTreeMap<String, String>,
     pub cwd: Option<&'a WorkspacePath>,
@@ -32,35 +33,33 @@ impl PreparedCommand<'_> {
 }
 
 pub(crate) async fn execute_command(
+    executor: Executor,
     remote: &RemoteExecution,
     command: PreparedCommand<'_>,
     workspace_root: &Path,
     cache: &CacheProvider,
     stream_to_parent: bool,
 ) -> Result<ActionResult> {
-    let executor = remote.executor.as_deref().unwrap_or(&remote.provider);
     tracing::debug!(
         provider = %remote.provider,
-        executor,
+        executor = executor.name(),
         environment = remote.environment.as_deref().unwrap_or("provider-default"),
         inputs = command.inputs.len(),
         outputs = command.outputs.len(),
         "dispatching remote command"
     );
     match executor {
-        "microsandbox" => {
+        Executor::Microsandbox => {
             microsandbox::execute_command(remote, command, workspace_root, cache, stream_to_parent)
                 .await
         }
-        "daytona" => {
+        Executor::Daytona => {
             daytona::execute_command(remote, command, workspace_root, cache, stream_to_parent).await
         }
-        "e2b" => {
+        Executor::E2b => {
             e2b::execute_command(remote, command, workspace_root, cache, stream_to_parent).await
         }
-        executor => Err(Error::UnsupportedRemoteProvider {
-            provider: executor.to_string(),
-        }),
+        Executor::Local => unreachable!("local execution does not use a remote transport"),
     }
 }
 
