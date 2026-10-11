@@ -225,6 +225,81 @@ async fn a_complete_frame_without_transport_eof_does_not_publish() {
 }
 
 #[tokio::test]
+async fn guarded_staging_retains_remote_decoder_resources_after_cancellation() {
+    struct Guard {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.entered.take().unwrap().send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+    let bytes = vec![7; 512 * 1024];
+    let temp = tempfile::tempdir().unwrap();
+    let (cache, digest, server, _) = fixture(
+        &temp,
+        &bytes,
+        zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
+        true,
+        Vec::new(),
+    )
+    .await;
+    let resources = Arc::new(tokio::sync::Semaphore::new(1));
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let guard = Guard {
+        entered: Some(entered),
+        release: wait,
+        _permit: Arc::clone(&resources).acquire_owned().await.unwrap(),
+    };
+    let provider = crate::CacheProvider::Tuist(cache.clone());
+    let parent = temp.path().to_path_buf();
+    let task =
+        tokio::spawn(async move { provider.stage_blob_guarded(&digest, &parent, guard).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let written = std::fs::read_dir(cache.local.scratch_dir()).is_ok_and(|entries| {
+                entries.filter_map(std::result::Result::ok).any(|entry| {
+                    std::fs::File::open(entry.path())
+                        .and_then(|file| file.metadata())
+                        .is_ok_and(|metadata| metadata.len() >= 128 * 1024)
+                })
+            });
+            if written {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resources.try_acquire().is_err());
+    release.send(()).unwrap();
+    let permit = tokio::time::timeout(Duration::from_secs(5), resources.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(permit);
+    assert!(!cache.local.has_blob(&digest).await.unwrap());
+    assert_eq!(
+        std::fs::read_dir(cache.local.scratch_dir())
+            .unwrap()
+            .count(),
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn cancelling_compressed_streams_cleans_scratch_and_releases_waiters() {
     let bytes = vec![7; 512 * 1024];
     let temp = tempfile::tempdir().unwrap();

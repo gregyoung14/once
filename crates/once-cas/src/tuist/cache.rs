@@ -213,6 +213,14 @@ impl TuistCache {
     }
 
     pub async fn ensure_blob_local(&self, digest: &Digest) -> Result<()> {
+        self.ensure_blob_local_guarded(digest, ()).await
+    }
+
+    pub(crate) async fn ensure_blob_local_guarded<G: Clone + Send + 'static>(
+        &self,
+        digest: &Digest,
+        guard: G,
+    ) -> Result<()> {
         if self.local.has_blob(digest).await? {
             return Ok(());
         }
@@ -227,7 +235,7 @@ impl TuistCache {
         let remote_digest = self.remote_blob_digest(digest).await?;
         let started = Instant::now();
         retry::grpc("get blob", || {
-            self.stream_remote_blob(digest, &remote_digest)
+            self.stream_remote_blob(digest, &remote_digest, guard.clone())
         })
         .await?;
         transfer::record(

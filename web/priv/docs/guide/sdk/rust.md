@@ -103,9 +103,11 @@ original blob. Ordinary `get_blob_to_file` and `copy_blob_to_file` destinations
 remain independent, mutable copies.
 
 `stage_blob_guarded(&digest, parent, guard)` additionally retains a
-`Send + 'static` owner through any blocking decoder. If staging is cancelled,
-the decoder keeps its owner and private temporary directory until it finishes,
-then removes the directory. The completed lease does not retain the guard.
+`Send + 'static` owner through remote ingestion and local blocking decoding.
+If staging is cancelled, active workers keep their owner until they finish;
+a local decoder also retains and then removes its private temporary directory.
+The completed lease does not retain the guard. A cancelled operation can drop
+the guard on a blocking worker thread after the calling future has been dropped.
 The existing cache selection, remote retrieval and publication defaults are
 unchanged. These APIs do not execute actions or create runtime sessions.
 

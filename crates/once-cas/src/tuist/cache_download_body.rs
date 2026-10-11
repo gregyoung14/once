@@ -9,13 +9,13 @@ use tonic::{Status, Streaming};
 use super::{retry, stall};
 use crate::{Cas, Digest, Error};
 
-pub(super) async fn store(
+pub(super) async fn store<G: Send + 'static>(
     cache: &Cas,
     stream: Streaming<ReadResponse>,
     timeout: Duration,
     expected: u64,
     compressed: bool,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    guard: G,
 ) -> std::result::Result<Digest, retry::Failure> {
     let chunks = stream::try_unfold(stream, move |mut stream| async move {
         let message = stall::next_message(&mut stream, timeout)
@@ -25,7 +25,7 @@ pub(super) async fn store(
     });
     let reader = StreamReader::new(Box::pin(chunks));
     cache
-        .mirror_remote_stream(reader, expected, compressed, permit)
+        .mirror_remote_stream(reader, expected, compressed, guard)
         .await
         .map_err(read_error)
 }

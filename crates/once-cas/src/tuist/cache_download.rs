@@ -4,32 +4,34 @@ use super::*;
 mod body;
 
 impl TuistCache {
-    pub(super) async fn stream_remote_blob(
+    pub(super) async fn stream_remote_blob<G: Clone + Send + 'static>(
         &self,
         digest: &Digest,
         remote_digest: &reapi::Digest,
+        guard: G,
     ) -> std::result::Result<(), retry::Failure> {
         let compressed = self.remote_capabilities().await.zstd_streams;
         match self
-            .stream_remote_representation(digest, remote_digest, compressed)
+            .stream_remote_representation(digest, remote_digest, compressed, guard.clone())
             .await
         {
             Err(retry::Failure::Local(error))
                 if compressed && Cas::remote_window_limit_exceeded(&error) =>
             {
                 tracing::debug!(blob_digest = %digest, "retrying oversized compressed frame as identity");
-                self.stream_remote_representation(digest, remote_digest, false)
+                self.stream_remote_representation(digest, remote_digest, false, guard)
                     .await
             }
             result => result,
         }
     }
 
-    async fn stream_remote_representation(
+    async fn stream_remote_representation<G: Send + 'static>(
         &self,
         digest: &Digest,
         remote_digest: &reapi::Digest,
         compressed: bool,
+        guard: G,
     ) -> std::result::Result<(), retry::Failure> {
         let permit = Arc::clone(&self.transfer_limit)
             .acquire_owned()
@@ -73,7 +75,7 @@ impl TuistCache {
             self.stream_stall_timeout,
             expected,
             compressed,
-            permit,
+            (permit, guard),
         )
         .await?;
         if mirrored != *digest {
