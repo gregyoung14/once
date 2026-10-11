@@ -107,20 +107,23 @@ impl Runner {
         if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
             return Ok(hit);
         }
-        let _permit = self
+        let permit = self
             .resources
             .acquire(action.resource_request().clone())
             .await;
         if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
             return Ok(hit);
         }
-        Box::pin(produce(
-            action,
-            &self.workspace_root,
-            &self.cache,
-            self.opts,
-            key,
-        ))
+        crate::with_resource_permit(
+            permit,
+            Box::pin(produce(
+                action,
+                &self.workspace_root,
+                &self.cache,
+                self.opts,
+                key,
+            )),
+        )
         .await
     }
 
@@ -129,38 +132,44 @@ impl Runner {
         if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
             return Ok(hit);
         }
-        let _permit = self
+        let permit = self
             .resources
             .acquire(action.resource_request().clone())
             .await;
         if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
             return Ok(hit);
         }
-        let result = Box::pin(execute::run(
-            action,
-            &self.workspace_root,
-            &self.cache,
-            true,
-            false,
-        ))
-        .await?;
-        let uses_cache = action_uses_cache(action);
-        let cacheable = uses_cache && (result.exit_code == 0 || self.opts.cache_failures);
-        if cacheable {
-            self.cache.put_action_result(&key, &result).await?;
-        } else if !uses_cache {
-            debug!("skipping action cache for non-cacheable action");
-        } else {
-            debug!(
-                exit_code = result.exit_code,
-                "skipping cache write for failure"
-            );
-        }
-        Ok(Outcome {
-            action: key,
-            result,
-            cache: CacheState::Miss,
-        })
+        crate::with_resource_permit(
+            permit,
+            Box::pin(async {
+                let result = Box::pin(execute::run(
+                    action,
+                    &self.workspace_root,
+                    &self.cache,
+                    true,
+                    false,
+                ))
+                .await?;
+                let uses_cache = action_uses_cache(action);
+                let cacheable = uses_cache && (result.exit_code == 0 || self.opts.cache_failures);
+                if cacheable {
+                    self.cache.put_action_result(&key, &result).await?;
+                } else if !uses_cache {
+                    debug!("skipping action cache for non-cacheable action");
+                } else {
+                    debug!(
+                        exit_code = result.exit_code,
+                        "skipping cache write for failure"
+                    );
+                }
+                Ok(Outcome {
+                    action: key,
+                    result,
+                    cache: CacheState::Miss,
+                })
+            }),
+        )
+        .await
     }
 }
 
