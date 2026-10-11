@@ -115,23 +115,20 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                 .iter()
                 .map(|action| state.input_action_digests(action, dep_action_digests))
                 .collect::<Vec<_>>();
-            let mut batch_inputs = state.available_inputs.clone();
             if batch.len() > 1 {
                 let permit = resources.acquire(ResourceRequest::default()).await;
                 once_core::with_resource_permit(permit, async {
                     for action in &batch {
-                        let pending = state.pending().all().cloned().collect::<Vec<_>>();
                         let restored = pending_outputs::restore(
                             workspace,
                             cache,
-                            &pending,
-                            &batch_inputs,
+                            state.pending(),
+                            &state.available_inputs,
                             action,
                             source_digest_cache,
                         )
                         .await?;
                         pending_outputs::mark_restored(&mut state, &restored);
-                        batch_inputs.clone_from(&state.available_inputs);
                     }
                     Ok::<(), anyhow::Error>(())
                 })
@@ -146,10 +143,11 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
             } else {
                 super::PendingResults::default()
             };
+            let batch_inputs = &state.available_inputs;
             let outcomes =
                 futures::future::join_all(batch.into_iter().zip(&input_digests).enumerate().map(
                     |(offset, (declared, input_action_digests))| {
-                        let available_inputs = &batch_inputs;
+                        let available_inputs = batch_inputs;
                         Box::pin(async move {
                             let worker = workers.acquire().await;
                             let start_at = crate::bus_events::now_ms();

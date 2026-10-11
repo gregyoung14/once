@@ -52,11 +52,11 @@ where
         }
         if failure.is_none() && next < results.len() {
             if let Some(permit) = resources.acquire(ResourceRequest::default()).now_or_never() {
-                let candidate = results[next].outputs.keys().cloned().collect();
-                let disjoint = active.iter().all(|index| {
-                    let outputs = results[*index].outputs.keys().cloned().collect();
-                    paths::disjoint(workspace, &candidate, &outputs)
-                });
+                let disjoint = paths::disjoint_from_results(
+                    workspace,
+                    &results[next],
+                    active.iter().map(|index| &results[*index]),
+                );
                 if disjoint {
                     active.insert(next);
                     running.push(indexed(next, execute(next, permit)));

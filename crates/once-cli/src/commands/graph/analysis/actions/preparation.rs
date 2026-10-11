@@ -7,15 +7,10 @@ pub(super) async fn restore(
     context: &DeclaredActionContext<'_>,
     declared: &DeclaredAction,
 ) -> Result<pending_outputs::Restoration> {
-    let pending = context
-        .prior_cached_results
-        .all()
-        .cloned()
-        .collect::<Vec<_>>();
     let restored = pending_outputs::restore(
         context.workspace,
         context.cache,
-        &pending,
+        context.prior_cached_results,
         context.available_inputs,
         declared,
         context.source_digest_cache,

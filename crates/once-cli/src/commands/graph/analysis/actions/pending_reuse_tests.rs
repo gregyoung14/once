@@ -28,7 +28,10 @@ async fn different_available_digest_cannot_reuse_a_prior_input_snapshot() {
     restore(
         workspace.path(),
         &cache,
-        &pending,
+        PendingResults {
+            restored_at_end: &pending,
+            intermediate: &[],
+        },
         &available,
         &declared,
         None,
@@ -62,7 +65,10 @@ fn child_overlays_prevent_reusing_an_enclosing_input_snapshot() {
     )]);
     assert!(reusable_inputs(
         workspace.path(),
-        &pending,
+        PendingResults {
+            restored_at_end: &pending,
+            intermediate: &[],
+        },
         &available,
         &BTreeSet::from(["tree".into(), "tree/child".into()]),
         &BTreeSet::from(["tree".into()])

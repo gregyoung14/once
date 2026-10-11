@@ -7,7 +7,7 @@ use once_frontend::analysis::DeclaredAction;
 
 use super::{
     enclosing_available_output, restore_outputs, AvailableInput, DeclaredActionsState,
-    SourceDigestCache,
+    PendingResults, SourceDigestCache,
 };
 
 #[cfg(test)]
@@ -30,7 +30,7 @@ fn overlaps(left: &str, right: &str) -> bool {
 pub(super) async fn restore(
     workspace: &Path,
     cache: &CacheProvider,
-    pending: &[ActionResult],
+    pending: PendingResults<'_>,
     available: &BTreeMap<String, AvailableInput>,
     declared: &DeclaredAction,
     digests: Option<&SourceDigestCache>,
@@ -42,17 +42,17 @@ pub(super) async fn restore(
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     let prior = pending
-        .iter()
+        .all()
         .flat_map(|result| result.outputs.keys().cloned())
         .collect::<BTreeSet<_>>();
     let mutations = super::touched_paths(declared)
         .into_iter()
         .filter_map(|path| match path {
             super::TouchedPath::Replaced(path) => Some(path),
-            super::TouchedPath::Created(path) => (!prior
-                .iter()
-                .all(|pending| pending != &path && Path::new(pending).starts_with(&path)))
-            .then_some(path),
+            super::TouchedPath::Created(path) => {
+                super::super::materialization::creation_conflicts(workspace, &path, &prior)
+                    .then_some(path)
+            }
         })
         .collect::<BTreeSet<_>>();
     let unselected = prior
@@ -64,7 +64,7 @@ pub(super) async fn restore(
         || !super::super::materialization::disjoint_paths(workspace, &prior, &mutations)
         || !super::super::materialization::disjoint_paths(workspace, &unselected, &required);
     let mut restored = BTreeSet::new();
-    for result in pending {
+    for result in pending.all() {
         let outputs = result
             .outputs
             .iter()
@@ -75,8 +75,10 @@ pub(super) async fn restore(
             continue;
         }
         let result = ActionResult {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
             outputs,
-            ..result.clone()
         };
         restore_outputs(workspace, cache, &result, digests).await?;
         restored.extend(result.outputs.into_keys());
@@ -126,30 +128,21 @@ pub(super) async fn restore(
 
 fn reusable_inputs(
     workspace: &Path,
-    pending: &[ActionResult],
+    pending: PendingResults<'_>,
     available: &BTreeMap<String, AvailableInput>,
     prior: &BTreeSet<String>,
     required: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    required
-        .iter()
-        .filter(|path| {
-            pending
-                .iter()
-                .filter_map(|result| result.outputs.get(*path))
-                .next_back()
-                == Some(&available[*path].blob_digest)
-                && super::super::materialization::disjoint_paths(
-                    workspace,
-                    &BTreeSet::from([(*path).clone()]),
-                    &prior
-                        .iter()
-                        .filter(|other| *other != *path)
-                        .cloned()
-                        .collect(),
-                )
-        })
-        .cloned()
+    let matching = required.iter().filter(|path| {
+        pending
+            .all()
+            .filter_map(|result| result.outputs.get(*path))
+            .next_back()
+            == Some(&available[*path].blob_digest)
+    });
+    super::super::materialization::independent_paths(workspace, prior, matching.map(String::as_str))
+        .into_iter()
+        .map(str::to_owned)
         .collect()
 }
 

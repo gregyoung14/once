@@ -149,11 +149,6 @@ impl DeclaredActionsState {
         per_action: Option<PerActionOutcome>,
         policy: &CachedResultPolicy,
     ) {
-        let restored = if outcome.cache_state == EvidenceCacheState::Hit {
-            Vec::new()
-        } else {
-            self.restored_before(policy)
-        };
         self.per_action_outcomes.extend(per_action);
         self.prior_actions_digest = Some(extend_prior_actions_digest(
             self.prior_actions_digest,
@@ -203,14 +198,6 @@ impl DeclaredActionsState {
                 self.intermediate_outputs.remove(path);
             }
         }
-        // What was restored before the action ran is on disk now, possibly
-        // with the action's changes inside it, so it must not be restored
-        // again for a later reader.
-        for path in restored {
-            if let Some(input) = self.available_inputs.get_mut(&path) {
-                input.materialized = true;
-            }
-        }
         track_cached_result(&mut self.cached_results, &outcome, policy, false);
         track_cached_result(&mut self.pending_intermediate, &outcome, policy, true);
         self.input_fingerprints.push(outcome.input_fingerprint);
@@ -224,21 +211,6 @@ impl DeclaredActionsState {
             restored_at_end: &self.cached_results,
             intermediate: &self.pending_intermediate,
         }
-    }
-
-    /// Paths of the pending outputs an action under `policy` found restored
-    /// before it ran.
-    fn restored_before(&self, policy: &CachedResultPolicy) -> Vec<String> {
-        let pending = self.pending();
-        let results = if policy.restores_prior {
-            pending.all().cloned().collect::<Vec<_>>()
-        } else {
-            overlapping_results(pending.all(), &policy.touched)
-        };
-        results
-            .into_iter()
-            .flat_map(|result| result.outputs.into_keys())
-            .collect()
     }
 
     fn take_evidence_records(&mut self) -> Vec<EvidenceRecord> {
@@ -521,7 +493,7 @@ pub(super) struct PendingResults<'a> {
 }
 
 impl<'a> PendingResults<'a> {
-    fn all(self) -> impl Iterator<Item = &'a ActionResult> {
+    fn all(self) -> impl DoubleEndedIterator<Item = &'a ActionResult> {
         self.restored_at_end.iter().chain(self.intermediate)
     }
 }
@@ -598,30 +570,6 @@ fn contains(outer: &str, inner: &str) -> bool {
 /// Whether one path is the other or contains it.
 fn paths_overlap(left: &str, right: &str) -> bool {
     left == right || contains(left, right) || contains(right, left)
-}
-
-/// The waiting outputs that would undo part of what the action does if they
-/// were restored after it ran.
-fn overlapping_results<'a>(
-    results: impl Iterator<Item = &'a ActionResult>,
-    touched: &[TouchedPath],
-) -> Vec<ActionResult> {
-    results
-        .filter_map(|result| {
-            let outputs = result
-                .outputs
-                .iter()
-                .filter(|(path, _)| touched.iter().any(|touched| touched.conflicts_with(path)))
-                .map(|(path, digest)| (path.clone(), *digest))
-                .collect::<BTreeMap<_, _>>();
-            (!outputs.is_empty()).then_some(ActionResult {
-                exit_code: 0,
-                stdout: None,
-                stderr: None,
-                outputs,
-            })
-        })
-        .collect()
 }
 
 /// Keep one list of pending cache hits current after `outcome`: the outputs

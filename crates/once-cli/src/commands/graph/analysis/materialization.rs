@@ -27,6 +27,22 @@ pub(super) fn disjoint_paths(
     paths::disjoint(workspace, left, right)
 }
 
+pub(super) fn independent_paths<'a>(
+    workspace: &Path,
+    paths: &std::collections::BTreeSet<String>,
+    candidates: impl Iterator<Item = &'a str>,
+) -> std::collections::BTreeSet<&'a str> {
+    self::paths::independent_members(workspace, paths, candidates)
+}
+
+pub(super) fn creation_conflicts(
+    workspace: &Path,
+    created: &str,
+    pending: &std::collections::BTreeSet<String>,
+) -> bool {
+    paths::creation_conflicts(workspace, created, pending)
+}
+
 pub(super) async fn restore(
     results: &[ActionResult],
     workspace: &Path,
