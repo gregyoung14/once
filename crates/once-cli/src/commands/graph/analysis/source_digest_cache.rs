@@ -322,6 +322,7 @@ impl SourceDigestCache {
         result: &once_cas::ActionResult,
         workspace: &Path,
         cache: &once_cas::CacheProvider,
+        lease: Option<once_core::ExecutionPermit>,
     ) -> once_core::Result<()> {
         let mut required = result.clone();
         let mut selected = BTreeSet::new();
@@ -348,7 +349,12 @@ impl SourceDigestCache {
             // cheapest possible outcome.
             return Ok(());
         }
-        once_core::materialize_outputs(&required, workspace, cache).await?;
+        match lease {
+            Some(lease) => {
+                once_core::materialize_outputs_admitted(&required, workspace, cache, lease).await?;
+            }
+            None => once_core::materialize_outputs(&required, workspace, cache).await?,
+        }
         self.record_outputs(&required, workspace);
         Ok(())
     }

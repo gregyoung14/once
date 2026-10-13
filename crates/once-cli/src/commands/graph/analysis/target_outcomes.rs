@@ -180,7 +180,22 @@ impl TargetOutcomes {
             action_digest: record.action_digest,
             input_digest: record.input_digest,
             input_fingerprint: record.input_fingerprint.clone(),
-            available_inputs: record.available_inputs.clone(),
+            // Whether an output is on disk described the disk of the build
+            // that wrote the record. A reader restores what it needs instead,
+            // which costs nothing for an output that is still in place.
+            available_inputs: record
+                .available_inputs
+                .iter()
+                .map(|(path, input)| {
+                    (
+                        path.clone(),
+                        AvailableInput {
+                            materialized: false,
+                            ..*input
+                        },
+                    )
+                })
+                .collect(),
             outputs: record.outputs.clone(),
             // A reused record means nothing ran, which is a hit however the
             // build that produced it went. Replaying the producing run's state

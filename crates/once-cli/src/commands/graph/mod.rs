@@ -27,8 +27,8 @@ use once_frontend::GraphTarget;
 
 pub use self::capability::load_graph_for_capability_with_configuration;
 use self::capability::{
-    build_target, ensure_capability, record_capability_run, run_target_capability, write_record,
-    CapabilityRunRecord,
+    build_target, build_target_deferring, ensure_capability, record_capability_run,
+    run_target_capability, write_record, CapabilityRunRecord,
 };
 use self::lint::{
     lint_provider_output_path, persist_lint_results, validate_lint_provider, write_lint_results,
@@ -212,20 +212,21 @@ pub async fn build(
             return Err(error);
         }
     };
-    let record = match build_target(workspace, cache, target, &session, sandbox).await {
-        Ok(record) => record,
-        Err(error) => {
-            let duration_ms: u64 = started_at
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
-            bus_events::target_failed(&bus, target_id, duration_ms);
-            finish_live_reporter(live_reporter).await;
-            finish_reporter(reporter).await;
-            return Err(error);
-        }
-    };
+    let (record, deferred) =
+        match build_target_deferring(workspace, cache, target, &session, sandbox).await {
+            Ok(built) => built,
+            Err(error) => {
+                let duration_ms: u64 = started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                bus_events::target_failed(&bus, target_id, duration_ms);
+                finish_live_reporter(live_reporter).await;
+                finish_reporter(reporter).await;
+                return Err(error);
+            }
+        };
     record_capability_run(workspace, &record).await;
     // An uncacheable build (any declared action with `cacheable = false`, which
     // several target kinds such as Dockerfile, Go, and Android use) must run on
@@ -289,6 +290,7 @@ pub async fn build(
                     host_paths: &host_paths,
                     source_digests: &source_digests,
                     produced: &produced,
+                    deferred: &deferred,
                 },
                 &record,
             )
@@ -552,7 +554,7 @@ pub async fn test_with_filters(
             result,
         }
     } else {
-        run_target_capability(workspace, cache, target, "test", sandbox).await?
+        run_target_capability(workspace, cache, target, "test", sandbox, &session).await?
     };
     record_capability_run(workspace, &record).await;
     if test_filters.is_empty() {
@@ -806,7 +808,7 @@ pub async fn run(
             result,
         }
     } else {
-        run_target_capability(workspace, cache, target, "run", sandbox).await?
+        run_target_capability(workspace, cache, target, "run", sandbox, &session).await?
     };
     record_capability_run(workspace, &record).await;
     write_record(output, &record).await?;

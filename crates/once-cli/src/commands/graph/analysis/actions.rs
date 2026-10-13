@@ -33,8 +33,15 @@ use super::output_state;
 use super::source_digest_cache::SourceDigestCache;
 use super::{AvailableInput, BuildOutcome, PerActionOutcome};
 
+mod recovery;
 mod runner;
 mod scheduling;
+mod uncached_process;
+mod worker_lease;
+
+pub(super) use self::recovery::{Producers, Repair};
+pub(super) use self::runner::run_declared_actions_with;
+pub(super) use self::worker_lease::WorkerLease;
 
 const FAILURE_OUTPUT_LIMIT: usize = 16 * 1024;
 const EVIDENCE_FLUSH_BATCH_SIZE: usize = 128;
@@ -55,6 +62,8 @@ struct DeclaredActionRun<'a> {
     sandbox: SandboxMode,
     resources: &'a Arc<ResourcePool>,
     output_observer: Option<&'a dyn ActionOutputObserver>,
+    producers: &'a Producers,
+    worker: Option<&'a WorkerLease<'a>>,
 }
 
 struct DeclaredActionOutcome {
@@ -199,6 +208,13 @@ impl DeclaredActionsState {
                 input.materialized = true;
             }
         }
+        if outcome.cache_state != EvidenceCacheState::Hit {
+            output_state::forget_replaced_materializations(
+                &mut self.available_inputs,
+                &policy.touched,
+                &outcome.result.outputs,
+            );
+        }
         track_cached_result(&mut self.cached_results, &outcome, policy, false);
         track_cached_result(&mut self.pending_intermediate, &outcome, policy, true);
         self.input_fingerprints.push(outcome.input_fingerprint);
@@ -274,6 +290,28 @@ struct DeclaredActionContext<'a> {
     record_success_evidence: bool,
     resources: &'a Arc<ResourcePool>,
     output_observer: Option<&'a dyn ActionOutputObserver>,
+    producers: &'a Producers,
+    worker: Option<&'a WorkerLease<'a>>,
+}
+
+impl DeclaredActionContext<'_> {
+    fn repair(&self) -> Repair<'_> {
+        Repair {
+            workspace: self.workspace,
+            cache: self.cache,
+            source_digest_cache: self.source_digest_cache,
+            resources: self.resources,
+            producers: self.producers,
+        }
+    }
+
+    /// Take a worker lane once the action is admitted, so a lane is never
+    /// held by an action still queued for capacity or for its lock.
+    async fn claim_worker(&self) {
+        if let Some(worker) = self.worker {
+            worker.claim().await;
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -472,6 +510,7 @@ pub(super) async fn validate_declared_actions(
     Ok(validations)
 }
 
+#[cfg(test)]
 pub(super) use runner::run_declared_actions;
 
 fn extend_prior_actions_digest(
@@ -838,6 +877,8 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
         sandbox,
         resources,
         output_observer,
+        producers,
+        worker,
     } = run;
     let identifier_for_error = declared
         .identifier
@@ -858,6 +899,10 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
         "preparing declared graph action"
     );
     let prepare_started = std::time::Instant::now();
+    let preparation = producers
+        .executors(resources)?
+        .acquire_materialization()
+        .await;
     materialize_declared_arg_files(workspace, &declared.arg_files).with_context(|| {
         format!("writing arg files for action {index} for {target_id} ({identifier_for_error})")
     })?;
@@ -871,6 +916,7 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
         sandbox,
     )
     .with_context(|| format!("building action {index} for {target_id} ({identifier_for_error})"))?;
+    drop(preparation);
     let prepare_ms = i64::try_from(prepare_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let action = prepared.action;
     let context = DeclaredActionContext {
@@ -889,26 +935,19 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
         record_success_evidence,
         resources,
         output_observer,
+        producers,
+        worker,
     };
 
     let execute_started = std::time::Instant::now();
     let outcome = if cacheable {
         run_cacheable_declared_action(context, action, &declared).await
     } else {
-        materialize_prior_results_for(
-            workspace,
-            cache,
+        restore_declared_inputs(
+            &context.repair(),
             prior_cached_results,
             &declared,
-            source_digest_cache,
-        )
-        .await?;
-        materialize_available_inputs(
-            workspace,
-            cache,
-            &declared,
             available_inputs,
-            source_digest_cache,
         )
         .await
         .with_context(|| {
@@ -916,12 +955,7 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
                 "materializing inputs for action {index} for {target_id} ({identifier_for_error})"
             )
         })?;
-        prepare_declared_command_paths(workspace, &declared)
-            .await
-            .with_context(|| {
-                format!("preparing action {index} for {target_id} ({identifier_for_error})")
-            })?;
-        run_uncacheable_declared_action(context, action, declared.inherit_parent_env).await
+        run_uncacheable_declared_action(context, action, &declared).await
     };
     let execute_ms = i64::try_from(execute_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     outcome.map(|mut o| {
@@ -931,15 +965,25 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
     })
 }
 
+#[cfg(test)]
 async fn prepare_declared_command_paths(workspace: &Path, declared: &DeclaredAction) -> Result<()> {
     if declared.operation.is_some() {
         return Ok(());
     }
-    for path in &declared.clean_paths {
+    prepare_command_setup(workspace, &declared.clean_paths, &declared.create_dirs).await
+}
+
+#[cfg(test)]
+async fn prepare_command_setup(
+    workspace: &Path,
+    clean_paths: &[String],
+    create_dirs: &[String],
+) -> Result<()> {
+    for path in clean_paths {
         let path = workspace_path(path, "clean_paths entry")?;
         remove_declared_path_if_exists(&path.resolve(workspace), path.as_str()).await?;
     }
-    for path in &declared.create_dirs {
+    for path in create_dirs {
         let path = workspace_path(path, "create_dirs entry")?;
         tokio::fs::create_dir_all(path.resolve(workspace))
             .await
@@ -948,6 +992,34 @@ async fn prepare_declared_command_paths(workspace: &Path, declared: &DeclaredAct
     Ok(())
 }
 
+async fn prepare_command_setup_admitted(
+    workspace: &Path,
+    cache: &CacheProvider,
+    clean_paths: &[String],
+    create_dirs: &[String],
+    lease: &once_core::ExecutionPermit,
+) -> Result<()> {
+    let paths = clean_paths
+        .iter()
+        .map(|path| (path, once_core::PreparePathMode::Remove))
+        .chain(
+            create_dirs
+                .iter()
+                .map(|path| (path, once_core::PreparePathMode::Directory)),
+        );
+    for (path, mode) in paths {
+        let action = Action::PreparePath {
+            path: workspace_path(path, "command preparation path")?,
+            mode,
+            input_digest: None,
+        };
+        once_core::run_uncached_admitted(&action, workspace, cache, false, None, lease.clone())
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 async fn remove_declared_path_if_exists(abs: &Path, label: &str) -> Result<()> {
     let metadata = match tokio::fs::symlink_metadata(abs).await {
         Ok(metadata) => metadata,
@@ -997,6 +1069,7 @@ async fn run_cacheable_declared_action(
         }
         .into());
     }
+    record_producer(&context, &action, declared, &outcome.result);
     let cache_tag = crate::commands::util::cache_tag(outcome.cache);
     let cache_state = EvidenceCacheState::from(outcome.cache);
     tracing::debug!(
@@ -1035,6 +1108,67 @@ async fn run_cacheable_declared_action(
     })
 }
 
+/// Remember how this action produced its outputs, so a later restore that
+/// finds their bytes gone can run it again.
+fn record_producer(
+    context: &DeclaredActionContext<'_>,
+    action: &Action,
+    declared: &DeclaredAction,
+    result: &ActionResult,
+) {
+    if result.outputs.is_empty() {
+        return;
+    }
+    let mut inputs = prior_results_for(context.prior_cached_results, declared)
+        .into_iter()
+        .flat_map(|result| result.outputs)
+        .collect::<BTreeMap<_, _>>();
+    inputs.extend(
+        declared
+            .inputs
+            .iter()
+            .filter_map(|input| enclosing_available_output(context.available_inputs, input))
+            .map(|(path, input)| (path.clone(), input.blob_digest)),
+    );
+    if declared.depends_on_prior_actions {
+        inputs.extend(
+            context
+                .available_inputs
+                .iter()
+                .filter(|(_, input)| input.same_target)
+                .map(|(path, input)| (path.clone(), input.blob_digest)),
+        );
+    }
+    inputs.retain(|path, _| !result.outputs.contains_key(path));
+    context.producers.record(recovery::Producer {
+        target_id: context.target_id.to_string(),
+        capability: context.capability.to_string(),
+        index: context.index,
+        identifier: context.identifier.to_string(),
+        report: recovery::ProducerReport {
+            reported: !declared
+                .operation
+                .as_ref()
+                .is_some_and(DeclaredActionOperation::is_bookkeeping),
+            identifier: declared.identifier.clone(),
+            display_name: declared.display_name.clone(),
+            source_files: declared.source_files.clone(),
+            presentation: declared.presentation.clone(),
+            history: declared.history.clone(),
+        },
+        action: action.clone(),
+        setup: declared
+            .operation
+            .is_none()
+            .then(|| recovery::CommandSetup {
+                clean_paths: declared.clean_paths.clone(),
+                create_dirs: declared.create_dirs.clone(),
+            }),
+        inputs,
+        outputs: result.outputs.clone(),
+    });
+}
+
 async fn resolve_cacheable_declared_action(
     context: &DeclaredActionContext<'_>,
     action: &Action,
@@ -1045,62 +1179,94 @@ async fn resolve_cacheable_declared_action(
     // A cache hit does not run command setup. Removing a clean_paths entry on
     // a hit could delete an unrelated path with no command left to recreate it.
     let action_digest = action.digest();
-    let mut action_lock = cacheable_action_lock(context.workspace, action_digest)?;
-    let _action_guard = loop {
-        match action_lock.try_write() {
-            Ok(guard) => break guard,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "locking action {} for {} ({})",
-                        context.index, context.target_id, context.identifier
-                    )
-                });
-            }
-        }
-    };
-    let cached = context
-        .cache
-        .get_action_result(&action_digest)
-        .await
-        .with_context(|| {
-            format!(
-                "probing cache for action {} for {} ({})",
-                context.index, context.target_id, context.identifier
-            )
-        })?;
-    let outcome = if let Some(result) = cached {
-        if action_result_blobs_present(
-            &result,
-            context.workspace,
-            context.cache,
-            context.source_digest_cache,
+    if let Some(outcome) = probe_cached_action(context, action_digest).await? {
+        context.claim_worker().await;
+        return Ok(outcome);
+    }
+    // Inputs go on disk before admission: restoring one can mean running its
+    // producer again, which needs capacity of its own.
+    restore_declared_inputs(
+        &context.repair(),
+        context.prior_cached_results,
+        declared,
+        context.available_inputs,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "materializing inputs for action {} for {} ({})",
+            context.index, context.target_id, context.identifier
         )
-        .await?
-        {
-            once_core::Outcome {
-                action: action_digest,
-                result,
-                cache: once_core::CacheState::Hit,
+    })?;
+    let outcome = recovery::with_action_lock_and_permit(
+        context.workspace,
+        action_digest,
+        context.producers.executors(context.resources)?,
+        action.resource_request().clone(),
+        |contended, lease| async move {
+            // Another process held the action, so it may have produced the
+            // result while this one waited.
+            if contended {
+                if let Some(outcome) = probe_cached_action(context, action_digest).await? {
+                    context.claim_worker().await;
+                    return Ok(outcome);
+                }
             }
-        } else {
-            execute_declared_cache_miss(context, action, declared).await?
-        }
-    } else {
-        execute_declared_cache_miss(context, action, declared).await?
-    };
+            context.claim_worker().await;
+            execute_declared_cache_miss(context, action, declared, lease).await
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "running action {} for {} ({})",
+            context.index, context.target_id, context.identifier
+        )
+    })?;
     if outcome.cache == once_core::CacheState::Miss {
         if let Some(cache) = context.source_digest_cache {
             cache.record_outputs(&outcome.result, context.workspace);
         }
     }
     Ok(outcome)
+}
+
+/// The cached result for the action, when every blob it names can still be
+/// had. A transport failure is an error rather than a miss.
+async fn probe_cached_action(
+    context: &DeclaredActionContext<'_>,
+    action_digest: Digest,
+) -> Result<Option<once_core::Outcome>> {
+    let probe = || {
+        format!(
+            "probing cache for action {} for {} ({})",
+            context.index, context.target_id, context.identifier
+        )
+    };
+    let Some(result) = context
+        .cache
+        .get_action_result(&action_digest)
+        .await
+        .with_context(probe)?
+    else {
+        return Ok(None);
+    };
+    if !action_result_blobs_present(
+        &result,
+        context.workspace,
+        context.cache,
+        context.source_digest_cache,
+    )
+    .await
+    .with_context(probe)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(once_core::Outcome {
+        action: action_digest,
+        result,
+        cache: once_core::CacheState::Hit,
+    }))
 }
 
 fn cacheable_action_lock(workspace: &Path, digest: Digest) -> Result<RwLock<std::fs::File>> {
@@ -1151,44 +1317,21 @@ async fn action_result_blobs_present(
     Ok(true)
 }
 
+/// Run a cache miss whose inputs are on disk, holding its lock and permit.
 async fn execute_declared_cache_miss(
     context: &DeclaredActionContext<'_>,
     action: &Action,
     declared: &DeclaredAction,
+    lease: once_core::ExecutionPermit,
 ) -> Result<once_core::Outcome> {
-    let _permit = context
-        .resources
-        .acquire(action.resource_request().clone())
-        .await;
-    materialize_prior_results_for(
-        context.workspace,
-        context.cache,
-        context.prior_cached_results,
-        declared,
-        context.source_digest_cache,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "materializing prior outputs for action {} for {} ({})",
-            context.index, context.target_id, context.identifier
+    if declared.operation.is_none() {
+        prepare_command_setup_admitted(
+            context.workspace,
+            context.cache,
+            &declared.clean_paths,
+            &declared.create_dirs,
+            &lease,
         )
-    })?;
-    materialize_available_inputs(
-        context.workspace,
-        context.cache,
-        declared,
-        context.available_inputs,
-        context.source_digest_cache,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "materializing inputs for action {} for {} ({})",
-            context.index, context.target_id, context.identifier
-        )
-    })?;
-    prepare_declared_command_paths(context.workspace, declared)
         .await
         .with_context(|| {
             format!(
@@ -1196,19 +1339,16 @@ async fn execute_declared_cache_miss(
                 context.index, context.target_id, context.identifier
             )
         })?;
-    let result = match context.output_observer {
-        Some(observer) => {
-            once_core::run_uncached_observed(
-                action,
-                context.workspace,
-                context.cache,
-                false,
-                observer,
-            )
-            .await
-        }
-        None => once_core::run_uncached(action, context.workspace, context.cache, false).await,
     }
+    let result = once_core::run_uncached_admitted(
+        action,
+        context.workspace,
+        context.cache,
+        false,
+        context.output_observer,
+        lease,
+    )
+    .await
     .with_context(|| {
         format!(
             "executing action {} for {} ({})",
@@ -1235,36 +1375,55 @@ async fn execute_declared_cache_miss(
     })
 }
 
-/// Restore the cached outputs still waiting to be put on disk that the action
-/// can observe before it runs.
+/// The cached outputs still waiting to be put on disk that the action can
+/// observe before it runs.
 ///
 /// An action that depends on the ones before it may read any of them. One
-/// that doesn't declares what it reads, which `materialize_available_inputs`
-/// restores, so only the outputs it is about to write over, clean, or remove
+/// that doesn't declares what it reads, which `unmaterialized_inputs_for`
+/// selects, so only the outputs it is about to write over, clean, or remove
 /// come back first, leaving the rest for the target's end.
-pub(super) async fn materialize_prior_results_for(
-    workspace: &Path,
-    cache: &CacheProvider,
-    pending: PendingResults<'_>,
-    declared: &DeclaredAction,
-    source_digest_cache: Option<&SourceDigestCache>,
-) -> Result<()> {
-    let results = if declared.depends_on_prior_actions {
-        pending.all().cloned().collect::<Vec<_>>()
+fn prior_results_for(pending: PendingResults<'_>, declared: &DeclaredAction) -> Vec<ActionResult> {
+    if declared.depends_on_prior_actions {
+        pending.all().cloned().collect()
     } else {
         overlapping_results(pending.all(), &touched_paths(declared))
-    };
-    materialize_prior_cached_results(workspace, cache, &results, source_digest_cache).await
+    }
 }
 
-async fn materialize_prior_cached_results(
-    workspace: &Path,
-    cache: &CacheProvider,
-    results: &[ActionResult],
-    source_digest_cache: Option<&SourceDigestCache>,
+/// The outputs of other actions the action declares reading that aren't on
+/// disk yet.
+fn unmaterialized_inputs_for(
+    declared: &DeclaredAction,
+    available_inputs: &BTreeMap<String, AvailableInput>,
+) -> Option<ActionResult> {
+    let outputs = declared
+        .inputs
+        .iter()
+        .filter_map(|input| enclosing_available_output(available_inputs, input))
+        .filter(|(_, input)| !input.materialized)
+        .map(|(path, input)| (path.clone(), input.blob_digest))
+        .collect::<BTreeMap<_, _>>();
+    (!outputs.is_empty()).then_some(ActionResult {
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        outputs,
+    })
+}
+
+/// Put what the action reads on disk, running the producer of anything the
+/// cache confirms it lost. Callers must not hold an admission permit.
+async fn restore_declared_inputs(
+    repair: &Repair<'_>,
+    pending: PendingResults<'_>,
+    declared: &DeclaredAction,
+    available_inputs: &BTreeMap<String, AvailableInput>,
 ) -> Result<()> {
-    for result in results {
-        restore_outputs(workspace, cache, result, source_digest_cache).await?;
+    for result in prior_results_for(pending, declared) {
+        repair.restore(&result).await?;
+    }
+    if let Some(result) = unmaterialized_inputs_for(declared, available_inputs) {
+        repair.restore(&result).await?;
     }
     Ok(())
 }
@@ -1280,64 +1439,47 @@ async fn restore_outputs(
     cache: &CacheProvider,
     result: &ActionResult,
     source_digest_cache: Option<&SourceDigestCache>,
+    lease: once_core::ExecutionPermit,
 ) -> Result<()> {
     match source_digest_cache {
         Some(digests) => digests
-            .materialize_outputs(result, workspace, cache)
+            .materialize_outputs(result, workspace, cache, Some(lease))
             .await
             .map_err(anyhow::Error::from),
-        None => once_core::materialize_outputs(result, workspace, cache)
+        None => once_core::materialize_outputs_admitted(result, workspace, cache, lease)
             .await
             .map_err(anyhow::Error::from),
     }
-}
-
-async fn materialize_available_inputs(
-    workspace: &Path,
-    cache: &CacheProvider,
-    declared: &DeclaredAction,
-    available_inputs: &BTreeMap<String, AvailableInput>,
-    source_digest_cache: Option<&SourceDigestCache>,
-) -> Result<()> {
-    let outputs = declared
-        .inputs
-        .iter()
-        .filter_map(|input| enclosing_available_output(available_inputs, input))
-        .filter(|(_, input)| !input.materialized)
-        .map(|(path, input)| (path.clone(), input.blob_digest))
-        .collect::<BTreeMap<_, _>>();
-    if outputs.is_empty() {
-        return Ok(());
-    }
-    restore_outputs(
-        workspace,
-        cache,
-        &ActionResult {
-            exit_code: 0,
-            stdout: None,
-            stderr: None,
-            outputs,
-        },
-        source_digest_cache,
-    )
-    .await
 }
 
 async fn run_uncacheable_declared_action(
     context: DeclaredActionContext<'_>,
     action: Action,
-    inherit_parent_env: bool,
+    declared: &DeclaredAction,
 ) -> Result<DeclaredActionOutcome> {
     let action_digest = action.digest();
-    let _permit = context
-        .resources
-        .acquire(action.resource_request().clone())
+    let lease = context
+        .producers
+        .executors(context.resources)?
+        .acquire(once_core::Executor::Local, action.resource_request())
         .await;
-    let result = run_uncached_action(
+    context.claim_worker().await;
+    if declared.operation.is_none() {
+        prepare_command_setup_admitted(
+            context.workspace,
+            context.cache,
+            &declared.clean_paths,
+            &declared.create_dirs,
+            &lease,
+        )
+        .await?;
+    }
+    let result = run_uncached_action_admitted(
         &action,
         context.workspace,
         context.cache,
-        inherit_parent_env,
+        declared.inherit_parent_env,
+        Some(lease),
     )
     .await
     .with_context(|| {
@@ -1566,11 +1708,22 @@ async fn append_captured_output(
     message.push_str(&String::from_utf8_lossy(&bytes));
 }
 
+#[cfg(test)]
 async fn run_uncached_action(
     action: &Action,
     workspace: &Path,
     cache: &CacheProvider,
     inherit_parent_env: bool,
+) -> Result<ActionResult> {
+    run_uncached_action_admitted(action, workspace, cache, inherit_parent_env, None).await
+}
+
+async fn run_uncached_action_admitted(
+    action: &Action,
+    workspace: &Path,
+    cache: &CacheProvider,
+    inherit_parent_env: bool,
+    lease: Option<once_core::ExecutionPermit>,
 ) -> Result<ActionResult> {
     match action {
         Action::RunCommand {
@@ -1582,17 +1735,20 @@ async fn run_uncached_action(
             stdout_path,
             stderr_path,
             sandbox,
+            network,
             ..
         } => {
-            if *sandbox != SandboxMode::Off {
+            // Network denial is enforced only by the core runner, so a command
+            // that asks for it must not take the direct spawn below.
+            if *sandbox != SandboxMode::Off || network.is_denied() {
                 if inherit_parent_env {
-                    anyhow::bail!(
+                    anyhow::bail!(if network.is_denied() {
+                        "inherit_parent_env cannot be combined with network = \"deny\"; remove one of them"
+                    } else {
                         "inherit_parent_env is available only when the action sandbox is off"
-                    );
+                    });
                 }
-                return once_core::run_uncached(action, workspace, cache, false)
-                    .await
-                    .map_err(Into::into);
+                return run_core_admitted(action, workspace, cache, lease).await;
             }
             let argv = resolve_execution_argv(argv, workspace);
             let env = resolve_execution_env(env, workspace);
@@ -1625,35 +1781,12 @@ async fn run_uncached_action(
                 )
                 .await?
             } else {
-                // Uncacheable commands discard stdout rather than buffering
-                // it; only stderr is retained for failure diagnostics.
-                command.stdout(Stdio::null());
-                command.stderr(Stdio::piped());
-                let mut child = command.spawn().context("spawning declared action")?;
-                let stderr_pipe = child
-                    .stderr
-                    .take()
-                    .context("capturing declared action stderr")?;
-                let wait = async {
-                    let stderr = cache.put_stream(stderr_pipe).await?;
-                    let status = child.wait().await?;
-                    Ok::<_, anyhow::Error>((status, stderr))
-                };
-                let (status, stderr) = match timeout_ms {
-                    Some(ms) => tokio::time::timeout(Duration::from_millis(*ms), wait)
-                        .await
-                        .with_context(|| format!("declared action timed out after {ms}ms"))??,
-                    None => wait.await?,
-                };
-                ActionResult {
-                    exit_code: status.code().unwrap_or(-1),
-                    stdout: None,
-                    stderr: Some(stderr),
-                    outputs: BTreeMap::new(),
-                }
+                run_uncached_discarding_stdout(command, *timeout_ms, cache).await?
             };
             if action.accepts_exit_code(result.exit_code) {
-                result.outputs = capture_uncached_outputs(outputs, workspace, cache).await?;
+                result.outputs =
+                    capture_uncached_outputs_admitted(outputs, workspace, cache, lease.as_ref())
+                        .await?;
                 result.exit_code = 0;
             }
             Ok(result)
@@ -1667,11 +1800,57 @@ async fn run_uncached_action(
         | Action::WriteTreeDigest { .. }
         | Action::WriteArchive { .. }
         | Action::DownloadAndExtract { .. } => {
-            once_core::run_uncached(action, workspace, cache, false)
+            run_core_admitted(action, workspace, cache, lease).await
+        }
+    }
+}
+
+async fn run_core_admitted(
+    action: &Action,
+    workspace: &Path,
+    cache: &CacheProvider,
+    lease: Option<once_core::ExecutionPermit>,
+) -> Result<ActionResult> {
+    match lease {
+        Some(lease) => {
+            once_core::run_uncached_admitted(action, workspace, cache, false, None, lease)
                 .await
                 .map_err(Into::into)
         }
+        None => once_core::run_uncached(action, workspace, cache, false)
+            .await
+            .map_err(Into::into),
     }
+}
+
+/// Run an uncacheable command that writes no stream to a file. Stdout is
+/// discarded rather than buffered; only stderr is retained for failure
+/// diagnostics.
+async fn run_uncached_discarding_stdout(
+    mut command: Command,
+    timeout_ms: Option<u64>,
+    cache: &CacheProvider,
+) -> Result<ActionResult> {
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::piped());
+    let mut group =
+        uncached_process::ProcessGroup::spawn(&mut command, "spawning declared action")?;
+    let stderr_pipe = group
+        .take_stderr()
+        .context("capturing declared action stderr")?;
+    let wait = group.wait(Some(stderr_pipe), cache);
+    let (status, stderr) = match timeout_ms {
+        Some(ms) => tokio::time::timeout(Duration::from_millis(ms), wait)
+            .await
+            .with_context(|| format!("declared action timed out after {ms}ms"))??,
+        None => wait.await?,
+    };
+    Ok(ActionResult {
+        exit_code: status.code().unwrap_or(-1),
+        stdout: None,
+        stderr: Some(stderr.context("capturing declared action stderr")?),
+        outputs: BTreeMap::new(),
+    })
 }
 
 /// Run an uncacheable command whose stdout and/or stderr are redirected
@@ -1707,18 +1886,10 @@ async fn run_uncached_redirected(
     let capture_stderr = stderr_file.is_none();
     command.stderr(stderr_file.map_or_else(Stdio::piped, Stdio::from));
 
-    let mut child = command
-        .spawn()
-        .context("spawning redirected declared action")?;
-    let stderr_pipe = child.stderr.take();
-    let wait = async {
-        let stderr_blob = match stderr_pipe {
-            Some(pipe) => Some(cache.put_stream(pipe).await?),
-            None => None,
-        };
-        let status = child.wait().await?;
-        Ok::<_, anyhow::Error>((status, stderr_blob))
-    };
+    let mut group =
+        uncached_process::ProcessGroup::spawn(&mut command, "spawning redirected declared action")?;
+    let stderr_pipe = group.take_stderr();
+    let wait = group.wait(stderr_pipe, cache);
     let (status, stderr_blob) = match timeout_ms {
         Some(ms) => tokio::time::timeout(Duration::from_millis(ms), wait)
             .await
@@ -1745,15 +1916,30 @@ fn open_redirect_file(path: &WorkspacePath, workspace: &Path) -> Result<std::fs:
         .with_context(|| format!("creating redirect output `{}`", path.as_str()))
 }
 
+#[cfg(test)]
 async fn capture_uncached_outputs(
     outputs: &[WorkspacePath],
     workspace: &Path,
     cache: &CacheProvider,
 ) -> Result<BTreeMap<String, Digest>> {
+    capture_uncached_outputs_admitted(outputs, workspace, cache, None).await
+}
+
+async fn capture_uncached_outputs_admitted(
+    outputs: &[WorkspacePath],
+    workspace: &Path,
+    cache: &CacheProvider,
+    lease: Option<&once_core::ExecutionPermit>,
+) -> Result<BTreeMap<String, Digest>> {
     let mut captured = BTreeMap::new();
     for output in outputs {
         let absolute = output.resolve(workspace);
-        let metadata = match tokio::fs::symlink_metadata(&absolute).await {
+        let metadata = match capture_step(lease, {
+            let absolute = absolute.clone();
+            move || std::fs::symlink_metadata(absolute)
+        })
+        .await?
+        {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 anyhow::bail!(
@@ -1768,9 +1954,12 @@ async fn capture_uncached_outputs(
             }
         };
         if metadata.file_type().is_symlink() {
-            let target = tokio::fs::read_link(&absolute).await.with_context(|| {
-                format!("reading declared output symlink `{}`", output.as_str())
-            })?;
+            let target = capture_step(lease, {
+                let absolute = absolute.clone();
+                move || std::fs::read_link(absolute)
+            })
+            .await?
+            .with_context(|| format!("reading declared output symlink `{}`", output.as_str()))?;
             let manifest = format!("once.symlink_output.v1\n{}\n", target.to_string_lossy());
             captured.insert(
                 output.as_str().to_string(),
@@ -1779,7 +1968,7 @@ async fn capture_uncached_outputs(
             continue;
         }
         if metadata.is_dir() {
-            let manifest = tokio::task::spawn_blocking({
+            let manifest = capture_step(lease, {
                 let absolute = absolute.clone();
                 move || directory_manifest_bytes(&absolute)
             })
@@ -1791,12 +1980,29 @@ async fn capture_uncached_outputs(
             );
             continue;
         }
-        let file = tokio::fs::File::open(&absolute)
-            .await
+        let file = capture_step(lease, move || std::fs::File::open(absolute))
+            .await?
             .with_context(|| format!("opening declared action output `{}`", output.as_str()))?;
-        captured.insert(output.as_str().to_string(), cache.put_stream(file).await?);
+        captured.insert(
+            output.as_str().to_string(),
+            cache.put_stream(tokio::fs::File::from_std(file)).await?,
+        );
     }
     Ok(captured)
+}
+
+async fn capture_step<T, F>(
+    lease: Option<&once_core::ExecutionPermit>,
+    work: F,
+) -> std::result::Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match lease {
+        Some(lease) => lease.run_blocking(work).await,
+        None => tokio::task::spawn_blocking(work).await,
+    }
 }
 
 fn directory_manifest_bytes(root: &Path) -> Result<Vec<u8>> {
@@ -2800,9 +3006,18 @@ mod tests {
             outputs: BTreeMap::from([(path.to_string(), blob)]),
         };
 
-        materialize_prior_cached_results(workspace.path(), &cache, &[result], None)
-            .await
-            .unwrap();
+        let resources = once_core::ExecutorResources::new(Arc::new(ResourcePool::new(
+            once_core::ResourceLimits::default(),
+        )));
+        restore_outputs(
+            workspace.path(),
+            &cache,
+            &result,
+            None,
+            resources.acquire_materialization().await,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             std::fs::read(workspace.path().join(path)).unwrap(),
@@ -3731,7 +3946,7 @@ demo_kind = {"_once_target_kind": True, "kind": "demo_kind", "impl": impl}
 
         for result in &second.cached_results {
             source_digest_cache
-                .materialize_outputs(result, workspace.path(), &cache)
+                .materialize_outputs(result, workspace.path(), &cache, None)
                 .await
                 .unwrap();
         }

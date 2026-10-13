@@ -35,7 +35,7 @@ async fn restoring_a_tree_preserves_a_matching_newer_child() {
     digests.record_outputs(&updated, workspace.path());
     result.outputs.extend(updated.outputs.clone());
     digests
-        .materialize_outputs(&result, workspace.path(), &cache)
+        .materialize_outputs(&result, workspace.path(), &cache, None)
         .await
         .unwrap();
     assert_eq!(
@@ -43,7 +43,7 @@ async fn restoring_a_tree_preserves_a_matching_newer_child() {
         "new"
     );
     digests
-        .materialize_outputs(&original_tree, workspace.path(), &cache)
+        .materialize_outputs(&original_tree, workspace.path(), &cache, None)
         .await
         .unwrap();
     assert_eq!(
@@ -55,7 +55,7 @@ async fn restoring_a_tree_preserves_a_matching_newer_child() {
         outputs: BTreeSet::new(),
     });
     digests
-        .materialize_outputs(&updated, workspace.path(), &cache)
+        .materialize_outputs(&updated, workspace.path(), &cache, None)
         .await
         .unwrap();
     assert_eq!(
