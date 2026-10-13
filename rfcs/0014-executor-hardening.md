@@ -39,7 +39,7 @@ individual components passing earlier tests.
 | Transfer deadlock | All-or-nothing staging acquisition; input phase released before output phases; growing capture admission fails rather than waits while holding partial capacity; bounded publication lock waits | Stress and liveness tests for any future shared transfer scheduler and event/action upload composition |
 | Absence versus outage | Classified cache failures; only confirmed missing blobs trigger bounded producer recovery; corruption is verified and quarantined; idempotent retries and timed initialization cooldown | Negotiated native REAPI recovery and explicit remote materialization policy |
 | Uncertain execution | No blind create or command retries; durable intent, operation marker, authenticated reconciliation, retained uncertain records and finite hosted lifetimes | Duplicate-safe REAPI actions, observation recovery and optional cancellation handling |
-| Persistent reuse | Durable cache metadata; output restoration separated from materialized flags; build receipts distinguish deferred intermediates; per-invocation producer provenance and shared repair outcomes | Persisted remote producer/location provenance |
+| Persistent reuse | Durable cache metadata; output restoration separated from materialized flags; build receipts distinguish deferred intermediates; per-invocation producer provenance and shared repair outcomes; fingerprint-only restoration/reuse refusal; local target memo keys bind dependency contents | Persisted remote producer/location provenance |
 | Estimates versus guarantees | Required minimum admission fails instead of clamping; native network denial fails closed; concurrency/memory estimates explicitly not hard limits | Required cgroup/container enforcement, unavailable-controller tests, generic target-kind requirement declarations |
 | Interoperability | Hosted control responses bounded/sanitized; redirects disabled; Daytona toolbox restricted to configured origins; ownership listings verify markers | Native REAPI negotiation, independent implementations, layer-7 proxy/GOAWAY/rotation tests |
 | Maintenance and diagnostics | Bounded reconciliation passes, live-owner locks, quarantine; structured admission and hosted phase logs without command output, raw error bodies, or environment values | Recovery diagnostics and maintenance fairness stress tests; enforce any stronger machine-wide guarantee before claiming it |
@@ -239,12 +239,72 @@ artifact envelopes. Pinned digest tests exercise the production path, including
 dangling links; an owned capture-worker cancellation test checks the bridge.
 
 Those legacy uncached manifests contain hashes, not restorable directory contents.
-Restoration after a later action replaces an enclosing path remains an existing
-limitation, not a newly claimed capability. Changing that format or refusing such
-restores needs a separate compatibility decision. Linux/network-filesystem and
-Windows lock semantics, live hosted interoperability, lifecycle clock skew, ZIP
-size misreporting and aggregate filesystem overhead retain their own validation
-gates.
+The subsequent adversarial review confirmed that restoring them after cleanup
+could install manifest text as a regular file and poison consumer results. The
+fingerprint-only restoration and historical-result guards below supersede the
+previous decision to leave this as an unsupported compatibility limitation.
+Linux/network-filesystem and Windows lock semantics, live hosted interoperability,
+lifecycle clock skew, ZIP size misreporting and aggregate filesystem overhead
+retain their own validation gates.
+
+### Fingerprint-Only Outputs And Historical Poisoning
+
+A real three-action regression confirmed the failure: an uncacheable unsandboxed
+command produced a symlink, another action cleaned it, and a consumer successfully
+read its manifest as ordinary file contents. A directory producer similarly left
+an incorrect regular file at the directory path. Producer fingerprints and
+consumer action keys stayed unchanged, allowing bad results to persist in the
+cache.
+
+Direct capture now records insert-only invocation evidence keyed by exact output
+path and digest. Capture and verification share the same typed legacy fingerprint
+function. Before any core restore or prefetch, a materialization-admitted blocking
+worker checks each fingerprint-only output against its current filesystem type
+and contents. Verified outputs are omitted from restoration. Missing, changed or
+wrong-type outputs refuse with the path, producer identifier and an actionable
+hint. The refusal is not missing-cache evidence, never runs a producer again, and
+happens before installing other outputs from the same result. Unmaterialized
+fingerprint inputs also validate during preparation, before computing an action
+key or querying the cache, without nested admission.
+
+Historical action-cache entries cannot be trusted merely because the current
+output is intact: a formerly cleaned graph and an intact graph can have identical
+consumer keys. Consumers of fingerprint-only declared or implicit same-target
+inputs therefore skip both the initial cache probe and the contended-lock
+re-probe, while retaining ordinary admitted execution and publication. This is an
+eligibility decision, not authorization to run after a cache outage or refusal.
+Local and remote publication retain their existing failure policies. These
+consumers intentionally recompute on each invocation; ordinary raw-file and core
+artifact inputs keep their reuse behavior.
+
+Whole-target reuse also excludes fingerprint-only dependency inputs. An
+intermediate target can replace the fingerprint path with a restorable artifact,
+hiding that original evidence from later targets. Local target-outcome memo keys
+now bind canonical dependency path/content digests in addition to analysis and
+producer action digests, through a versioned, incremental BLAKE3 encoding with
+length-prefixed fields and counted sections. Corrected intermediate contents
+invalidate historical downstream records even when producer action keys remain
+unchanged. Only local optimization keys change; action encoding and digest
+domains, artifact bytes, persisted record shape and the cache-centered SDK remain
+unchanged. Older local memo keys miss safely.
+
+Evidence remains insert-only even if a later raw-file output has the same path
+and bytes as an earlier directory or symlink fingerprint. Clearing it would let
+older input maps restore the manifest as a file again. Such exact-key ambiguity
+conservatively refuses restoration for the invocation. Raw files merely starting
+with manifest prefixes, at unregistered keys, remain ordinary restorable files.
+Legacy fingerprints still exclude file modes and special directory entries, and
+raw legacy file restoration retains its existing mode policy.
+
+Regressions cover cleaned symlinks/directories, unchanged live outputs, wrong
+filesystem types, absent descriptor blobs, refusal classification and no repair,
+no partial installation, exact-key ambiguity, literal-prefix files, exact nested
+children, cross-target inputs, historical poisoned hits with intact explicit and
+implicit inputs, and whole-target/intermediate-hop replay. Removing the restore
+split fails four tests; enabling consumer reuse fails the seeded-poison test;
+removing the target exclusion fails its historical-record test; omitting content
+digests from memo keys fails two key/intermediate-hop tests. All mutations were
+restored before final acceptance.
 
 ## Validation Status
 
@@ -273,10 +333,12 @@ the later caller-path findings superseded that blanket conclusion. The follow-up
 review found the corrected ownership, lock and restore ordering sound by code
 reading. After the compatibility correction and pinned production-path tests,
 Claude repeated the graph admission/capture/capability regressions three times and
-reported no remaining blockers in these fixes. The existing legacy-manifest
-restoration limitation and live-environment gates above remain explicit.
+reported no remaining blockers in those ownership fixes. A subsequent fresh
+review found the fingerprint-only restoration and historical-replay bugs above,
+so that earlier conclusion is not acceptance of the later corrected tree. The
+platform and live-environment gates remain explicit.
 
-The corrected combined tree passed:
+The caller-ownership corrected tree, before the later fingerprint-only fixes, passed:
 
 - `mise exec -- cargo test --workspace`: 425 core unit tests and 532 CLI unit
   tests passed, together with workspace integration and documentation tests.
@@ -289,8 +351,9 @@ The corrected combined tree passed:
   execution, input/output transfer and cache restoration ran.
 
 An earlier overlapping ShellSpec run used a pre-correction binary and is not used
-as final acceptance. Final acceptance uses the rebuilt corrected binary and the
-complete suite above, not a partial run or mutation tree.
+as acceptance of that caller-ownership tree. Its acceptance used the rebuilt
+corrected binary and complete suite above, not a partial run or mutation tree.
+The later fingerprint-only fixes have their own validation below.
 
 Deterministic framing/deadline tests passed 20 full no-default-feature core rounds.
 Later download, admission and cancellation regressions were repeated, and mutation
@@ -303,3 +366,30 @@ and are not established by macOS/mock-server tests. ZIP size-misreporting mutati
 coverage and aggregate accounting of symlink/directory filesystem overhead remain
 focused follow-up gates; regular file expansion, metadata and entry counts have
 separate enforced bounds.
+
+### Fingerprint-Only Follow-Up Acceptance
+
+Claude reviewed the restoration guard, rejected unsafe evidence clearing, checked
+historical action/target replay and identified the hidden intermediate-hop case.
+The corrected final review found no remaining blockers in these fixes, including
+the incremental, length-prefixed local memo key. That conclusion covers this
+change, not the platform, hosted-provider or future-feature gates above.
+
+The final settled tree passed:
+
+- `mise exec -- cargo test --workspace`: 549 CLI unit tests and 425 core unit
+  tests passed, together with workspace integration and documentation tests.
+- `mise exec -- cargo test -p once-core --all-targets --no-default-features`.
+- `mise exec -- cargo clippy --workspace --all-targets -- -D warnings`.
+- `mise exec -- cargo clippy -p once-core --all-targets --no-default-features -- -D warnings`.
+- `mise exec -- cargo fmt --all -- --check` and `git diff --check`.
+- `mise exec -- cargo build --release`, rebuilt after the final production edits.
+- `ONCE_RUN_MICROSANDBOX_SPECS=1 mise exec -- shellspec`: 328 examples, zero
+  failures, seven existing Cargo/container skips, 823.11 seconds. Live
+  Microsandbox execution, declared input/output transfer and cache restoration ran.
+
+The 17 new regressions and four targeted mutations distinguish actual protection
+from a green baseline. Preliminary checks run before the intermediate-hop fix,
+and checks overlapping mutation edits, are not final acceptance. All mutations
+were restored before the settled-tree commands above; ShellSpec used its rebuilt
+release binary.

@@ -287,11 +287,20 @@ effects do not fit cached build rules.
 **Once now.** CAS/action-cache reuse is independent of a long-running daemon, and
 ordinary runner hits restore outputs. Reusable graph target outcomes also retain
 per-action identities. Their persistent validity and deferred output availability
-must continue to be checked separately from in-memory graph reuse.
+must continue to be checked separately from in-memory graph reuse. Local target
+memo keys now bind dependency output contents as well as producer action digests,
+so changed intermediate contents invalidate downstream reuse even when the
+producer action is unchanged. Legacy direct-spawn directory and symlink outputs
+carry invocation-owned fingerprint-only evidence: restoration verifies their
+current type and contents or refuses before installing descriptor text. Consumers
+skip action-cache reuse, including historical poisoned results with intact inputs,
+and direct dependency fingerprints exclude whole-target reuse.
 
 **Required safeguard.** A scheduler restart must not erase valid reusable results.
 Persist metadata atomically and revalidate its referenced content. Missing local
-outputs need restoration; missing cache content needs repair. Side effects outside
+restorable outputs need restoration; fingerprint-only outputs need an explicit
+refusal, not a manifest installed as file contents. Only confirmed missing cache
+content authorizes producer repair. Side effects outside
 declared outputs must not be promised on a cache hit. Cache tenancy and digest
 function are part of an artifact location, not assumptions hidden in one global
 CAS handle.
