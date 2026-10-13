@@ -75,6 +75,40 @@ That is important when downstream consumers also execute remotely.
 These are architectural reasons to introduce executors, not reasons to copy
 Bazel's flags or Buck2's configuration syntax into Once.
 
+## Research: Observed Failure Modes
+
+The [failure-analysis companion](0014-executor-failure-modes.md) examines public
+Bazel, Buck, and Buck2 issue discussions and fixes, distinguishing reported
+problems from confirmed defects, deliberate tradeoffs, and resolved setup errors.
+
+The strongest lessons concern subsystem boundaries:
+
+- Undeclared tools can produce incorrect cache hits, while client-host details
+  can fragment equivalent remote actions. Placement alone proves neither safety
+  nor equivalence.
+- Dynamic execution can start an ineligible local branch. Each candidate must
+  satisfy requirements independently, including during fallback.
+- CPU-oriented fan-out throttles remote work, but removing it without byte,
+  file-descriptor, staging, and nested-tool budgets can overwhelm the client.
+- Cancellation of a deduplication owner can fail unrelated waiters; a late worker
+  response can leak slots. Shared work needs subscriber-independent ownership.
+- Transfer limits can deadlock their completion path, and HTTP/2 flow control can
+  stall despite application admission. Nonblocking limits need liveness tests.
+- An action-cache hit does not prove referenced blobs still exist. Transient CAS
+  outages must not be turned into missing inputs, and repair needs bounded producer
+  recovery plus circuit-breaker recovery.
+- REAPI explicitly permits duplicate execution and does not require cancellation
+  support. An operation completing or a client stream closing does not prove all
+  work stopped.
+- Daemon incrementality, durable cache reuse, and local materialization are
+  different states. Restart and eviction tests must cover them independently.
+
+The current boundary addresses shared host accounting, hosted request admission,
+and cleanup leases. It does not yet satisfy the companion's delivery gates for
+bounded hosted capture, immutable environments, remote graph provenance, native
+REAPI interoperability, or speculative execution. Those are prerequisites for
+expansion, not benefits implied by introducing the executor type.
+
 ## Comparison With Once
 
 | Concern | Bazel / Buck2 | Once today |
@@ -214,6 +248,16 @@ Do not add a graph remote flag that moves host-resolved executable paths onto
 an incompatible worker. There are no new manifest settings in this slice;
 existing infrastructure selection and action encodings remain unchanged.
 
+### Hardening The Boundary
+
+The [hardening implementation](0014-executor-hardening.md) adds fair admission,
+required-minimum validation, bounded hosted capture and staging, cancellation-owned
+blocking publication, durable hosted lifecycle reconciliation, typed cache errors
+and recovery, native process-group supervision, and deferred-output producer
+repair. Runtime I/O policies do not change action encoding or digest identity.
+Native network denial fails closed, including loopback; uncacheable graph actions
+must not bypass it. Explicit account/project placement is rejected until enforced.
+
 ### Follow-On Work
 
 - Resolve immutable platform and toolchain identities before changing result
@@ -224,26 +268,36 @@ existing infrastructure selection and action encodings remain unchanged.
   along with the matching public Starlark reference and validation.
 - Decouple graph target fan-out, action batching, event worker slots, and test
   batch processes from host-only capacity when graph remote placement exists.
-- Introduce FIFO or aging admission so small client requests cannot indefinitely
-  starve large local requests. The existing pool is fit-first, not fair.
-- Add VM-overhead estimates, phase-specific transfer CPU admission, bounded
-  staging disk, and provider lifecycle reconciliation. The initial fixed client
-  memory reservation deliberately spans the entire remote operation. It is an
-  admission estimate, not a hard memory cap: existing hosted command responses
-  are buffered in full and can exceed it. Streamed or capped hosted response
-  capture is required before claiming bounded capture for arbitrary output.
-- Add a native REAPI adapter with missing-blob exchange, server operation
-  tracking, cancellation, and recovery of lost deferred input blobs.
+- Add VM-overhead estimates and phase-specific transfer CPU admission. Hosted
+  capture and staging now have explicit limits, but the client reservation is
+  still an admission estimate, not a hard total resident-memory guarantee.
+- Add a native REAPI adapter with missing-blob exchange, resumable server operation
+  tracking, optional-cancellation capability handling, and bounded recovery of
+  lost deferred input blobs. Restrict this path to duplicate-safe actions because
+  the protocol does not guarantee at-most-once execution.
+- Distinguish verified blob absence, transient transport failure, corruption,
+  command failure, and uncertain execution state. Recovery budgets and circuit
+  breakers must preserve these categories.
+- Give shared transfers and future worker requests subscriber-independent task
+  ownership, with completion/cancellation race tests. Add transfer liveness and
+  service-rotation tests through a proxy and independent REAPI implementations.
 - Make remote materialization policy explicit before keeping intermediate
-  artifacts remote.
-- Add fallback or dynamic execution only with classified failures, compatible
-  platform identities, isolated outputs, and publication claims.
+  artifacts remote, including producer provenance and cache-location identity.
+- Separate consumption estimates from minimum capacity and required enforcement;
+  normalization of an estimate must never satisfy an unmet hard requirement.
+- Add sanitized phase-level queue, transfer, execution, materialization, and
+  cleanup diagnostics, including uncertain cleanup outcomes.
+- Add fallback or dynamic execution only with classified failures, independently
+  eligible branches, compatible platform identities, isolated outputs, and
+  publication claims. Account for losing work until its terminal state is known.
 
 ## Validation Requirements
 
 - Native and local virtual-machine executors compete for the same host budget.
 - Remote guest estimates do not consume host CPU or guest-sized host memory.
-- Remote client work still consumes bounded host memory.
+- Remote client admission respects the host memory budget. This does not assert
+  a hard total resident-memory bound; bounded protocol and capture buffers have
+  separate fault tests.
 - Aliases cannot multiply a shared domain's capacity.
 - Success and failure return leases after cleanup; cancellation retains them
   through detached deletion, including cancellation while awaiting deletion.
@@ -251,3 +305,9 @@ existing infrastructure selection and action encodings remain unchanged.
 - Unknown adapters fail before sandbox creation and never run locally.
 - Existing action digests, script headers, and graph local behavior remain stable.
 - Tests exercise both ordinary and streaming execution entry points.
+
+The [failure-analysis delivery gates](0014-executor-failure-modes.md#delivery-gates)
+add subsystem-specific fault-injection requirements before increasing hosted
+fan-out, enabling cross-executor sharing or remote graph placement, introducing
+REAPI, or adding shared workers and speculative policies. These future gates are
+not claims that the current implementation has already passed those tests.
