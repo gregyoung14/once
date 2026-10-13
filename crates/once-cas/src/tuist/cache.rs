@@ -12,25 +12,29 @@ use bazel_remote_apis::{
         content_addressable_storage_client::ContentAddressableStorageClient,
     },
     google::bytestream::{self, byte_stream_client::ByteStreamClient},
-    google::rpc::Status as RpcStatus,
 };
 use futures::{future::try_join_all, stream};
 use reqwest::{Method, Url};
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, OnceCell, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::Instant;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-use tonic::{Code, Request, Status};
+#[cfg(test)]
+use tonic::Status;
+use tonic::{Code, Request};
 use uuid::Uuid;
 
+use super::recovery::Recovering;
+use super::status;
 use super::{
-    env_token, file_body, join_url, remote_status_message, retry, stall, TuistAuth,
-    TuistCacheConfig, ENDPOINTS_PATH, PROVIDER_NAME,
+    env_token, file_body, join_url, redact, retry, stall, TuistAuth, TuistCacheConfig,
+    ENDPOINTS_PATH, PROVIDER_NAME,
 };
 use crate::transfer::{self, TransferDirection};
-use crate::{ActionResult, Cas, Digest, Error, Result};
+use crate::{ActionResult, Cas, Digest, Error, ErrorKind, Result, TransferBudget};
+
+mod download;
 
 /// Ceiling on blobs transferred to or from the remote cache at once. The
 /// number of outputs comes from a remote `ActionResult` (untrusted), and
@@ -55,8 +59,22 @@ const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const BATCH_BLOB_LIMIT: usize = 2 * 1024 * 1024;
 const BATCH_BLOB_LIMIT_I64: i64 = 2 * 1024 * 1024;
 const BYTE_STREAM_CHUNK_SIZE: usize = 2 * 1024 * 1024;
-const BYTE_STREAM_MESSAGE_LIMIT: usize = 32 * 1024 * 1024;
+#[allow(clippy::cast_possible_truncation)]
+const BYTE_STREAM_MESSAGE_LIMIT: usize = crate::budget::MAX_STREAM_MESSAGE_BYTES as usize;
 const MAX_PARALLEL_TRANSFERS: usize = 8;
+/// Largest response a metadata RPC (action cache, existence checks) may
+/// decode. Each such call reserves this much memory from the transfer budget,
+/// which makes the reservation a bound rather than an estimate.
+const METADATA_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+/// Memory a streamed upload from a file holds: the chunk being sent, the one
+/// queued behind it, and the one being read or compressed. The compressor's
+/// own working memory is outside the budget.
+fn file_upload_memory(size_bytes: i64) -> u64 {
+    let chunk = u64::try_from(size_bytes)
+        .unwrap_or_default()
+        .min(BYTE_STREAM_CHUNK_SIZE as u64);
+    chunk.saturating_mul(3)
+}
 const KURA_FEATURE_FLAGS_HEADER: &str = "x-tuist-feature-flags";
 const KURA_FEATURE_FLAG: &str = "kura";
 const BLOB_MAPPING_OUTPUT_PATH: &str = "blob";
@@ -70,15 +88,16 @@ const SHA256_DIGEST_FUNCTION: i32 = reapi::digest_function::Value::Sha256 as i32
 #[derive(Debug, Clone)]
 pub struct TuistCache {
     local: Cas,
-    client: Arc<OnceCell<std::result::Result<reqwest::Client, CachedRemoteError>>>,
+    client: Arc<Recovering<reqwest::Client>>,
     config: TuistCacheConfig,
-    grpc_channel_cache: Arc<OnceCell<std::result::Result<GrpcChannels, CachedRemoteError>>>,
+    grpc_channel_cache: Arc<Recovering<GrpcChannels>>,
     stream_stall_timeout: Duration,
-    capabilities_cache: Arc<Mutex<Option<RemoteCapabilities>>>,
+    capabilities_cache: Arc<Recovering<RemoteCapabilities>>,
     known_remote_blobs: Arc<Mutex<HashMap<Digest, reapi::Digest>>>,
     transfer_limit: Arc<Semaphore>,
+    budget: TransferBudget,
     auth: TuistAuth,
-    auth_token_cache: Arc<OnceCell<std::result::Result<String, CachedRemoteError>>>,
+    auth_token_cache: Arc<Recovering<String>>,
     endpoint_override: Option<String>,
 }
 
@@ -95,34 +114,6 @@ struct GrpcChannels {
 struct RemoteCapabilities {
     zstd_streams: bool,
     zstd_batches: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CachedRemoteError {
-    operation: &'static str,
-    message: String,
-}
-
-impl CachedRemoteError {
-    fn from_error(error: Error, operation: &'static str) -> Self {
-        match error {
-            Error::Remote {
-                operation, message, ..
-            } => Self { operation, message },
-            error => Self {
-                operation,
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn to_error(&self) -> Error {
-        Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: self.operation,
-            message: self.message.clone(),
-        }
-    }
 }
 
 impl TuistCache {
@@ -148,21 +139,38 @@ impl TuistCache {
         let auth = TuistAuth::new(auth_root, &config);
         Ok(Self {
             local,
-            client: Arc::new(OnceCell::new()),
+            client: Arc::default(),
             config,
-            grpc_channel_cache: Arc::new(OnceCell::new()),
+            grpc_channel_cache: Arc::default(),
             stream_stall_timeout: STREAM_STALL_TIMEOUT,
-            capabilities_cache: Arc::new(Mutex::new(None)),
+            capabilities_cache: Arc::default(),
             known_remote_blobs: Arc::new(Mutex::new(HashMap::new())),
             transfer_limit: Arc::new(Semaphore::new(MAX_PARALLEL_TRANSFERS)),
+            budget: TransferBudget::default(),
             auth,
-            auth_token_cache: Arc::new(OnceCell::new()),
+            auth_token_cache: Arc::default(),
             endpoint_override: env_token(TUIST_CACHE_ENDPOINT_ENV),
         })
     }
 
     pub fn local(&self) -> &Cas {
         &self.local
+    }
+
+    /// Draw remote transfers from `budget` instead of this cache's own.
+    pub fn set_transfer_budget(&mut self, budget: TransferBudget) {
+        self.budget = budget;
+    }
+
+    pub fn transfer_budget(&self) -> &TransferBudget {
+        &self.budget
+    }
+
+    /// Memory for one metadata RPC attempt.
+    async fn reserve_metadata(&self) -> Result<crate::budget::Reservation> {
+        self.budget
+            .reserve_memory(METADATA_RESPONSE_LIMIT as u64)
+            .await
     }
 
     pub fn config(&self) -> &TuistCacheConfig {
@@ -173,6 +181,10 @@ impl TuistCache {
         match self.local.get_blob(digest).await {
             Ok(bytes) => return Ok(bytes),
             Err(Error::BlobNotFound(_)) => {}
+            // The store removed the bad copy; the remote one is authoritative.
+            Err(error) if error.is_corrupt() => {
+                tracing::warn!(blob_digest = %digest, error = %error, "refetching a corrupt local blob");
+            }
             Err(error) => return Err(error),
         }
 
@@ -181,15 +193,22 @@ impl TuistCache {
             return Ok(Vec::new());
         }
 
+        let remote_digest = self.remote_blob_digest(digest).await?;
+        if remote_digest.size_bytes > download::IN_MEMORY_BLOB_LIMIT {
+            // Too large to read into memory from the remote: stream it into
+            // the local tier, verified, and read the caller's copy from there.
+            self.ensure_blob_local(digest).await?;
+            return self.local.get_blob(digest).await;
+        }
         let started = Instant::now();
-        let bytes = self.get_blob_remote(digest).await?;
+        let bytes = self.get_blob_remote(digest, &remote_digest).await?;
         let mirrored = self.local.mirror_blob(digest, &bytes).await?;
         if mirrored != *digest {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "get blob",
-                message: format!("remote blob {digest} did not match requested digest"),
-            });
+            return Err(status::remote(
+                "get blob",
+                ErrorKind::Corrupt,
+                format!("remote blob {digest} did not match requested digest"),
+            ));
         }
         transfer::record(
             TransferDirection::Download,
@@ -200,91 +219,31 @@ impl TuistCache {
         Ok(bytes)
     }
 
-    pub async fn ensure_blob_local(&self, digest: &Digest) -> Result<()> {
-        if self.local.has_blob(digest).await? {
-            return Ok(());
+    /// Materialize a blob, fetching it first when the local tier lacks it.
+    /// A local copy that fails verification is removed by the store and
+    /// fetched again once from the remote tier.
+    pub async fn copy_blob_to_file(&self, digest: &Digest, destination: &Path) -> Result<()> {
+        self.ensure_blob_local(digest).await?;
+        match self.local.copy_blob_to_file(digest, destination).await {
+            Err(error) if error.is_corrupt() => {
+                tracing::warn!(blob_digest = %digest, error = %error, "refetching a corrupt local blob");
+                self.ensure_blob_local(digest).await?;
+                self.local.copy_blob_to_file(digest, destination).await
+            }
+            result => result,
         }
-        if is_empty_blob(digest) {
-            self.local.mirror_blob(digest, &[]).await?;
-            return Ok(());
-        }
-        let remote_digest = self.remote_blob_digest(digest).await?;
-        let started = Instant::now();
-        retry::grpc("get blob", || {
-            self.stream_remote_blob(digest, &remote_digest)
-        })
-        .await?;
-        transfer::record(
-            TransferDirection::Download,
-            *digest,
-            u64::try_from(remote_digest.size_bytes).unwrap_or_default(),
-            started.elapsed(),
-        );
-        Ok(())
     }
 
-    /// Streams one remote blob into the local store. Each attempt opens a
-    /// fresh read stream, so a dropped HTTP/2 stream can be retried.
-    async fn stream_remote_blob(
-        &self,
-        digest: &Digest,
-        remote_digest: &reapi::Digest,
-    ) -> std::result::Result<(), retry::Failure> {
-        let _permit = self
-            .transfer_limit
-            .acquire()
-            .await
-            .expect("transfer semaphore remains open");
-        let channel = self.grpc_channel().await?;
-        let mut client =
-            ByteStreamClient::new(channel).max_decoding_message_size(BYTE_STREAM_MESSAGE_LIMIT);
-        let request = bytestream::ReadRequest {
-            resource_name: byte_stream_read_resource(
-                &self.instance_name(),
-                remote_digest,
-                reapi::compressor::Value::Identity as i32,
-            ),
-            read_offset: 0,
-            read_limit: 0,
-        };
-        let response = match client
-            .read(self.authorized_grpc_request(request, "get blob").await?)
-            .await
-        {
-            Ok(response) => response,
-            Err(status) if status.code() == Code::NotFound => {
-                return Err(Error::BlobNotFound(*digest).into());
-            }
-            Err(status) => return Err(status.into()),
-        };
-        let mut stream = response.into_inner();
-        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-        let download = async {
-            while let Some(response) =
-                stall::next_message(&mut stream, self.stream_stall_timeout).await?
-            {
-                writer
-                    .write_all(&response.data)
-                    .await
-                    .map_err(|source| local_mirror_error(&source))?;
-            }
-            writer
-                .shutdown()
-                .await
-                .map_err(|source| local_mirror_error(&source))?;
-            Ok::<_, retry::Failure>(())
-        };
-        let store = async { Ok(self.local.put_stream(reader).await?) };
-        let (mirrored, ()) = tokio::try_join!(store, download)?;
-        if mirrored != *digest {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "get blob",
-                message: format!("remote blob {digest} did not match requested digest"),
-            }
-            .into());
+    /// Mirror a blob the local tier already holds, streaming it. Best effort,
+    /// like every remote write.
+    pub(crate) async fn publish_local_blob(&self, digest: &Digest) {
+        if let Err(error) = self.upload_local_blob(Some(digest), "put blob").await {
+            tracing::warn!(
+                blob_digest = %digest,
+                error = %error,
+                "failed to upload blob to remote cache"
+            );
         }
-        Ok(())
     }
 
     pub async fn put_blob(&self, bytes: &[u8]) -> Result<Digest> {
@@ -300,9 +259,9 @@ impl TuistCache {
         Ok(digest)
     }
 
-    /// True if the blob is present locally or remotely. A remote
-    /// failure is treated as "not present" so a transient outage degrades
-    /// to a cache miss instead of a hard error.
+    /// True if the blob is present locally or remotely. `false` means the
+    /// remote tier confirmed its absence; a remote that cannot answer is an
+    /// error, never "not present".
     pub async fn has_blob(&self, digest: &Digest) -> Result<bool> {
         if self.has_local_blob(digest).await? {
             return Ok(true);
@@ -310,7 +269,7 @@ impl TuistCache {
         if is_empty_blob(digest) {
             return Ok(true);
         }
-        Ok(self.head_blob_remote(digest).await.unwrap_or(false))
+        self.head_blob_remote(digest).await
     }
 
     /// Whether the local tier already holds the blob, without asking the
@@ -320,38 +279,28 @@ impl TuistCache {
         self.local.has_blob(digest).await
     }
 
+    /// Look up an action result. `None` means the remote tier confirmed there
+    /// is no usable entry: none is recorded, or one is recorded but a blob it
+    /// references is confirmed gone. Outages, refusals, and malformed entries
+    /// are errors.
     pub async fn get_action_result(&self, action: &Digest) -> Result<Option<ActionResult>> {
         if let Some(result) = self.local.get_action_result(action).await? {
             tracing::debug!(action_digest = %action, tier = "local", "action cache hit");
             return Ok(Some(result));
         }
 
-        match self.get_action_result_remote(action).await {
-            Ok(Some(result)) => {
-                tracing::debug!(action_digest = %action, tier = "remote", "action cache hit");
-                if let Err(error) = self.local.mirror_action_result(action, &result).await {
-                    tracing::warn!(
-                        action_digest = %action,
-                        error = %error,
-                        "failed to persist remote action result locally"
-                    );
-                }
-                Ok(Some(result))
-            }
-            Ok(None) => {
-                tracing::debug!(action_digest = %action, "action cache miss");
-                Ok(None)
-            }
-            Err(error) if error.is_read_miss() => {
-                tracing::debug!(
-                    action_digest = %action,
-                    error = ?error,
-                    "action cache miss"
-                );
-                Ok(None)
-            }
-            Err(error) => Err(error.into_public_error("get action result")),
+        let Some(result) = self.get_action_result_remote(action).await? else {
+            return Ok(None);
+        };
+        tracing::debug!(action_digest = %action, tier = "remote", "action cache hit");
+        if let Err(error) = self.local.mirror_action_result(action, &result).await {
+            tracing::warn!(
+                action_digest = %action,
+                error = %error,
+                "failed to persist remote action result locally"
+            );
         }
+        Ok(Some(result))
     }
 
     pub async fn put_action_result(&self, action: &Digest, result: &ActionResult) -> Result<()> {
@@ -379,14 +328,10 @@ impl TuistCache {
         self.reapi_blob_exists(&sha256).await
     }
 
-    async fn get_blob_remote(&self, digest: &Digest) -> Result<Vec<u8>> {
-        let sha256 = self.remote_blob_digest(digest).await?;
-        let Some(bytes) = self.read_reapi_blob(&sha256, "get blob").await? else {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "get blob",
-                message: format!("remote blob mapping for {digest} points at a missing blob"),
-            });
+    async fn get_blob_remote(&self, digest: &Digest, sha256: &reapi::Digest) -> Result<Vec<u8>> {
+        let Some(bytes) = self.read_reapi_blob(sha256, "get blob").await? else {
+            tracing::debug!(blob_digest = %digest, "remote blob mapping points at a missing blob");
+            return Err(Error::BlobNotFound(*digest));
         };
         tracing::debug!(blob_digest = %digest, bytes = bytes.len(), "fetched blob from remote cache");
         Ok(bytes)
@@ -394,11 +339,11 @@ impl TuistCache {
 
     async fn put_blob_remote(&self, digest: &Digest, bytes: &[u8]) -> Result<reapi::Digest> {
         if Digest::of_bytes(bytes) != *digest {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "put blob",
-                message: format!("blob body did not match digest {digest}"),
-            });
+            return Err(status::remote(
+                "put blob",
+                ErrorKind::Corrupt,
+                format!("blob body did not match digest {digest}"),
+            ));
         }
         if let Some(remote_digest) = self.known_remote_blobs.lock().await.get(digest).cloned() {
             return Ok(remote_digest);
@@ -425,23 +370,27 @@ impl TuistCache {
         Ok(sha256)
     }
 
-    async fn get_action_result_remote(
-        &self,
-        action: &Digest,
-    ) -> std::result::Result<Option<ActionResult>, RemoteReadError> {
-        let mapping_digest = action_mapping_digest(action).map_err(RemoteReadError::fatal)?;
+    async fn get_action_result_remote(&self, action: &Digest) -> Result<Option<ActionResult>> {
+        let mapping_digest = action_mapping_digest(action)?;
         let Some(result) = self
             .get_reapi_action_result(&mapping_digest, "get action result")
-            .await
-            .map_err(remote_action_read_error)?
+            .await?
         else {
+            tracing::debug!(action_digest = %action, "action cache miss");
             return Ok(None);
         };
-
-        self.reapi_to_once_action_result(result)
-            .await
-            .map(Some)
-            .map_err(remote_action_read_error)
+        match self.reapi_to_once_action_result(result).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if error.is_not_found() => {
+                tracing::debug!(
+                    action_digest = %action,
+                    error = %error,
+                    "remote action result references a missing blob; treating it as a miss"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn put_action_result_remote(&self, action: &Digest, result: &ActionResult) -> Result<()> {
@@ -501,6 +450,12 @@ impl TuistCache {
             return Ok(Some(remote_digest));
         }
 
+        // The upload reads from a verified copy in temporary space, which
+        // counts against the staging budget like a download does.
+        let _staging = self
+            .budget
+            .reserve_staging(self.local.blob_size(digest).await?)
+            .await?;
         let directory = tempfile::tempdir().map_err(|source| Error::Io {
             path: std::env::temp_dir(),
             source,
@@ -517,14 +472,19 @@ impl TuistCache {
                     source: std::io::Error::other(source.to_string()),
                 })??;
         if once_digest != digest_to_verify {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
+            return Err(status::remote(
                 operation,
-                message: format!("local blob body did not match digest {digest}"),
-            });
+                ErrorKind::Corrupt,
+                format!("local blob body did not match digest {digest}"),
+            ));
         }
 
         if !self.reapi_blob_exists(&remote_digest).await? {
+            // Budget before the transfer slot, the order every transfer uses.
+            let _memory = self
+                .budget
+                .reserve_memory(file_upload_memory(remote_digest.size_bytes))
+                .await?;
             let _permit = self
                 .transfer_limit
                 .acquire()
@@ -575,10 +535,12 @@ impl TuistCache {
             .into_iter()
             .find(|file| file.path == BLOB_MAPPING_OUTPUT_PATH)
             .and_then(|file| file.digest)
-            .ok_or_else(|| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "get blob mapping",
-                message: format!("remote blob mapping for {digest} is missing its REAPI digest"),
+            .ok_or_else(|| {
+                status::remote(
+                    "get blob mapping",
+                    ErrorKind::Corrupt,
+                    format!("remote blob mapping for {digest} is missing its REAPI digest"),
+                )
             })
     }
 
@@ -699,7 +661,22 @@ impl TuistCache {
         )?;
         remote_digests.extend(remote.stdout_digest.iter().cloned());
         remote_digests.extend(remote.stderr_digest.iter().cloned());
-        self.ensure_reapi_blobs_present(remote_digests).await?;
+        if let Some(missing) = self.find_missing_reapi_blobs(remote_digests).await? {
+            let native = mappings
+                .iter()
+                .find_map(|(native, remote)| (*remote == missing).then_some(*native));
+            return Err(match native {
+                Some(native) => Error::BlobNotFound(native),
+                None => status::remote(
+                    "get action result",
+                    ErrorKind::NotFound,
+                    format!(
+                        "remote action result points at missing blob {}",
+                        digest_key(&missing)
+                    ),
+                ),
+            });
+        }
         self.known_remote_blobs.lock().await.extend(mappings);
         Ok(())
     }
@@ -735,15 +712,32 @@ impl TuistCache {
             return Ok(local_digest);
         }
         let started = Instant::now();
+        if digest.size_bytes > download::IN_MEMORY_BLOB_LIMIT {
+            let staged =
+                retry::grpc(operation, || self.stage_remote_blob(digest, operation)).await?;
+            let size = staged.len();
+            let local_digest = self.local.commit_staged(staged).await?;
+            transfer::record(
+                TransferDirection::Download,
+                local_digest,
+                size,
+                started.elapsed(),
+            );
+            self.known_remote_blobs
+                .lock()
+                .await
+                .insert(local_digest, digest.clone());
+            return Ok(local_digest);
+        }
         let Some(bytes) = self.read_reapi_blob(digest, operation).await? else {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
+            return Err(status::remote(
                 operation,
-                message: format!(
+                ErrorKind::NotFound,
+                format!(
                     "remote action result points at missing blob {}",
                     digest_key(digest)
                 ),
-            });
+            ));
         };
         let local_digest = Digest::of_bytes(&bytes);
         self.local.mirror_blob(&local_digest, &bytes).await?;
@@ -766,6 +760,15 @@ impl TuistCache {
         bytes: &[u8],
         operation: &'static str,
     ) -> Result<()> {
+        // The encoded body, the copy each attempt sends, and one chunk.
+        let len = bytes.len() as u64;
+        let _memory = self
+            .budget
+            .reserve_memory(
+                len.saturating_mul(2)
+                    .saturating_add(len.min(BYTE_STREAM_CHUNK_SIZE as u64)),
+            )
+            .await?;
         let _permit = self
             .transfer_limit
             .acquire()
@@ -799,66 +802,6 @@ impl TuistCache {
             }
         })
         .await
-    }
-
-    async fn read_reapi_blob(
-        &self,
-        digest: &reapi::Digest,
-        operation: &'static str,
-    ) -> Result<Option<Vec<u8>>> {
-        let _permit = self
-            .transfer_limit
-            .acquire()
-            .await
-            .expect("transfer semaphore remains open");
-        if digest.size_bytes > BATCH_BLOB_LIMIT_I64 {
-            return self.read_reapi_blob_stream(digest, operation).await;
-        }
-        let capabilities = self.remote_capabilities().await;
-        let channel = self.grpc_channel().await?;
-        let mut client = ContentAddressableStorageClient::new(channel);
-        let mut acceptable_compressors = vec![reapi::compressor::Value::Identity as i32];
-        if capabilities.zstd_batches {
-            acceptable_compressors.push(reapi::compressor::Value::Zstd as i32);
-        }
-        let request = reapi::BatchReadBlobsRequest {
-            instance_name: self.instance_name(),
-            digests: vec![digest.clone()],
-            acceptable_compressors,
-            digest_function: SHA256_DIGEST_FUNCTION,
-        };
-        let response = client
-            .batch_read_blobs(self.authorized_grpc_request(request, operation).await?)
-            .await
-            .map_err(|source| grpc_error(operation, &source))?
-            .into_inner();
-        let Some(blob) = response.responses.into_iter().next() else {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message: "Kura returned no blob response".to_string(),
-            });
-        };
-        match blob
-            .status
-            .as_ref()
-            .map_or(REAPI_STATUS_OK, |status| status.code)
-        {
-            REAPI_STATUS_OK => {
-                let bytes = decode_reapi_blob(blob.data, blob.compressor, digest, operation)?;
-                Ok(Some(bytes))
-            }
-            REAPI_STATUS_NOT_FOUND => Ok(None),
-            _ => Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message: rpc_status_message(
-                    blob.status
-                        .as_ref()
-                        .expect("non-successful response has a status"),
-                ),
-            }),
-        }
     }
 
     async fn write_reapi_blob_stream(
@@ -923,14 +866,14 @@ impl TuistCache {
         ]
         .contains(&response.committed_size)
         {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
+            return Err(status::remote(
                 operation,
-                message: format!(
+                ErrorKind::Protocol,
+                format!(
                     "byte stream committed {} of {total} bytes",
                     response.committed_size
                 ),
-            }
+            )
             .into());
         }
         Ok(())
@@ -1032,97 +975,66 @@ impl TuistCache {
         }
         let response = response?.into_inner();
         if ![-1, total, sent.load(Ordering::Relaxed)].contains(&response.committed_size) {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
+            return Err(status::remote(
                 operation,
-                message: format!(
+                ErrorKind::Protocol,
+                format!(
                     "byte stream committed {} of {total} bytes",
                     response.committed_size
                 ),
-            }
+            )
             .into());
         }
         Ok(())
     }
 
-    async fn read_reapi_blob_stream(
-        &self,
-        digest: &reapi::Digest,
-        operation: &'static str,
-    ) -> Result<Option<Vec<u8>>> {
-        let capabilities = self.remote_capabilities().await;
-        let compressor = if capabilities.zstd_streams {
-            reapi::compressor::Value::Zstd as i32
-        } else {
-            reapi::compressor::Value::Identity as i32
-        };
-        let channel = self.grpc_channel().await?;
-        let mut client =
-            ByteStreamClient::new(channel).max_decoding_message_size(BYTE_STREAM_MESSAGE_LIMIT);
-        let request = bytestream::ReadRequest {
-            resource_name: byte_stream_read_resource(&self.instance_name(), digest, compressor),
-            read_offset: 0,
-            read_limit: 0,
-        };
-        let response = match client
-            .read(self.authorized_grpc_request(request, operation).await?)
-            .await
-        {
-            Ok(response) => response,
-            Err(status) if status.code() == Code::NotFound => return Ok(None),
-            Err(status) => return Err(grpc_error(operation, &status)),
-        };
-        let expected = usize::try_from(digest.size_bytes).unwrap_or(0);
-        let initial_capacity = if compressor == reapi::compressor::Value::Identity as i32 {
-            expected.min(BYTE_STREAM_MESSAGE_LIMIT)
-        } else {
-            expected.min(BYTE_STREAM_CHUNK_SIZE)
-        };
-        let mut transferred = Vec::with_capacity(initial_capacity);
-        let mut stream = response.into_inner();
-        while let Some(response) = stall::next_message(&mut stream, self.stream_stall_timeout)
-            .await
-            .map_err(|source| grpc_error(operation, &source))?
-        {
-            transferred.extend_from_slice(&response.data);
-        }
-        let bytes = decode_reapi_blob(transferred, compressor, digest, operation)?;
-        Ok(Some(bytes))
-    }
-
+    /// Compression support, discovered once. Without it transfers still work
+    /// uncompressed, so a failure only costs compression: a server that
+    /// answered but not usefully is remembered as supporting none, and an
+    /// outage is asked about again after the usual cooldown.
     async fn remote_capabilities(&self) -> RemoteCapabilities {
-        let mut cached = self.capabilities_cache.lock().await;
-        if let Some(capabilities) = *cached {
-            return capabilities;
-        }
-        let capabilities = match self.fetch_remote_capabilities().await {
-            Ok(capabilities) => capabilities,
+        let this = self.clone();
+        let discovered = self
+            .capabilities_cache
+            .get_or_try_init(move || async move {
+                match this.fetch_remote_capabilities().await {
+                    Err(error) if error.kind() == ErrorKind::Protocol => {
+                        tracing::warn!(error = %error, "remote cache capabilities are unusable");
+                        Ok(RemoteCapabilities::default())
+                    }
+                    discovered => discovered,
+                }
+            })
+            .await;
+        match discovered {
+            Ok(capabilities) => *capabilities,
             Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "failed to discover remote cache capabilities"
-                );
+                tracing::warn!(error = %error, "failed to discover remote cache capabilities");
                 RemoteCapabilities::default()
             }
-        };
-        *cached = Some(capabilities);
-        capabilities
+        }
     }
 
     async fn fetch_remote_capabilities(&self) -> Result<RemoteCapabilities> {
         let channel = self.grpc_channel().await?;
-        let mut client = CapabilitiesClient::new(channel);
+        let client = CapabilitiesClient::new(channel);
         let request = reapi::GetCapabilitiesRequest {
             instance_name: self.instance_name(),
         };
-        let response = client
-            .get_capabilities(
-                self.authorized_grpc_request(request, "discover capabilities")
-                    .await?,
-            )
-            .await
-            .map_err(|source| grpc_error("discover capabilities", &source))?
-            .into_inner();
+        let response = retry::grpc("discover capabilities", || {
+            let mut client = client.clone();
+            let request = request.clone();
+            async move {
+                Ok(client
+                    .get_capabilities(
+                        self.authorized_grpc_request(request, "discover capabilities")
+                            .await?,
+                    )
+                    .await?)
+            }
+        })
+        .await?
+        .into_inner();
         let Some(capabilities) = response.cache_capabilities else {
             return Ok(RemoteCapabilities::default());
         };
@@ -1137,7 +1049,8 @@ impl TuistCache {
 
     async fn reapi_blob_exists(&self, digest: &reapi::Digest) -> Result<bool> {
         let channel = self.grpc_channel().await?;
-        let client = ContentAddressableStorageClient::new(channel);
+        let client = ContentAddressableStorageClient::new(channel)
+            .max_decoding_message_size(METADATA_RESPONSE_LIMIT);
         let request = reapi::FindMissingBlobsRequest {
             instance_name: self.instance_name(),
             blob_digests: vec![digest.clone()],
@@ -1147,6 +1060,7 @@ impl TuistCache {
             let mut client = client.clone();
             let request = request.clone();
             async move {
+                let _memory = self.reserve_metadata().await?;
                 Ok(client
                     .find_missing_blobs(self.authorized_grpc_request(request, "head blob").await?)
                     .await?)
@@ -1157,42 +1071,49 @@ impl TuistCache {
         Ok(response.missing_blob_digests.is_empty())
     }
 
-    async fn ensure_reapi_blobs_present(&self, digests: Vec<reapi::Digest>) -> Result<()> {
+    /// The first of `digests` the remote tier confirms it does not hold.
+    async fn find_missing_reapi_blobs(
+        &self,
+        digests: Vec<reapi::Digest>,
+    ) -> Result<Option<reapi::Digest>> {
         if digests.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let channel = self.grpc_channel().await?;
-        let mut client = ContentAddressableStorageClient::new(channel);
+        let client = ContentAddressableStorageClient::new(channel)
+            .max_decoding_message_size(METADATA_RESPONSE_LIMIT);
         let request = reapi::FindMissingBlobsRequest {
             instance_name: self.instance_name(),
             blob_digests: digests,
             digest_function: SHA256_DIGEST_FUNCTION,
         };
-        let response = client
-            .find_missing_blobs(
-                self.authorized_grpc_request(request, "get action result")
-                    .await?,
-            )
-            .await
-            .map_err(|source| grpc_error("get action result", &source))?
-            .into_inner();
-        if let Some(missing) = response.missing_blob_digests.first() {
-            return Err(remote_action_metadata_error(&format!(
-                "remote action result points at {} missing blob(s), including {}",
-                response.missing_blob_digests.len(),
-                digest_key(missing)
-            )));
-        }
-        Ok(())
+        let response = retry::grpc("get action result", || {
+            let mut client = client.clone();
+            let request = request.clone();
+            async move {
+                let _memory = self.reserve_metadata().await?;
+                Ok(client
+                    .find_missing_blobs(
+                        self.authorized_grpc_request(request, "get action result")
+                            .await?,
+                    )
+                    .await?)
+            }
+        })
+        .await?
+        .into_inner();
+        Ok(response.missing_blob_digests.into_iter().next())
     }
 
+    /// `None` only when the action cache answers `NOT_FOUND`.
     async fn get_reapi_action_result(
         &self,
         action_digest: &reapi::Digest,
         operation: &'static str,
     ) -> Result<Option<reapi::ActionResult>> {
         let channel = self.grpc_channel().await?;
-        let mut client = ActionCacheClient::new(channel);
+        let client =
+            ActionCacheClient::new(channel).max_decoding_message_size(METADATA_RESPONSE_LIMIT);
         let request = reapi::GetActionResultRequest {
             instance_name: self.instance_name(),
             action_digest: Some(action_digest.clone()),
@@ -1201,14 +1122,22 @@ impl TuistCache {
             inline_output_files: Vec::new(),
             digest_function: SHA256_DIGEST_FUNCTION,
         };
-        match client
-            .get_action_result(self.authorized_grpc_request(request, operation).await?)
-            .await
-        {
-            Ok(response) => Ok(Some(response.into_inner())),
-            Err(status) if status.code() == Code::NotFound => Ok(None),
-            Err(status) => Err(grpc_error(operation, &status)),
-        }
+        retry::grpc(operation, || {
+            let mut client = client.clone();
+            let request = request.clone();
+            async move {
+                let _memory = self.reserve_metadata().await?;
+                match client
+                    .get_action_result(self.authorized_grpc_request(request, operation).await?)
+                    .await
+                {
+                    Ok(response) => Ok(Some(response.into_inner())),
+                    Err(status) if status.code() == Code::NotFound => Ok(None),
+                    Err(status) => Err(status.into()),
+                }
+            }
+        })
+        .await
     }
 
     async fn update_reapi_action_result(
@@ -1218,7 +1147,8 @@ impl TuistCache {
         operation: &'static str,
     ) -> Result<()> {
         let channel = self.grpc_channel().await?;
-        let client = ActionCacheClient::new(channel);
+        let client =
+            ActionCacheClient::new(channel).max_decoding_message_size(METADATA_RESPONSE_LIMIT);
         let request = reapi::UpdateActionResultRequest {
             instance_name: self.instance_name(),
             action_digest: Some(action_digest.clone()),
@@ -1230,6 +1160,7 @@ impl TuistCache {
             let mut client = client.clone();
             let request = request.clone();
             async move {
+                let _memory = self.reserve_metadata().await?;
                 Ok(client
                     .update_action_result(self.authorized_grpc_request(request, operation).await?)
                     .await?)
@@ -1241,16 +1172,19 @@ impl TuistCache {
 
     async fn data_plane_endpoint(&self) -> Result<String> {
         if let Some(endpoint) = &self.endpoint_override {
-            tracing::debug!(endpoint = %endpoint, "using Tuist cache endpoint override");
+            tracing::debug!(
+                endpoint = %redact::endpoint(endpoint),
+                "using Tuist cache endpoint override"
+            );
             return Ok(endpoint.clone());
         }
         let endpoints = self.fetch_endpoints().await?;
         match endpoints.as_slice() {
-            [] => Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "discover endpoints",
-                message: "Tuist returned no Kura cache endpoints".to_string(),
-            }),
+            [] => Err(status::remote(
+                "discover endpoints",
+                ErrorKind::Protocol,
+                "Tuist returned no Kura cache endpoints",
+            )),
             [endpoint] => Ok(endpoint.clone()),
             _ => self.pick_fastest_endpoint(&endpoints).await,
         }
@@ -1260,8 +1194,8 @@ impl TuistCache {
     /// plugin do: the answer is persisted next to the local cache and reused
     /// across Once processes until the `max-age` the server sends expires, so
     /// most commands never ask. A request that cannot reach Tuist falls back to
-    /// the last answer, even an expired one, and otherwise reports
-    /// `reach endpoint discovery`, which cache reads treat as a miss.
+    /// the last answer, even an expired one, and otherwise reports the
+    /// remote tier as unavailable.
     async fn fetch_endpoints(&self) -> Result<Vec<String>> {
         let persisted = self.persisted_endpoints().await;
         if let Some(persisted) = &persisted {
@@ -1274,14 +1208,8 @@ impl TuistCache {
                 self.persist_endpoints(&endpoints, max_age).await;
                 Ok(endpoints)
             }
-            Err(error) => match (&error, persisted) {
-                (
-                    Error::Remote {
-                        operation: "reach endpoint discovery",
-                        ..
-                    },
-                    Some(stale),
-                ) => {
+            Err(error) => match persisted {
+                Some(stale) if error.is_unavailable() => {
                     tracing::warn!(
                         error = %error,
                         "using the last known Tuist cache endpoints because discovery is unreachable"
@@ -1302,41 +1230,48 @@ impl TuistCache {
             .header(KURA_FEATURE_FLAGS_HEADER, KURA_FEATURE_FLAG)
             .send()
             .await
-            .map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "reach endpoint discovery",
-                message: source.to_string(),
+            .map_err(|source| {
+                status::remote(
+                    "reach endpoint discovery",
+                    ErrorKind::Unavailable,
+                    redact::transport(&source),
+                )
             })?;
         let status = response.status();
         if status.is_success() {
             let max_age = cache_control_max_age(response.headers());
-            let body = response.bytes().await.map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "reach endpoint discovery",
-                message: source.to_string(),
+            let body = response.bytes().await.map_err(|source| {
+                status::remote(
+                    "reach endpoint discovery",
+                    ErrorKind::Unavailable,
+                    redact::transport(&source),
+                )
             })?;
-            let endpoints: EndpointResponse =
-                serde_json::from_slice(&body).map_err(|source| Error::Remote {
-                    provider: PROVIDER_NAME,
-                    operation: "decode endpoints",
-                    message: source.to_string(),
-                })?;
+            // The decoding error can quote the body, so only its position is
+            // reported.
+            let endpoints: EndpointResponse = serde_json::from_slice(&body).map_err(|source| {
+                status::remote(
+                    "decode endpoints",
+                    ErrorKind::Protocol,
+                    format!(
+                        "malformed endpoint response at line {} column {}",
+                        source.line(),
+                        source.column()
+                    ),
+                )
+            })?;
             return Ok((endpoints.endpoints, max_age));
         }
         // A server that cannot answer right now is unreachable; any other
-        // refusal, such as an unknown account or a rejected token, is a
-        // misconfiguration that has to surface.
-        let operation =
-            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                "reach endpoint discovery"
-            } else {
-                "discover endpoints"
-            };
-        Err(Error::Remote {
-            provider: PROVIDER_NAME,
-            operation,
-            message: remote_status_message(response).await,
-        })
+        // refusal, such as an unknown account or a rejected token, has to
+        // surface as what it is.
+        let kind = status::http_kind(status);
+        let operation = if kind == ErrorKind::Unavailable {
+            "reach endpoint discovery"
+        } else {
+            "discover endpoints"
+        };
+        Err(status::remote(operation, kind, redact::http_status(status)))
     }
 
     fn persisted_endpoints_path(&self) -> std::path::PathBuf {
@@ -1373,12 +1308,10 @@ impl TuistCache {
                 .saturating_add(duration_ms(max_age.unwrap_or(DEFAULT_ENDPOINTS_MAX_AGE))),
         };
         let write = async {
-            let directory = path.parent().expect("endpoint file has a parent");
-            tokio::fs::create_dir_all(directory).await?;
-            let temporary =
-                directory.join(format!(".{}-{}.tmp", std::process::id(), unix_ms_now()));
-            tokio::fs::write(&temporary, serde_json::to_vec(&persisted)?).await?;
-            tokio::fs::rename(&temporary, &path).await
+            let bytes = serde_json::to_vec(&persisted).map_err(std::io::Error::other)?;
+            crate::filesystem::write_atomically(&path, &bytes)
+                .await
+                .map_err(std::io::Error::other)
         };
         if let Err(error) = write.await {
             tracing::debug!(error = %error, "could not persist Tuist cache endpoints");
@@ -1398,7 +1331,7 @@ impl TuistCache {
                         .and_then(|result| result.map(|_| ()));
                 match outcome {
                     Ok(()) => Ok((start.elapsed(), endpoint)),
-                    Err(error) => Err(format!("{endpoint}: {error}")),
+                    Err(error) => Err(format!("{}: {error}", redact::endpoint(&endpoint))),
                 }
             });
         }
@@ -1432,7 +1365,7 @@ impl TuistCache {
         }
         best.map(|(elapsed, endpoint)| {
             tracing::debug!(
-                endpoint = %endpoint,
+                endpoint = %redact::endpoint(&endpoint),
                 probe_ms = elapsed.as_millis(),
                 candidates = endpoints.len(),
                 "selected Tuist cache endpoint"
@@ -1448,11 +1381,7 @@ impl TuistCache {
                     failures.join("; ")
                 )
             };
-            Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "pick fastest endpoint",
-                message,
-            }
+            status::remote("pick fastest endpoint", ErrorKind::Unavailable, message)
         })
     }
 
@@ -1464,58 +1393,59 @@ impl TuistCache {
         Ok(self.grpc_channels().await?.uploads)
     }
 
+    /// Connect once, then reuse the channels. A failed discovery or connection
+    /// is retried after a cooldown instead of disabling the remote tier for
+    /// the rest of the process.
     async fn grpc_channels(&self) -> Result<GrpcChannels> {
-        let result =
-            self.grpc_channel_cache
-                .get_or_init(|| async {
-                    let endpoint = self.data_plane_endpoint().await.map_err(|error| {
-                        CachedRemoteError::from_error(error, "discover endpoints")
+        let this = self.clone();
+        self.grpc_channel_cache
+            .get_or_try_init(move || async move {
+                let url = this.data_plane_endpoint().await?;
+                let endpoint = grpc_endpoint(&url).map_err(|message| {
+                    status::remote("connect endpoint", ErrorKind::Misconfigured, message)
+                })?;
+                let requests = endpoint
+                    .clone()
+                    .timeout(GRPC_REQUEST_TIMEOUT)
+                    .connect()
+                    .await
+                    .map_err(|_| {
+                        status::remote(
+                            "connect endpoint",
+                            ErrorKind::Unavailable,
+                            format!("could not connect to {}", redact::endpoint(&url)),
+                        )
                     })?;
-                    let connect_error = |message| CachedRemoteError {
-                        operation: "connect endpoint",
-                        message,
-                    };
-                    let endpoint = grpc_endpoint(&endpoint).map_err(connect_error)?;
-                    let requests = endpoint
-                        .clone()
-                        .timeout(GRPC_REQUEST_TIMEOUT)
-                        .connect()
-                        .await
-                        .map_err(|source| connect_error(format!("{source:?}")))?;
-                    Ok(GrpcChannels {
-                        requests,
-                        uploads: endpoint.connect_lazy(),
-                    })
+                Ok(GrpcChannels {
+                    requests,
+                    uploads: endpoint.connect_lazy(),
                 })
-                .await;
-        match result {
-            Ok(channels) => Ok(channels.clone()),
-            Err(error) => Err(error.to_error()),
-        }
+            })
+            .await
+            .cloned()
     }
 
     /// Resolve authentication once per command. Tokens are proactively
     /// refreshed during this first lookup. A single command that outlives
     /// the resulting token's lifetime must be retried to resolve a new token.
+    /// A missing or rejected credential is final; a failure to reach the
+    /// token service is retried after a cooldown. Token requests are never
+    /// retried immediately because a refresh can rotate the stored token.
     async fn auth_token(&self) -> Result<&str> {
-        let result = self
-            .auth_token_cache
-            .get_or_init(|| async {
-                let auth = self.auth.clone();
+        let auth = self.auth.clone();
+        self.auth_token_cache
+            .get_or_try_init(move || async move {
                 match tokio::task::spawn_blocking(move || auth.token()).await {
-                    Ok(result) => result
-                        .map_err(|error| CachedRemoteError::from_error(error, "load auth token")),
-                    Err(source) => Err(CachedRemoteError {
-                        operation: "load auth token",
-                        message: source.to_string(),
-                    }),
+                    Ok(result) => result,
+                    Err(source) => Err(status::remote(
+                        "load auth token",
+                        ErrorKind::Other,
+                        source.to_string(),
+                    )),
                 }
             })
-            .await;
-        match result {
-            Ok(token) => Ok(token),
-            Err(error) => Err(error.to_error()),
-        }
+            .await
+            .map(String::as_str)
     }
 
     async fn authorized_request(
@@ -1526,20 +1456,16 @@ impl TuistCache {
     ) -> Result<reqwest::RequestBuilder> {
         let client = self
             .client
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 reqwest::Client::builder()
                     .timeout(GRPC_REQUEST_TIMEOUT)
                     .build()
-                    .map_err(|source| CachedRemoteError {
-                        operation: "build client",
-                        message: source.to_string(),
+                    .map_err(|source| {
+                        status::remote("build client", ErrorKind::Misconfigured, source.to_string())
                     })
             })
-            .await;
-        match client {
-            Ok(client) => Ok(client.request(method, url).bearer_auth(token)),
-            Err(error) => Err(error.to_error()),
-        }
+            .await?;
+        Ok(client.request(method, url).bearer_auth(token))
     }
 
     async fn authorized_grpc_request<T>(
@@ -1548,13 +1474,8 @@ impl TuistCache {
         operation: &'static str,
     ) -> Result<Request<T>> {
         let token = self.auth_token().await?;
-        authorized_grpc_request_with_token(message, token, Some(self.account())).map_err(
-            |message| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message,
-            },
-        )
+        authorized_grpc_request_with_token(message, token, Some(self.account()))
+            .map_err(|message| status::remote(operation, ErrorKind::Misconfigured, message))
     }
 
     fn account(&self) -> &str {
@@ -1632,12 +1553,7 @@ struct EndpointResponse {
 }
 
 fn local_mirror_error(source: &std::io::Error) -> retry::Failure {
-    Error::Remote {
-        provider: PROVIDER_NAME,
-        operation: "get blob",
-        message: source.to_string(),
-    }
-    .into()
+    status::remote("get blob", ErrorKind::Io, source.to_string()).into()
 }
 
 /// Per-blob statuses use the gRPC code space, so a transient one is retried
@@ -1651,88 +1567,33 @@ fn batch_upload_outcome(
         .first()
         .and_then(|response| response.status.as_ref())
     else {
-        return Err(Error::Remote {
-            provider: PROVIDER_NAME,
+        return Err(status::remote(
             operation,
-            message: "Kura returned no status for blob upload".to_string(),
-        }
+            ErrorKind::Protocol,
+            "Kura returned no status for blob upload",
+        )
         .into());
     };
     if status.code == REAPI_STATUS_OK {
         return Ok(());
     }
-    let rpc = Status::new(Code::from_i32(status.code), status.message.clone());
+    let rpc = super::retry_hint::from_rpc(status);
     if retry::retryable(&rpc) {
         Err(rpc.into())
     } else {
-        Err(Error::Remote {
-            provider: PROVIDER_NAME,
-            operation,
-            message: rpc_status_message(status),
-        }
-        .into())
-    }
-}
-
-#[derive(Debug)]
-enum RemoteReadError {
-    Miss(String),
-    Fatal(Error),
-}
-
-impl RemoteReadError {
-    fn miss(message: String) -> Self {
-        Self::Miss(message)
-    }
-
-    fn fatal(error: Error) -> Self {
-        Self::Fatal(error)
-    }
-
-    fn is_read_miss(&self) -> bool {
-        matches!(self, Self::Miss(_))
-    }
-
-    fn into_public_error(self, operation: &'static str) -> Error {
-        match self {
-            Self::Miss(message) => Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message,
-            },
-            Self::Fatal(error) => error,
-        }
-    }
-}
-
-fn remote_action_read_error(error: Error) -> RemoteReadError {
-    match error {
-        Error::Remote {
-            message,
-            operation,
-            provider,
-        } if provider == PROVIDER_NAME
-            && matches!(
-                operation,
-                "connect endpoint"
-                    | "get action result"
-                    | "pick fastest endpoint"
-                    | "reach endpoint discovery"
-            ) =>
-        {
-            RemoteReadError::miss(message)
-        }
-        other => RemoteReadError::fatal(other),
+        Err(status::rpc_status_error(operation, status).into())
     }
 }
 
 fn encode_action_result_metadata(
     result: &ActionResult,
 ) -> Result<bazel_remote_apis::google::protobuf::Any> {
-    let value = serde_json::to_vec(result).map_err(|source| Error::Remote {
-        provider: PROVIDER_NAME,
-        operation: "put action result",
-        message: format!("serializing native action result metadata: {source}"),
+    let value = serde_json::to_vec(result).map_err(|source| {
+        status::remote(
+            "put action result",
+            ErrorKind::Other,
+            format!("serializing native action result metadata: {source}"),
+        )
     })?;
     Ok(bazel_remote_apis::google::protobuf::Any {
         type_url: ACTION_RESULT_METADATA_TYPE_URL.to_string(),
@@ -1776,30 +1637,31 @@ fn remember_optional_remote_blob(
     }
 }
 
+/// A remote entry whose metadata is inconsistent is reported as corrupt, not
+/// trusted and not mistaken for a miss.
 fn remote_action_metadata_error(message: &str) -> Error {
-    Error::Remote {
-        provider: PROVIDER_NAME,
-        operation: "get action result",
-        message: message.to_string(),
-    }
+    status::remote("get action result", ErrorKind::Corrupt, message)
 }
 
+/// Failures are described without the transport's error text, which can
+/// include the full endpoint URI.
 async fn connect_grpc_endpoint(endpoint: &str) -> std::result::Result<Channel, String> {
     grpc_endpoint(endpoint)?
         .connect()
         .await
-        .map_err(|source| format!("{source:?}"))
+        .map_err(|_| "the connection failed".to_string())
 }
 
 fn grpc_endpoint(endpoint: &str) -> std::result::Result<Endpoint, String> {
     let endpoint_url = grpc_endpoint_url(endpoint);
+    let invalid = || format!("invalid cache endpoint {}", redact::endpoint(endpoint));
     let mut endpoint = Endpoint::from_shared(endpoint_url.clone())
-        .map_err(|source| source.to_string())?
+        .map_err(|_| invalid())?
         .connect_timeout(ENDPOINT_PROBE_TIMEOUT);
     if endpoint_url.starts_with("https://") {
         endpoint = endpoint
             .tls_config(ClientTlsConfig::new().with_enabled_roots())
-            .map_err(|source| format!("{source:?}"))?;
+            .map_err(|_| invalid())?;
     }
     Ok(endpoint)
 }
@@ -1820,30 +1682,6 @@ fn authorized_grpc_request_with_token<T>(
             .insert("x-tuist-account-handle", metadata);
     }
     Ok(request)
-}
-
-pub(super) fn grpc_error(operation: &'static str, status: &Status) -> Error {
-    Error::Remote {
-        provider: PROVIDER_NAME,
-        operation,
-        message: grpc_status_message(status),
-    }
-}
-
-fn grpc_status_message(status: &Status) -> String {
-    if status.message().is_empty() {
-        format!("gRPC {}", status.code())
-    } else {
-        format!("gRPC {}: {}", status.code(), status.message())
-    }
-}
-
-fn rpc_status_message(status: &RpcStatus) -> String {
-    if status.message.is_empty() {
-        format!("REAPI status {}", status.code)
-    } else {
-        format!("REAPI status {}: {}", status.code, status.message)
-    }
 }
 
 fn file_digests(path: &Path) -> Result<(Digest, reapi::Digest)> {
@@ -1867,10 +1705,12 @@ fn file_digests(path: &Path) -> Result<(Digest, reapi::Digest)> {
         sha256.update(&buffer[..read]);
         size = size.saturating_add(read as u64);
     }
-    let size_bytes = i64::try_from(size).map_err(|_| Error::Remote {
-        provider: PROVIDER_NAME,
-        operation: "put blob",
-        message: "blob exceeds the remote size range".to_string(),
+    let size_bytes = i64::try_from(size).map_err(|_| {
+        status::remote(
+            "put blob",
+            ErrorKind::Protocol,
+            "blob exceeds the remote size range",
+        )
     })?;
     Ok((
         Digest::from_bytes(*once.finalize().as_bytes()),
@@ -1897,15 +1737,15 @@ fn validate_sha256_digest(
     if actual == *digest {
         Ok(())
     } else {
-        Err(Error::Remote {
-            provider: PROVIDER_NAME,
+        Err(status::remote(
             operation,
-            message: format!(
+            ErrorKind::Corrupt,
+            format!(
                 "remote blob {} did not match expected digest {}",
                 digest_key(&actual),
                 digest_key(digest)
             ),
-        })
+        ))
     }
 }
 
@@ -1915,10 +1755,12 @@ fn encode_reapi_blob(
     operation: &'static str,
 ) -> Result<(Vec<u8>, i32)> {
     if supports_zstd {
-        let compressed = zstd::stream::encode_all(bytes, 0).map_err(|source| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation,
-            message: format!("compressing blob: {source}"),
+        let compressed = zstd::stream::encode_all(bytes, 0).map_err(|source| {
+            status::remote(
+                operation,
+                ErrorKind::Other,
+                format!("compressing blob: {source}"),
+            )
         })?;
         if compressed.len() < bytes.len() {
             return Ok((compressed, reapi::compressor::Value::Zstd as i32));
@@ -1936,42 +1778,46 @@ fn decode_reapi_blob(
     let bytes = match reapi::compressor::Value::try_from(compressor) {
         Ok(reapi::compressor::Value::Identity) => data,
         Ok(reapi::compressor::Value::Zstd) => {
-            let expected = usize::try_from(digest.size_bytes).map_err(|_| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message: format!(
-                    "remote blob has invalid size in digest {}",
-                    digest_key(digest)
-                ),
+            let expected = usize::try_from(digest.size_bytes).map_err(|_| {
+                status::remote(
+                    operation,
+                    ErrorKind::Protocol,
+                    format!(
+                        "remote blob has invalid size in digest {}",
+                        digest_key(digest)
+                    ),
+                )
             })?;
             let limit = u64::try_from(expected)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1);
             let decompressor =
                 zstd::stream::read::Decoder::new(data.as_slice()).map_err(|source| {
-                    Error::Remote {
-                        provider: PROVIDER_NAME,
+                    status::remote(
                         operation,
-                        message: format!("opening compressed blob: {source}"),
-                    }
+                        ErrorKind::Corrupt,
+                        format!("opening compressed blob: {source}"),
+                    )
                 })?;
-            let mut uncompressed = Vec::with_capacity(expected);
+            let mut uncompressed = Vec::with_capacity(expected.min(BYTE_STREAM_MESSAGE_LIMIT));
             decompressor
                 .take(limit)
                 .read_to_end(&mut uncompressed)
-                .map_err(|source| Error::Remote {
-                    provider: PROVIDER_NAME,
-                    operation,
-                    message: format!("decompressing blob: {source}"),
+                .map_err(|source| {
+                    status::remote(
+                        operation,
+                        ErrorKind::Corrupt,
+                        format!("decompressing blob: {source}"),
+                    )
                 })?;
             uncompressed
         }
         _ => {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
+            return Err(status::remote(
                 operation,
-                message: format!("unsupported remote blob compressor {compressor}"),
-            });
+                ErrorKind::Protocol,
+                format!("unsupported remote blob compressor {compressor}"),
+            ));
         }
     };
     validate_sha256_digest(digest, &bytes, operation)?;
@@ -2035,16 +1881,16 @@ fn resource_name(instance_name: &str, suffix: &str) -> String {
 
 fn size_bytes_i64(size: usize) -> Result<i64> {
     let Ok(size) = i64::try_from(size) else {
-        return Err(Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "compute digest",
-            message: format!("blob size exceeds REAPI size limit: {size} bytes"),
-        });
+        return Err(status::remote(
+            "compute digest",
+            ErrorKind::Protocol,
+            format!("blob size exceeds REAPI size limit: {size} bytes"),
+        ));
     };
     Ok(size)
 }
 
-fn grpc_endpoint_url(endpoint: &str) -> String {
+pub(super) fn grpc_endpoint_url(endpoint: &str) -> String {
     if let Some(rest) = endpoint.strip_prefix("grpc://") {
         format!("http://{rest}")
     } else if let Some(rest) = endpoint.strip_prefix("grpcs://") {
@@ -2076,10 +1922,22 @@ mod stream_tests;
 mod upload_tests;
 
 #[cfg(test)]
+mod fault_server;
+
+#[cfg(test)]
+mod fault_tests;
+
+#[cfg(test)]
+mod budget_tests;
+
+#[cfg(test)]
+mod redaction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn tuist_cache(temp: &TempDir, project: Option<&str>) -> TuistCache {
         TuistCache::new(
@@ -2133,7 +1991,7 @@ mod tests {
     fn discovery_cache(temp: &TempDir, url: &str) -> TuistCache {
         let mut cache = tuist_cache(temp, Some("once"));
         cache.config.url = url.to_string();
-        cache.auth_token_cache.set(Ok("test-token".into())).unwrap();
+        cache.auth_token_cache.set("test-token".into());
         cache
     }
 
@@ -2213,7 +2071,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(remote_action_read_error(error).is_read_miss());
+        assert!(error.is_unavailable(), "{error}");
     }
 
     #[tokio::test]
@@ -2229,7 +2087,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(remote_action_read_error(error).is_read_miss());
+        assert!(error.is_unavailable(), "{error}");
     }
 
     #[tokio::test]
@@ -2266,7 +2124,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(!remote_action_read_error(error).is_read_miss());
+        assert!(!error.is_unavailable(), "{error}");
     }
 
     #[tokio::test]
@@ -2279,7 +2137,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(!remote_action_read_error(error).is_read_miss());
+        assert!(!error.is_unavailable(), "{error}");
     }
 
     #[test]
@@ -2433,14 +2291,6 @@ mod tests {
     }
 
     #[test]
-    fn grpc_error_includes_code_and_message() {
-        let error = grpc_error("get blob", &Status::unavailable("cache unavailable"));
-        let message = error.to_string();
-        assert!(message.to_lowercase().contains("unavailable"));
-        assert!(message.contains("cache unavailable"));
-    }
-
-    #[test]
     fn blob_and_action_mapping_digests_are_distinct() {
         let digest = Digest::of_bytes(b"payload");
         assert_ne!(
@@ -2513,46 +2363,5 @@ mod tests {
             decode_action_result_metadata(&remote).unwrap(),
             Some(native)
         );
-    }
-
-    #[test]
-    fn remote_action_materialization_errors_are_read_misses() {
-        let error = Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "get action result",
-            message: "remote action result points at missing blob".to_string(),
-        };
-
-        assert!(remote_action_read_error(error).is_read_miss());
-    }
-
-    #[test]
-    fn remote_endpoint_connectivity_errors_are_read_misses() {
-        for operation in [
-            "connect endpoint",
-            "pick fastest endpoint",
-            "reach endpoint discovery",
-        ] {
-            let error = Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message: "cache endpoint unavailable".to_string(),
-            };
-
-            assert!(remote_action_read_error(error).is_read_miss());
-        }
-    }
-
-    #[test]
-    fn unrelated_remote_action_errors_stay_fatal() {
-        for operation in ["discover endpoints", "put blob"] {
-            let error = Error::Remote {
-                provider: PROVIDER_NAME,
-                operation,
-                message: "remote operation failed".to_string(),
-            };
-
-            assert!(!remote_action_read_error(error).is_read_miss());
-        }
     }
 }

@@ -54,9 +54,7 @@ pub(super) async fn unless_stalled<T>(
             result = &mut call => return result,
             () = tokio::time::sleep_until(progress.idle_deadline(timeout)) => {
                 if progress.idle_deadline(timeout) <= Instant::now() {
-                    return Err(Status::deadline_exceeded(format!(
-                        "upload made no progress for {timeout:?}"
-                    )));
+                    return Err(stalled("upload", timeout));
                 }
             }
         }
@@ -71,11 +69,23 @@ pub(super) async fn next_message<T>(
 ) -> std::result::Result<Option<T>, Status> {
     tokio::time::timeout(timeout, stream.message())
         .await
-        .unwrap_or_else(|_| {
-            Err(Status::deadline_exceeded(format!(
-                "download made no progress for {timeout:?}"
-            )))
-        })
+        .unwrap_or_else(|_| Err(stalled("download", timeout)))
+}
+
+/// Marks statuses this client created for a stalled transfer, so their
+/// description comes from here rather than from text a server sent.
+const STALLED: &[u8] = b"once.cas.stalled";
+
+fn stalled(direction: &str, timeout: Duration) -> Status {
+    Status::with_details(
+        tonic::Code::DeadlineExceeded,
+        format!("{direction} made no progress for {timeout:?}"),
+        STALLED.into(),
+    )
+}
+
+pub(super) fn is_stalled(status: &Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded && status.details() == STALLED
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 use crate::tuist::{TuistCache, TuistCacheConfig};
-use crate::{ActionResult, Cas, Digest, GcReport, Result, Stats};
+use crate::{ActionResult, Cas, Digest, GcReport, Result, Stats, TransferBudget};
 
 const TUIST_STREAM_REMOTE_UPLOAD_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -46,6 +46,30 @@ impl CacheProvider {
         )?))
     }
 
+    /// Draw this provider's remote transfers, and those of every clone made
+    /// from it afterwards, from `budget`.
+    ///
+    /// Without a budget each remote provider uses its own
+    /// [`TransferBudget::default`]. Pass one budget to every provider that
+    /// should share an allowance. A local-only provider moves no remote
+    /// transfers and keeps no budget.
+    #[must_use]
+    pub fn with_transfer_budget(mut self, budget: TransferBudget) -> Self {
+        if let Self::Tuist(cache) = &mut self {
+            cache.set_transfer_budget(budget);
+        }
+        self
+    }
+
+    /// The budget remote transfers draw from, if this provider has a remote
+    /// tier.
+    pub fn transfer_budget(&self) -> Option<&TransferBudget> {
+        match self {
+            Self::Local(_) => None,
+            Self::Tuist(cache) => Some(cache.transfer_budget()),
+        }
+    }
+
     /// Filesystem root of the local tier, remote tier or not.
     pub fn root(&self) -> &Path {
         match self {
@@ -68,15 +92,15 @@ impl CacheProvider {
     ///
     /// Only blobs below an internal size limit are mirrored to a remote
     /// tier, so a huge stream stays local rather than stalling the write
-    /// on a slow upload.
+    /// on a slow upload. The mirror streams from the local copy rather than
+    /// reading it into memory.
     pub async fn put_stream<R: AsyncRead + Unpin>(&self, reader: R) -> Result<Digest> {
         match self {
             Self::Local(cas) => cas.put_stream(reader).await,
             Self::Tuist(cache) => {
                 let digest = cache.local().put_stream(reader).await?;
                 if cache.local().blob_size(&digest).await? <= TUIST_STREAM_REMOTE_UPLOAD_LIMIT {
-                    let bytes = cache.local().get_blob(&digest).await?;
-                    let _ = cache.put_blob(&bytes).await?;
+                    cache.publish_local_blob(&digest).await;
                 }
                 Ok(digest)
             }
@@ -98,13 +122,16 @@ impl CacheProvider {
 
     /// Materialize a blob at `destination`, streaming it rather than
     /// buffering it in memory.
+    ///
+    /// The bytes are verified against `digest` while they are copied. Fails
+    /// with [`Error::BlobNotFound`](crate::Error::BlobNotFound) only when the
+    /// blob is confirmed absent; a local copy that fails verification is
+    /// removed and reported as corrupt, after one refetch when a remote tier
+    /// holds it.
     pub async fn copy_blob_to_file(&self, digest: &Digest, destination: &Path) -> Result<()> {
         match self {
             Self::Local(cas) => cas.copy_blob_to_file(digest, destination).await,
-            Self::Tuist(cache) => {
-                cache.ensure_blob_local(digest).await?;
-                cache.local().copy_blob_to_file(digest, destination).await
-            }
+            Self::Tuist(cache) => cache.copy_blob_to_file(digest, destination).await,
         }
     }
 
@@ -174,6 +201,9 @@ impl CacheProvider {
     /// True if a content-addressed blob exists. For Tuist this consults
     /// the remote tier on local miss so it mirrors `get_blob`'s reach;
     /// scripts can probe `exists` then `get` without surprises.
+    ///
+    /// `false` means the blob is confirmed absent. A remote tier that cannot
+    /// answer, or refuses to, is an error rather than `false`.
     pub async fn has_blob(&self, digest: &Digest) -> Result<bool> {
         match self {
             Self::Local(cas) => cas.has_blob(digest).await,
@@ -202,8 +232,13 @@ impl CacheProvider {
         }
     }
 
-    /// Look up a cached action result. `None` is a miss; a stored record
-    /// that fails to decode is also treated as a miss.
+    /// Look up a cached action result.
+    ///
+    /// `None` is a confirmed miss: no entry is recorded, or a remote entry
+    /// references a blob the remote tier confirms is gone. A remote tier that
+    /// cannot answer, refuses the request, or returns a malformed entry is an
+    /// error; use [`Error::kind`](crate::Error::kind) to tell them apart. A
+    /// local record that fails to decode is reported as corrupt.
     pub async fn get_action_result(&self, action: &Digest) -> Result<Option<ActionResult>> {
         match self {
             Self::Local(cas) => cas.get_action_result(action).await,

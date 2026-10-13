@@ -5,6 +5,7 @@
 //! This module owns the shared state, endpoint resolution, and credential
 //! storage those flows build on.
 
+mod classify;
 mod oauth;
 mod oidc;
 mod registration;
@@ -18,7 +19,8 @@ use schlussel::{
 };
 
 use super::{env_token, join_url, TuistCacheConfig, PROVIDER_NAME};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
+use classify::{auth_error, schlussel_kind};
 
 /// Public OAuth client id for Once's built-in Tuist app. This is not a secret.
 pub const TUIST_APP_OAUTH_CLIENT_ID: &str = "b3298a92-3deb-4f5e-a526-b7ad324979b5";
@@ -166,11 +168,8 @@ impl TuistAuth {
     }
 
     fn storage(&self) -> Result<FileStorage> {
-        FileStorage::with_path(&self.credentials_root).map_err(|source| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "open auth storage",
-            message: source.to_string(),
-        })
+        FileStorage::with_path(&self.credentials_root)
+            .map_err(|source| auth_error("open auth storage", ErrorKind::Io, source.to_string()))
     }
 
     fn storage_key(&self) -> String {
@@ -208,6 +207,10 @@ impl TuistAuth {
         )
     }
 
+    /// A missing session asks the user to sign in, as before. A session the
+    /// credential service rejected is a refusal that also says how to fix
+    /// it. Anything else keeps its own classification, so a credential
+    /// service outage can recover without signing in again.
     fn cached_auth_error(&self, source: SchlusselError) -> Error {
         match source {
             SchlusselError::TokenNotFound(_)
@@ -216,16 +219,21 @@ impl TuistAuth {
                 provider: PROVIDER_NAME,
                 message: self.login_hint(),
             },
+            other if schlussel_kind(&other) == ErrorKind::Refused => auth_error(
+                "load auth token",
+                ErrorKind::Refused,
+                format!("{}; {}", classify::describe(&other), self.login_hint()),
+            ),
             other => Self::remote_auth_error("load auth token", &other),
         }
     }
 
     fn remote_auth_error(operation: &'static str, source: &SchlusselError) -> Error {
-        Error::Remote {
-            provider: PROVIDER_NAME,
+        auth_error(
             operation,
-            message: source.to_string(),
-        }
+            schlussel_kind(source),
+            classify::describe(source),
+        )
     }
 }
 
@@ -585,6 +593,97 @@ mod tests {
         assert_eq!(exchange_requests.len(), 2);
         assert!(exchange_requests[0].starts_with("POST /api/auth/oidc/token "));
         assert!(exchange_requests[1].starts_with("POST /api/auth/oidc/token "));
+    }
+
+    fn github_oidc_token_error(exchange: Vec<(u16, &'static str)>) -> (Error, usize) {
+        let github_server = OneShotHttpServer::new(200, r#"{"value":"github-identity-token"}"#);
+        let exchange_server = MultiShotHttpServer::new(exchange);
+        let temp = TempDir::new().unwrap();
+        let auth = TuistAuth::new(temp.path(), &static_config(exchange_server.base_url()));
+        let error = with_ci_env(
+            &[
+                ("CI", "true".to_string()),
+                ("GITHUB_ACTIONS", "true".to_string()),
+                (
+                    "ACTIONS_ID_TOKEN_REQUEST_URL",
+                    github_server.endpoint("/identity-token"),
+                ),
+                (
+                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                    "github-request-token".to_string(),
+                ),
+            ],
+            || auth.token().unwrap_err(),
+        );
+        let _ = github_server.request();
+        (error, exchange_server.requests().len())
+    }
+
+    #[test]
+    fn a_rejected_openid_connect_exchange_is_a_refusal_that_is_not_retried() {
+        let (error, requests) = github_oidc_token_error(vec![(401, "invalid token")]);
+        assert_eq!(error.kind(), ErrorKind::Refused, "{error}");
+        assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn an_unavailable_credential_service_is_transient_not_a_refusal() {
+        let (error, requests) = github_oidc_token_error(vec![(503, "down"); 4]);
+        assert_eq!(error.kind(), ErrorKind::Unavailable, "{error}");
+        assert_eq!(requests, 4);
+    }
+
+    #[test]
+    fn credential_service_bodies_are_not_repeated() {
+        use crate::tuist::redact::SENTINEL;
+        // A refusal is answered once; an outage is retried until exhausted.
+        for (status, attempts) in [(401, 1), (503, 4)] {
+            let responses = vec![(status, r#"{"error":"SENTINEL-c0ffee-secret"}"#); attempts];
+            let (error, _) = github_oidc_token_error(responses);
+            assert!(!error.to_string().contains(SENTINEL), "{error}");
+            assert!(
+                error.to_string().contains(&format!("HTTP {status}")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_request_urls_are_not_repeated() {
+        use crate::tuist::redact::SENTINEL;
+        let temp = TempDir::new().unwrap();
+        let auth = TuistAuth::new(temp.path(), &static_config("http://127.0.0.1:1".into()));
+        let error = with_ci_env(
+            &[
+                ("CI", "true".to_string()),
+                ("GITHUB_ACTIONS", "true".to_string()),
+                (
+                    "ACTIONS_ID_TOKEN_REQUEST_URL",
+                    format!("http://127.0.0.1:1/token?sig={SENTINEL}"),
+                ),
+                ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", SENTINEL.to_string()),
+            ],
+            || auth.token().unwrap_err(),
+        );
+        assert_eq!(error.kind(), ErrorKind::Unavailable, "{error}");
+        assert!(!error.to_string().contains(SENTINEL), "{error}");
+    }
+
+    #[test]
+    fn a_rejected_refresh_tells_the_user_how_to_sign_in_again() {
+        let temp = TempDir::new().unwrap();
+        let auth = TuistAuth::new(temp.path(), &static_config("https://tuist.dev".to_string()));
+        let error = auth.cached_auth_error(SchlusselError::server(
+            Some(400),
+            Some("invalid_grant".into()),
+            None,
+        ));
+        assert_eq!(error.kind(), ErrorKind::Refused);
+        assert!(error.to_string().contains("once auth login"), "{error}");
+        let outage = auth.cached_auth_error(SchlusselError::Http("connection reset".into()));
+        assert_eq!(outage.kind(), ErrorKind::Unavailable);
+        let missing = auth.cached_auth_error(SchlusselError::NoRefreshToken);
+        assert!(matches!(missing, Error::InvalidConfig { .. }));
     }
 
     #[test]

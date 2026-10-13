@@ -1,15 +1,16 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::fs::{self, File};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::filesystem::{
-    ensure_dir, rename_into_place, write_atomically, write_durably, write_with_durable_contents,
-    TMP_COUNTER,
+    ensure_dir, rename_into_place, write_durably, write_with_durable_contents, TMP_COUNTER,
 };
+use crate::integrity::{self, CorruptBlob};
 use crate::{blob, ActionResult, Digest, Error, Result};
 
 const STREAM_CHUNK: usize = 64 * 1024;
@@ -85,6 +86,11 @@ impl Cas {
 
     /// Write a blob's contents to `destination`, streaming rather than
     /// buffering, and creating parent directories as needed.
+    ///
+    /// The bytes are hashed as they are written and only appear at
+    /// `destination` when they match `digest`. A stored blob that fails the
+    /// check is removed from the store so it can be fetched or produced again,
+    /// and the copy fails with an error whose kind is corrupt.
     pub async fn copy_blob_to_file(&self, digest: &Digest, destination: &Path) -> Result<()> {
         let stored_path = self.blob_path(digest);
         if !fs::try_exists(&stored_path).await.unwrap_or(false) {
@@ -92,16 +98,47 @@ impl Cas {
         }
         let output_path = destination.to_path_buf();
         let error_path = output_path.clone();
-        tokio::task::spawn_blocking(move || blob::decode_file(&stored_path, &output_path))
-            .await
-            .map_err(|source| Error::Io {
-                path: error_path.clone(),
-                source: io::Error::other(source.to_string()),
-            })?
-            .map_err(|source| Error::Io {
+        let decode_path = stored_path.clone();
+        let expected = *digest;
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = blob::StopOnDrop(Arc::clone(&stop));
+        let decoded = tokio::task::spawn_blocking(move || {
+            blob::decode_file(&decode_path, &output_path, &expected, &stop)
+        })
+        .await
+        .map_err(|source| Error::Io {
+            path: error_path.clone(),
+            source: io::Error::other(source.to_string()),
+        })?;
+        match decoded {
+            Ok(()) => Ok(()),
+            Err(source) if CorruptBlob::is(&source) => {
+                self.quarantine(digest, &stored_path).await;
+                Err(Error::Io {
+                    path: stored_path,
+                    source,
+                })
+            }
+            Err(source) => Err(Error::Io {
                 path: error_path,
                 source,
-            })
+            }),
+        }
+    }
+
+    /// Remove a stored blob that failed verification. Best effort: the caller
+    /// reports the corruption either way.
+    async fn quarantine(&self, digest: &Digest, path: &Path) {
+        tracing::warn!(
+            blob_digest = %digest,
+            path = %path.display(),
+            "removing a local cache blob that failed its integrity check"
+        );
+        if let Err(error) = fs::remove_file(path).await {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(blob_digest = %digest, error = %error, "could not remove corrupt blob");
+            }
+        }
     }
 
     pub(crate) fn action_path(&self, digest: &Digest) -> PathBuf {
@@ -157,7 +194,11 @@ impl Cas {
         Ok(digest)
     }
 
-    async fn commit_stream(&self, tmp: tempfile::TempPath, digest: &Digest) -> Result<()> {
+    pub(crate) async fn commit_stream(
+        &self,
+        tmp: tempfile::TempPath,
+        digest: &Digest,
+    ) -> Result<()> {
         let final_path = self.blob_path(digest);
         if fs::try_exists(&final_path).await.unwrap_or(false) {
             return Ok(());
@@ -174,7 +215,7 @@ impl Cas {
     /// Stream `reader` into the scratch dir and compute the BLAKE3 of
     /// the bytes. The caller is responsible for renaming the returned
     /// tmp path into its final location.
-    async fn stream_to_tmp<R: AsyncRead + Unpin>(
+    pub(crate) async fn stream_to_tmp<R: AsyncRead + Unpin>(
         &self,
         prefix: &str,
         reader: R,
@@ -264,13 +305,31 @@ impl Cas {
         })?
     }
 
-    /// Read a content-addressed blob.
+    /// Read a content-addressed blob, verifying it against `digest`.
+    ///
+    /// A stored blob that cannot be decoded or does not hash to `digest` is
+    /// removed and reported with an error whose kind is corrupt.
     pub async fn get_blob(&self, digest: &Digest) -> Result<Vec<u8>> {
         let path = self.blob_path(digest);
-        match fs::read(&path).await {
-            Ok(bytes) => blob::decode_bytes(bytes).map_err(|source| Error::Io { path, source }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::BlobNotFound(*digest)),
-            Err(source) => Err(Error::Io { path, source }),
+        let stored = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::BlobNotFound(*digest))
+            }
+            Err(source) => return Err(Error::Io { path, source }),
+        };
+        let verified = blob::decode_bytes(stored)
+            .map_err(|error| CorruptBlob::io_error(*digest, &error.to_string()))
+            .and_then(|bytes| {
+                integrity::verify(digest, &Digest::of_bytes(&bytes))?;
+                Ok(bytes)
+            });
+        match verified {
+            Ok(bytes) => Ok(bytes),
+            Err(source) => {
+                self.quarantine(digest, &path).await;
+                Err(Error::Io { path, source })
+            }
         }
     }
 
@@ -298,7 +357,7 @@ impl Cas {
     ) -> Result<()> {
         let path = self.action_path(action);
         let bytes = serde_json::to_vec(result).expect("ActionResult is serializable");
-        write_atomically(&path, &bytes).await
+        write_with_durable_contents(&path, &bytes).await
     }
 
     /// Look up a cached action result. `None` is a miss.
@@ -326,5 +385,8 @@ impl Cas {
     }
 }
 
+mod staging;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use staging::StagedBlob;

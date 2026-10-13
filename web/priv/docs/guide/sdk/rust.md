@@ -167,3 +167,34 @@ Use `digest_from_hex(hex)` when a digest crosses a string boundary, such
 as structured data, configuration, or another process. It validates lowercase
 BLAKE3 hexadecimal strings and returns `Error::InvalidDigest` for invalid
 input.
+
+`Error::Cache` wraps a cache failure that can classify itself. Call
+`is_not_found()` to tell confirmed absence apart from `is_unavailable()`, a
+remote service that could not answer, and `is_corrupt()`, content that failed
+its integrity check. `kind()` returns the full classification, which also
+distinguishes refused credentials, malformed remote answers, configuration
+problems, transfers larger than their budget, and local filesystem failures.
+Only confirmed absence means the content is not cached; see
+[Misses, Failures, And Integrity](/guide/sdk/#misses-failures-and-integrity).
+
+### Matching On Cache Errors
+
+The classification methods are the compatible way to react to a cache
+failure. The cache error type gained a variant for classified remote
+failures in this release, and that error type is not marked as
+non-exhaustive, so code that matches every variant of it without a wildcard
+arm stops compiling and needs a new arm. Failures that earlier releases
+reported as a generic remote error, or as a miss, now arrive in that new
+variant. Match on `kind()` or the `is_*` methods instead of on variants, and
+always keep a wildcard arm when matching on the classification itself,
+because new kinds can be added without a breaking release. Display text for
+remote failures is unchanged.
+
+```rust
+match cache.get_action_result(action).await {
+    Ok(Some(result)) => replay(result),
+    Ok(None) => run_and_store().await?,
+    Err(once::Error::Cache(error)) if error.is_unavailable() => run_without_cache().await?,
+    Err(error) => return Err(error.into()),
+}
+```

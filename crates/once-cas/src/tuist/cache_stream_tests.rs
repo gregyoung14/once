@@ -78,6 +78,29 @@ async fn cache_for_failing_stream(
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let served: Vec<u8> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.as_ref().ok())
+        .flat_map(|chunk| chunk.data.clone())
+        .collect();
+    let remote = sha256_digest(&served).unwrap();
+    cache_declaring(temp, digest, remote, chunks, failures, stalls).await
+}
+
+/// A cache whose mapping for `digest` declares `remote_digest`, served by a
+/// byte stream that answers with `chunks`.
+async fn cache_declaring(
+    temp: &tempfile::TempDir,
+    digest: Digest,
+    remote_digest: reapi::Digest,
+    chunks: Vec<std::result::Result<bytestream::ReadResponse, Status>>,
+    failures: Vec<Status>,
+    stalls: bool,
+) -> (
+    TuistCache,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let service = BlobServer {
         chunks,
@@ -114,19 +137,16 @@ async fn cache_for_failing_stream(
         .connect()
         .await
         .unwrap();
-    cache
-        .grpc_channel_cache
-        .set(Ok(GrpcChannels {
-            requests: channel.clone(),
-            uploads: channel,
-        }))
-        .unwrap();
-    cache.auth_token_cache.set(Ok("test-token".into())).unwrap();
+    cache.grpc_channel_cache.set(GrpcChannels {
+        requests: channel.clone(),
+        uploads: channel,
+    });
+    cache.auth_token_cache.set("test-token".into());
     cache
         .known_remote_blobs
         .lock()
         .await
-        .insert(digest, sha256_digest(b"test mapping").unwrap());
+        .insert(digest, remote_digest);
     (cache, server, reads)
 }
 
@@ -261,7 +281,9 @@ async fn stalled_streams_fail_at_the_stall_timeout_without_retrying() {
     let remote_digest = sha256_digest(&bytes).unwrap();
     let read = tokio::time::timeout(
         Duration::from_secs(5),
-        cache.read_reapi_blob_stream(&remote_digest, "get blob"),
+        retry::grpc("get blob", || {
+            cache.stage_remote_blob(&remote_digest, "get blob")
+        }),
     )
     .await
     .expect("a stalled read must fail at its stall timeout")
@@ -291,10 +313,5 @@ async fn a_streamed_download_is_reported_once_and_a_local_blob_not_at_all() {
     assert_eq!(transfers.len(), 1, "{transfers:?}");
     assert_eq!(transfers[0].direction, TransferDirection::Download);
     assert_eq!(transfers[0].digest, digest);
-    // The size is the one the remote digest declares; the fixture maps every
-    // blob to the same placeholder remote digest.
-    assert_eq!(
-        transfers[0].size_bytes,
-        u64::try_from(sha256_digest(b"test mapping").unwrap().size_bytes).unwrap()
-    );
+    assert_eq!(transfers[0].size_bytes, bytes.len() as u64);
 }

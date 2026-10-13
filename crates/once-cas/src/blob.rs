@@ -2,8 +2,13 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use zstd::stream::{copy_decode, copy_encode, decode_all, encode_all};
+use zstd::stream::{copy_encode, decode_all, encode_all};
+
+use crate::integrity::{self, CorruptBlob, HashingWriter};
+use crate::Digest;
 
 pub(crate) const ZSTD_BLOB_MAGIC: &[u8] = b"once.cas.zstd.v1\0";
 pub(crate) const ZSTD_BLOB_HEADER_LEN: usize = ZSTD_BLOB_MAGIC.len() + RAW_SIZE_LEN;
@@ -78,7 +83,20 @@ pub(crate) fn encode_file(raw_path: &Path, encoded_path: &Path) -> io::Result<En
     })
 }
 
-pub(crate) fn decode_file(stored_path: &Path, output_path: &Path) -> io::Result<()> {
+/// Decode the stored blob at `stored_path` into `output_path`, hashing the
+/// decoded bytes as they are written. The output is only persisted when they
+/// hash to `expected`; undecodable or mismatching content is reported as a
+/// corrupt blob and leaves `output_path` untouched.
+///
+/// `stop` is checked between chunks and once more before the output is
+/// published, so a restore whose caller went away does not write the
+/// destination afterwards.
+pub(crate) fn decode_file(
+    stored_path: &Path,
+    output_path: &Path,
+    expected: &Digest,
+    stop: &AtomicBool,
+) -> io::Result<()> {
     let mut input = File::open(stored_path)?;
     let mut header = vec![0_u8; ZSTD_BLOB_HEADER_LEN];
     let mut header_len = 0;
@@ -91,25 +109,84 @@ pub(crate) fn decode_file(stored_path: &Path, output_path: &Path) -> io::Result<
     }
     input.rewind()?;
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut output = tempfile::NamedTempFile::new_in(parent)?;
-    if header_len == ZSTD_BLOB_HEADER_LEN && header.starts_with(ZSTD_BLOB_MAGIC) {
-        let raw_size = raw_size_from_header(&header).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "truncated zstd blob header")
-        })?;
+    let mut output = HashingWriter::new(tempfile::NamedTempFile::new_in(parent)?);
+    let written = if header_len == ZSTD_BLOB_HEADER_LEN && header.starts_with(ZSTD_BLOB_MAGIC) {
+        let raw_size = raw_size_from_header(&header)
+            .ok_or_else(|| CorruptBlob::io_error(*expected, "truncated zstd blob header"))?;
         input.seek(io::SeekFrom::Start(ZSTD_BLOB_HEADER_LEN as u64))?;
-        copy_decode(&mut input, &mut output)?;
-        if output.as_file().metadata()?.len() != raw_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+        let decoder = zstd::stream::read::Decoder::new(input)?;
+        let written = copy_chunks(
+            decoder.take(raw_size.saturating_add(1)),
+            &mut output,
+            Some(expected),
+            stop,
+        )?;
+        if written != raw_size {
+            return Err(CorruptBlob::io_error(
+                *expected,
                 "zstd blob decoded size mismatch",
             ));
         }
+        written
     } else {
-        io::copy(&mut input, &mut output)?;
+        copy_chunks(input, &mut output, None, stop)?
+    };
+    integrity::verify(expected, &output.digest())?;
+    if stop.load(Ordering::Acquire) {
+        return Err(cancelled());
     }
+    let output = output.into_inner();
     output.as_file().sync_all()?;
     output.persist(output_path).map_err(|error| error.error)?;
+    tracing::trace!(bytes = written, blob_digest = %expected, "restored verified blob");
     Ok(())
+}
+
+/// Copies bytes in bounded chunks until `stop` is set. When `decoding` names
+/// the blob being decoded, a decoder failure that is not an operating system
+/// error is reported as corruption of that stored blob.
+fn copy_chunks(
+    mut input: impl Read,
+    output: &mut impl Write,
+    decoding: Option<&Digest>,
+    stop: &AtomicBool,
+) -> io::Result<u64> {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut written = 0_u64;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
+        let read = match input.read(&mut buffer) {
+            Ok(0) => return Ok(written),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => match decoding {
+                Some(expected) if error.raw_os_error().is_none() => {
+                    return Err(CorruptBlob::io_error(
+                        *expected,
+                        &format!("decoding stored blob: {error}"),
+                    ));
+                }
+                _ => return Err(error),
+            },
+        };
+        output.write_all(&buffer[..read])?;
+        written += read as u64;
+    }
+}
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "blob restore was cancelled")
+}
+
+/// Sets its flag when dropped, telling blocking work that its caller is gone.
+pub(crate) struct StopOnDrop(pub(crate) Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) struct EncodedFile {
@@ -190,6 +267,32 @@ mod tests {
         assert!(encoded.starts_with(ZSTD_BLOB_MAGIC));
         assert!(matches!(encoded, Cow::Owned(_)));
         assert_eq!(decode_bytes(encoded.into_owned()).unwrap(), raw);
+    }
+
+    #[test]
+    fn a_stopped_restore_never_publishes_its_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let payload = b"same line\n".repeat(64 * 1024);
+        let digest = Digest::of_bytes(&payload);
+        for stored in [
+            encode_bytes(&payload).unwrap().into_owned(),
+            payload.clone(),
+        ] {
+            let stored_path = temp.path().join("stored");
+            std::fs::write(&stored_path, stored).unwrap();
+            let output = temp.path().join("output");
+            let stop = AtomicBool::new(true);
+
+            let error = decode_file(&stored_path, &output, &digest, &stop).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(!output.exists());
+            let left: Vec<_> = std::fs::read_dir(temp.path()).unwrap().collect();
+            assert_eq!(left.len(), 1, "only the stored blob remains");
+            decode_file(&stored_path, &output, &digest, &AtomicBool::new(false)).unwrap();
+            assert_eq!(std::fs::read(&output).unwrap(), payload);
+            std::fs::remove_file(&output).unwrap();
+        }
     }
 
     #[test]

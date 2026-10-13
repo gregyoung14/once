@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use schlussel::{ClientMetadata, DynamicRegistrationClient};
 use serde::{Deserialize, Serialize};
 
+use super::classify::auth_error;
 use super::{TuistAuth, PROVIDER_NAME};
-use crate::{Digest, Error, Result};
+use crate::{Digest, Error, ErrorKind, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct RegisteredClient {
@@ -41,11 +42,11 @@ impl TuistAuth {
             .map_err(|source| Self::remote_auth_error("register auth client", &source))?;
         let client_id = response.client_id.trim();
         if client_id.is_empty() {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "register auth client",
-                message: "Tuist returned an empty client_id".to_string(),
-            });
+            return Err(auth_error(
+                "register auth client",
+                ErrorKind::Protocol,
+                "Tuist returned an empty client_id".to_string(),
+            ));
         }
         Ok(RegisteredClient {
             client_id: client_id.to_string(),
@@ -71,11 +72,11 @@ impl TuistAuth {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
-                return Err(Error::Remote {
-                    provider: PROVIDER_NAME,
-                    operation: "load auth registration",
-                    message: source.to_string(),
-                });
+                return Err(auth_error(
+                    "load auth registration",
+                    ErrorKind::Io,
+                    source.to_string(),
+                ));
             }
         };
         serde_json::from_slice(&bytes)
@@ -95,27 +96,20 @@ impl TuistAuth {
     ) -> Result<()> {
         let path = self.registration_path();
         let Some(parent) = path.parent() else {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "store auth registration",
-                message: "registration path had no parent directory".to_string(),
-            });
+            return Err(auth_error(
+                "store auth registration",
+                ErrorKind::Io,
+                "registration path had no parent directory".to_string(),
+            ));
         };
-        fs::create_dir_all(parent).map_err(|source| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "store auth registration",
-            message: source.to_string(),
+        fs::create_dir_all(parent).map_err(|source| {
+            auth_error("store auth registration", ErrorKind::Io, source.to_string())
         })?;
-        let bytes =
-            serde_json::to_vec_pretty(registered_client).map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "store auth registration",
-                message: source.to_string(),
-            })?;
-        fs::write(path, bytes).map_err(|source| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "store auth registration",
-            message: source.to_string(),
+        let bytes = serde_json::to_vec_pretty(registered_client).map_err(|source| {
+            auth_error("store auth registration", ErrorKind::Io, source.to_string())
+        })?;
+        fs::write(path, bytes).map_err(|source| {
+            auth_error("store auth registration", ErrorKind::Io, source.to_string())
         })
     }
 
@@ -124,11 +118,11 @@ impl TuistAuth {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "delete auth registration",
-                message: source.to_string(),
-            }),
+            Err(source) => Err(auth_error(
+                "delete auth registration",
+                ErrorKind::Io,
+                source.to_string(),
+            )),
         }
     }
 
