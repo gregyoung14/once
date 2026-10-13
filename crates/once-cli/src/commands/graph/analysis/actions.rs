@@ -1212,8 +1212,8 @@ async fn resolve_cacheable_declared_action(
     Ok((outcome, restored_outputs))
 }
 
-/// The cached result for the action, when every blob it names can still be
-/// had. A transport failure is an error rather than a miss.
+/// Reuse only a fully available result. An unavailable cache skips reuse;
+/// refusals, corruption, and local failures still stop execution.
 async fn probe_cached_action(
     context: &DeclaredActionContext<'_>,
     action_digest: Digest,
@@ -1224,30 +1224,36 @@ async fn probe_cached_action(
             context.index, context.target_id, context.identifier
         )
     };
-    let Some(result) = context
-        .cache
-        .get_action_result(&action_digest)
-        .await
-        .with_context(probe)?
-    else {
-        return Ok(None);
-    };
-    if !action_result_blobs_present(
-        &result,
-        context.workspace,
-        context.cache,
-        context.source_digest_cache,
-    )
-    .await
-    .with_context(probe)?
-    {
-        return Ok(None);
+    let cached: once_cas::Result<_> = async {
+        let Some(result) = context.cache.get_action_result(&action_digest).await? else {
+            return Ok(None);
+        };
+        if !action_result_blobs_present(
+            &result,
+            context.workspace,
+            context.cache,
+            context.source_digest_cache,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(once_core::Outcome {
+            action: action_digest,
+            result,
+            cache: once_core::CacheState::Hit,
+        }))
     }
-    Ok(Some(once_core::Outcome {
-        action: action_digest,
-        result,
-        cache: once_core::CacheState::Hit,
-    }))
+    .await;
+    match cached {
+        Err(error) if error.is_unavailable() => {
+            tracing::warn!(target = %context.target_id, action_index = context.index,
+                %action_digest, error = %error,
+                "cache unavailable; executing the action instead of reusing it");
+            Ok(None)
+        }
+        result => result.with_context(probe),
+    }
 }
 
 fn cacheable_action_lock(workspace: &Path, digest: Digest) -> Result<RwLock<std::fs::File>> {

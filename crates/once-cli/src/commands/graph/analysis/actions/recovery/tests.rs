@@ -42,6 +42,70 @@ fn only_confirmed_absence_counts_as_a_missing_blob() {
     assert_eq!(confirmed_missing_blob(&misconfigured), None);
 }
 
+#[test]
+fn only_absence_or_classified_unavailability_allows_output_recomputation() {
+    for kind in [
+        once_cas::ErrorKind::Unavailable,
+        once_cas::ErrorKind::Refused,
+        once_cas::ErrorKind::Corrupt,
+        once_cas::ErrorKind::Protocol,
+        once_cas::ErrorKind::Misconfigured,
+        once_cas::ErrorKind::Exhausted,
+        once_cas::ErrorKind::Io,
+        once_cas::ErrorKind::Other,
+    ] {
+        for through_core in [false, true] {
+            let error = once_cas::Error::RemoteFailure {
+                provider: "tuist",
+                operation: "get blob",
+                kind,
+                message: "test failure".into(),
+            };
+            let error = if through_core {
+                anyhow::Error::from(once_core::Error::Cas(error))
+            } else {
+                anyhow::Error::from(error)
+            }
+            .context("restoring declared output");
+            assert_eq!(
+                can_recompute_output(&error),
+                kind == once_cas::ErrorKind::Unavailable,
+                "{kind}"
+            );
+            assert_eq!(
+                confirmed_missing_blob(&error),
+                None,
+                "an outage never proves absence"
+            );
+        }
+    }
+}
+
+#[test]
+fn local_io_errors_do_not_inherit_unavailability_from_their_source() {
+    let unavailable = || once_cas::Error::RemoteFailure {
+        provider: "test",
+        operation: "read",
+        kind: once_cas::ErrorKind::Unavailable,
+        message: "unavailable".into(),
+    };
+    let errors = [
+        anyhow::Error::from(once_cas::Error::Io {
+            path: "output".into(),
+            source: std::io::Error::other(unavailable()),
+        }),
+        anyhow::Error::from(once_core::Error::ReadOutput {
+            path: "output".into(),
+            source: std::io::Error::other(unavailable()),
+        }),
+    ];
+    for error in errors {
+        assert!(!can_recompute_output(
+            &error.context("local output operation failed")
+        ));
+    }
+}
+
 fn target() -> GraphTarget {
     GraphTarget {
         label: once_frontend::TargetLabel {

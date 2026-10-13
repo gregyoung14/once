@@ -8,9 +8,9 @@
 //! remembered as the producer of its outputs, so a restore the cache confirms
 //! is impossible runs that producer again instead of failing the build.
 //!
-//! Only confirmed absence takes that path. A transport failure, a corrupt
-//! blob, or a rejected credential says nothing about whether the bytes exist,
-//! and running work again would hide the real failure, so those propagate.
+//! Confirmed absence or a classified cache outage can take that path, but
+//! only a recorded producer can reconstruct the exact expected bytes. An
+//! outage never proves absence. Corruption, refusals, and local errors propagate.
 //!
 //! A repair is owned by the registry, not by whoever asked for it first: it
 //! runs as its own task, every caller observes the same terminal answer, and a
@@ -81,6 +81,18 @@ pub(in crate::commands::graph::analysis) fn confirmed_missing_blob(
             _ => None,
         }
     })
+}
+
+fn can_recompute_output(error: &anyhow::Error) -> bool {
+    confirmed_missing_blob(error).is_some()
+        || error.chain().any(|cause| {
+            if let Some(once_core::Error::Cas(error)) = cause.downcast_ref::<once_core::Error>() {
+                return error.is_unavailable();
+            }
+            cause
+                .downcast_ref::<once_cas::Error>()
+                .is_some_and(once_cas::Error::is_unavailable)
+        })
 }
 
 /// How one action produced its outputs, retained so it can run again and be
@@ -448,7 +460,7 @@ impl Repair<'_> {
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
-            if confirmed_missing_blob(&error).is_none() {
+            if !can_recompute_output(&error) {
                 return Err(error);
             }
             for (path, digest) in &result.outputs {
@@ -457,23 +469,26 @@ impl Repair<'_> {
                     Ok(()) => continue,
                     Err(error) => error,
                 };
-                let Some(missing) = confirmed_missing_blob(&error) else {
+                if !can_recompute_output(&error) {
                     return Err(error);
-                };
+                }
+                let missing = confirmed_missing_blob(&error);
                 let Some(producer) = self.producers.producer_of(path, *digest) else {
                     return Err(error.context(format!(
-                        "output `{path}` is no longer in the cache and no action in this build \
+                        "output `{path}` could not be restored and no action in this build \
                          recorded producing it; run the build again to produce it"
                     )));
                 };
                 tracing::warn!(
                     output = %path,
-                    blob = %missing,
+                    blob = %digest,
+                    confirmed_missing = missing.is_some(),
+                    error = %error,
                     target = %producer.target_id,
                     action_index = producer.index,
                     identifier = %producer.identifier,
                     depth,
-                    "deferred output is gone from the cache; running its producer again"
+                    "deferred output could not be restored; running its recorded producer again"
                 );
                 self.repair(&producer, depth, waiter)
                     .await
