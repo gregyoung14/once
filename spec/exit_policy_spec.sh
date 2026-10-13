@@ -31,13 +31,20 @@ EOF
       "$1" "$2" > "$WORKSPACE/task/once.toml"
   }
 
+  build_policy_twice() {
+    if once build task/Policy > "$SPEC_ROOT/first.out" 2> "$SPEC_ROOT/first.err"; then
+      printf 'first=success\n'
+    else
+      printf 'first=failure\n'
+    fi
+    once "$@" build task/Policy
+  }
+
   It 'rejects an excluded zero on repeated cacheable builds'
     create_exit_policy_workspace 0 true
-    once build task/Policy > "$SPEC_ROOT/first.out" 2> "$SPEC_ROOT/first.err"
-    first_status=$?
-    The value "$first_status" should not equal 0
 
-    When call once build task/Policy
+    When call build_policy_twice
+    The stdout should include 'first=failure'
     The status should be failure
     The stderr should include 'code 0, which is excluded by success_exit_codes'
   End
@@ -52,11 +59,8 @@ EOF
 
   It 'reuses accepted nonzero-only policies on subsequent builds'
     create_exit_policy_workspace 7 true
-    once build task/Policy > "$SPEC_ROOT/first.out" 2> "$SPEC_ROOT/first.err"
-    first_status=$?
-    The value "$first_status" should equal 0
-
-    When call once --format json build task/Policy
+    When call build_policy_twice --format json
+    The stdout should include 'first=success'
     The status should be success
     The stdout should include '"status":"completed"'
     The stdout should include '"cache":"hit"'
