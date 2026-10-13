@@ -32,6 +32,22 @@ script can see. A precise contract produces useful cache hits while still
 invalidating the result when it should.
 :::
 
+## Continue During a Cache Outage
+
+If a remote cache remains unavailable after bounded retries, Once executes the
+script instead of reusing a cached result. Newly produced results remain in the
+local cache, so later runs can reuse them even while the remote cache is down.
+The outage is logged; it is not treated as proof that remote content is absent.
+
+Builds can also reconstruct an unavailable deferred output when the current
+build recorded its producer. Reconstruction must reproduce the exact expected
+bytes and remains subject to resource admission and bounded repair limits.
+An output without a recorded producer still fails if its bytes cannot be fetched.
+
+Cache reuse and restoration still fail on rejected credentials, corrupt content,
+malformed cache records, and local filesystem errors. Explicit cache reads, including SDK reads,
+continue to report availability errors rather than silently return missing data.
+
 ## Connect Dependent Scripts
 
 Use `needs` when one annotated script must run before another:

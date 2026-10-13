@@ -340,6 +340,21 @@ async fn lookup_cached(
     if !action_uses_cache(action) {
         return Ok(None);
     }
+    match lookup_cached_available(cache, workspace_root, key, resources).await {
+        Err(crate::Error::Cas(error)) if error.is_unavailable() => {
+            warn!(action_digest = %key, error = %error, "cache unavailable; executing the action instead of reusing it");
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+async fn lookup_cached_available(
+    cache: &CacheProvider,
+    workspace_root: &Path,
+    key: &Digest,
+    resources: Option<&ExecutorResources>,
+) -> Result<Option<Outcome>> {
     if let Some(result) = cache.get_action_result(key).await? {
         // A partially-evicted or partially-synced entry can have its
         // action result present while a blob it points at is gone. The
