@@ -236,7 +236,7 @@ impl SourceDigestCache {
         // reads every byte under it, and a graph derived from a package manifest
         // declares whole unpacked dependency trees as inputs. Describe the tree
         // by metadata instead, and read it only when that description moves.
-        let tree = if metadata.is_dir() {
+        let tree = if metadata.is_dir() && Fingerprint::can_reuse() {
             Some(once_core::tree_stat_fingerprint(&absolute)?)
         } else {
             None
@@ -482,6 +482,9 @@ struct DescribedOutput {
 /// it resolves to, which is a different question from whether the link itself
 /// moved, and reading the link is cheap anyway.
 fn describe_output(workspace: &Path, relative: &str) -> Option<DescribedOutput> {
+    if !Fingerprint::can_reuse() {
+        return None;
+    }
     let absolute = workspace.join(relative);
     let metadata = std::fs::symlink_metadata(&absolute).ok()?;
     if metadata.file_type().is_symlink() {
@@ -491,7 +494,7 @@ fn describe_output(workspace: &Path, relative: &str) -> Option<DescribedOutput> 
     // or a build script's, is a directory holding anything from one file to
     // thousands, and hashing it is the largest single cost of an invocation
     // that has nothing to do. The description below walks it with `lstat`.
-    let tree = if metadata.is_dir() {
+    let tree = if metadata.is_dir() && Fingerprint::can_reuse() {
         Some(once_core::tree_stat_fingerprint(&absolute).ok()?)
     } else if metadata.is_file() {
         None

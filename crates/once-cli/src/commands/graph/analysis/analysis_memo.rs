@@ -42,7 +42,7 @@ pub struct AnalysisMemo {
     root: PathBuf,
     /// Identity of the running executable, part of every name because the
     /// globals an implementation calls are compiled into it.
-    executable_identity: String,
+    executable_identity: Option<String>,
     enabled: bool,
 }
 
@@ -54,13 +54,13 @@ impl AnalysisMemo {
             // With no identity for the executable there is no way to notice
             // that the code behind the globals changed, so remember nothing.
             enabled: enabled() && executable_identity.is_some(),
-            executable_identity: executable_identity.unwrap_or_default(),
+            executable_identity,
         }
     }
 
     #[must_use]
-    pub fn executable_identity(&self) -> &str {
-        &self.executable_identity
+    pub fn executable_identity(&self) -> Option<&str> {
+        self.executable_identity.as_deref()
     }
 
     #[must_use]
@@ -152,11 +152,11 @@ fn enabled() -> bool {
 /// distinguishes any rebuild or reinstall: both are writes, and the kernel
 /// stamps ctime on writes whatever a build system claims about mtime.
 fn executable_identity() -> Option<String> {
-    let executable = std::env::current_exe().ok()?;
-    let metadata = std::fs::metadata(&executable).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        let executable = std::env::current_exe().ok()?;
+        let metadata = std::fs::metadata(&executable).ok()?;
         Some(format!(
             "{}:{}:{}.{}:{}",
             executable.display(),
@@ -168,18 +168,7 @@ fn executable_identity() -> Option<String> {
     }
     #[cfg(not(unix))]
     {
-        let modified = metadata
-            .modified()
-            .ok()?
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        Some(format!(
-            "{}:{}:{}.{}",
-            executable.display(),
-            metadata.len(),
-            modified.as_secs(),
-            modified.subsec_nanos()
-        ))
+        None
     }
 }
 

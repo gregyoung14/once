@@ -22,6 +22,19 @@ fn recorded(entries: Vec<once_frontend::analysis::Observation>) -> AnalysisObser
 }
 
 #[test]
+fn executable_identity_is_optional_and_independent_of_memoization_policy() {
+    let workspace = TempDir::new().unwrap();
+    let mut memo = AnalysisMemo::open(workspace.path());
+    memo.executable_identity = Some("binary-identity".to_owned());
+    memo.enabled = false;
+    assert!(!memo.is_enabled());
+    assert_eq!(memo.executable_identity(), Some("binary-identity"));
+    memo.executable_identity = None;
+    assert_eq!(memo.executable_identity(), None);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_stored_analysis_comes_back_with_the_answers_it_recorded() {
     let workspace = TempDir::new().unwrap();
     let memo = AnalysisMemo::open(workspace.path());
@@ -56,6 +69,7 @@ fn an_analysis_that_read_something_undescribable_is_not_stored() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_record_written_by_another_schema_is_ignored() {
     let workspace = TempDir::new().unwrap();
@@ -72,6 +86,7 @@ fn a_record_written_by_another_schema_is_ignored() {
     assert!(memo.read("abcdef").is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn records_are_kept_apart_by_name() {
     let workspace = TempDir::new().unwrap();

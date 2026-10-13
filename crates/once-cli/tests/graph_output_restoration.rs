@@ -89,14 +89,17 @@ impl Workspace {
     }
 
     fn build(&self) -> Output {
+        self.command().arg("build").arg("app").output().unwrap()
+    }
+
+    fn command(&self) -> Command {
         let home = self.home.path();
-        Command::new(env!("CARGO_BIN_EXE_once"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_once"));
+        command
             .arg("-C")
             .arg(self.path())
             .arg("--format")
             .arg("json")
-            .arg("build")
-            .arg("app")
             .env("HOME", home)
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env("XDG_CONFIG_HOME", home.join("config"))
@@ -104,9 +107,8 @@ impl Workspace {
             .env("XDG_STATE_HOME", home.join("state"))
             .env("ONCE_CHANGE_TRACKER", "0")
             .env("ONCE_CACHE_PROVIDER", "local")
-            .env_remove("TUIST_TOKEN")
-            .output()
-            .unwrap()
+            .env_remove("TUIST_TOKEN");
+        command
     }
 
     fn build_succeeds(&self) -> serde_json::Value {
@@ -177,6 +179,29 @@ fn a_restarted_build_restores_removed_outputs_without_rerunning_actions() {
         !workspace.output("main.o").exists(),
         "the intermediate stays in the cache when nothing needs it on disk"
     );
+}
+
+#[test]
+fn an_action_cache_build_reruns_after_gc_evicts_its_intermediate() {
+    let workspace = Workspace::new("two_step");
+    workspace.build_succeeds();
+    assert_eq!(workspace.runs(), "compilelink");
+    let output = workspace
+        .command()
+        .args(["cache", "gc", "--max-size", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "GC failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(workspace.output("main.o")).unwrap();
+    workspace.build_succeeds();
+    assert_eq!(workspace.runs(), "compilelinkcompilelink");
+    assert_eq!(std::fs::read(workspace.output("app")).unwrap(), b"object");
+    workspace.build_succeeds();
+    assert_eq!(workspace.runs(), "compilelinkcompilelink");
 }
 
 #[test]

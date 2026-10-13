@@ -159,7 +159,10 @@ let action = key.finish();
 ```
 
 Changing the namespace, a label, an input value, a digest, or input order
-produces a different action key.
+produces a different action key. Inputs are hashed as they are added, without
+retaining a separate copy of their contents. Builder memory stays
+bounded independently of input size, and cloning a builder copies only its
+hash state. The versioned encoding and resulting action keys are unchanged.
 
 ### Action Results
 

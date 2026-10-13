@@ -12,7 +12,7 @@ use crate::commands::change_tracker::{ChangePosition, ChangeSnapshot};
 
 use self::path_fingerprint::PathFingerprint;
 
-const SCHEMA: &str = "once.build-receipt.v5";
+const SCHEMA: &str = "once.build-receipt.v6";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct BuildReceipt {
@@ -74,6 +74,10 @@ pub(super) async fn load(
     snapshot: Option<&ChangeSnapshot>,
     receipt: Option<BuildReceipt>,
 ) -> Option<CapabilityRunRecord> {
+    // Receipt host-path fingerprints require a reliable inode change marker.
+    if !cfg!(unix) {
+        return None;
+    }
     let snapshot = snapshot?;
     let mut receipt = receipt?;
     let changed_environment = changed_environment(&receipt.environment);
@@ -164,6 +168,9 @@ pub(super) async fn store(
     observations: Observations<'_>,
     record: &CapabilityRunRecord,
 ) {
+    if !cfg!(unix) {
+        return;
+    }
     let Some(executable_fingerprint) = executable_fingerprint() else {
         return;
     };
@@ -310,6 +317,9 @@ fn source_changes_match(
 }
 
 fn executable_fingerprint() -> Option<PathFingerprint> {
+    if !cfg!(unix) {
+        return None;
+    }
     let executable = std::env::current_exe().ok()?;
     path_fingerprint::fingerprint(&executable)
 }
@@ -475,6 +485,25 @@ mod tests {
             TEST_CONFIGURATION_PATH_SUFFIX,
         )
         .await;
+        let mut legacy = read(
+            temporary.path(),
+            "app",
+            SandboxMode::Off,
+            TEST_CONFIGURATION_PATH_SUFFIX,
+        )
+        .await
+        .unwrap();
+        legacy.schema = "once.build-receipt.v5".to_owned();
+        assert!(load(
+            temporary.path(),
+            "app",
+            SandboxMode::Off,
+            TEST_CONFIGURATION_PATH_SUFFIX,
+            Some(&snapshot),
+            Some(legacy)
+        )
+        .await
+        .is_none());
         let loaded = load(
             temporary.path(),
             "app",

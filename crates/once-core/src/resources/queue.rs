@@ -122,11 +122,11 @@ impl Queue {
             free.take(&waiter.request);
             if fits {
                 waiter.granted = true;
-                granted.push(waiter.request.clone());
+                granted.push(&waiter.request);
                 wakers.extend(waiter.waker.take());
             }
         }
-        for request in &granted {
+        for request in granted {
             self.used.add(request);
         }
         wakers

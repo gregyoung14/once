@@ -22,18 +22,22 @@
 //! moved backwards under it, or writes going around the filesystem to the raw
 //! device, neither of which any content digest survives either.
 //!
-//! Set `ONCE_TREE_DIGEST_CACHE=0` to hash every tree in full instead.
+//! Platforms without a reliable inode change marker fingerprint tree contents
+//! instead of trusting modification times. Set `ONCE_TREE_DIGEST_CACHE=0` to
+//! bypass reuse entirely.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+#[cfg(unix)]
 use sha2::Digest as _;
 
+#[cfg(unix)]
 use crate::digest::{hex_lower, host_file_mode, portable_path, utf8_path};
 
-const SCHEMA: &str = "once.tree_digests.v3";
+const SCHEMA: &str = "once.tree_digests.v4";
 
 /// Cap on remembered trees, so a long-lived workspace cannot grow the file
 /// without bound. Eviction is wholesale rather than least-recently-used: the
@@ -98,6 +102,11 @@ impl TreeDigestCache {
         let slot = format!("{key}\u{0}{root_text}");
         if let Some(answer) = self.lock_answered().get(&slot) {
             return Ok(answer.clone());
+        }
+        if !cfg!(unix) {
+            let digest = compute()?;
+            self.remember_answer(slot, &digest);
+            return Ok(digest);
         }
         // A tree that cannot be walked cannot be described, so fall through to
         // the real hash and let it report the problem.
@@ -222,18 +231,33 @@ fn parse(text: &str) -> Option<BTreeMap<String, Entry>> {
 }
 
 /// Describe a tree by the metadata of everything in it, without reading any
-/// contents. Entries are visited in sorted order so the description is stable.
+/// contents on Unix. Other platforms hash contents rather than trusting mutable
+/// timestamps. Entries are visited in sorted order so the description is stable.
 pub fn tree_stat_fingerprint(root: &Path) -> std::io::Result<String> {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"once.tree_stat.v2\0");
-    hash_stat_directory(root, root, &mut hasher, 0)?;
-    Ok(hex_lower(&hasher.finalize()))
+    #[cfg(unix)]
+    {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"once.tree_stat.v2\0");
+        hash_stat_directory(root, root, &mut hasher, 0)?;
+        Ok(hex_lower(&hasher.finalize()))
+    }
+    #[cfg(not(unix))]
+    {
+        content_fingerprint(root)
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn content_fingerprint(root: &Path) -> std::io::Result<String> {
+    crate::host_tree_sha256_hex(root)
 }
 
 /// Guard against a symlink loop turning the walk into an infinite descent.
 /// Real source trees are nowhere near this deep.
+#[cfg(unix)]
 const MAX_DEPTH: u32 = 64;
 
+#[cfg(unix)]
 fn hash_stat_directory(
     root: &Path,
     directory: &Path,
@@ -274,6 +298,7 @@ fn hash_stat_directory(
 
 /// Size of one entry's metadata marker. Fixed width so the fields cannot
 /// shift into one another between platforms.
+#[cfg(unix)]
 const STAT_MARKER_LEN: usize = 48;
 
 #[cfg(unix)]
@@ -299,21 +324,65 @@ fn stat_change_marker(metadata: &std::fs::Metadata) -> [u8; STAT_MARKER_LEN] {
     marker
 }
 
-#[cfg(not(unix))]
-fn stat_change_marker(metadata: &std::fs::Metadata) -> [u8; STAT_MARKER_LEN] {
-    let mut marker = [0_u8; STAT_MARKER_LEN];
-    if let Ok(modified) = metadata.modified() {
-        if let Ok(since) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-            marker[..8].copy_from_slice(&since.as_secs().to_le_bytes());
-            marker[8..12].copy_from_slice(&since.subsec_nanos().to_le_bytes());
-        }
-    }
-    marker
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn reopened_caches_rehash_contents_instead_of_reusing_restored_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("source");
+        let cache_path = tmp.path().join("cache");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cache = TreeDigestCache::open(cache_path.clone());
+        let before = cache
+            .digest("host-tree", &tree, || crate::host_tree_sha256_hex(&tree))
+            .unwrap();
+        assert_eq!(
+            cache
+                .digest("host-tree", &tree, || panic!("reuse within this run"))
+                .unwrap(),
+            before
+        );
+        drop(cache);
+        std::fs::write(&path, b"bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let cache = TreeDigestCache::open(cache_path);
+        let after = cache
+            .digest("host-tree", &tree, || crate::host_tree_sha256_hex(&tree))
+            .unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn content_fallback_detects_same_length_rewrites_with_restored_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("source");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = content_fingerprint(tmp.path()).unwrap();
+        std::fs::write(&path, b"bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_ne!(content_fingerprint(tmp.path()).unwrap(), before);
+    }
 
     #[test]
     fn reuses_a_digest_while_the_tree_is_untouched() {
@@ -427,7 +496,9 @@ mod tests {
             .unwrap();
 
         std::fs::write(&file, b"bbbb").unwrap();
-        std::fs::File::open(&file)
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(original))
             .unwrap();
@@ -462,6 +533,7 @@ mod tests {
         assert_eq!((one.as_str(), two.as_str()), ("a", "b"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn survives_a_round_trip_through_the_file() {
         let tmp = tempfile::TempDir::new().unwrap();

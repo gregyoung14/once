@@ -88,7 +88,7 @@ pub(super) fn known_changes(
 
 use super::configuration::ResolvedConfiguration;
 
-const GRAPH_TOOL_CACHE_SCHEMA: &str = "once.graph-tool-paths.v4";
+const GRAPH_TOOL_CACHE_SCHEMA: &str = "once.graph-tool-paths.v5";
 const GRAPH_TOOL_ENVIRONMENT_KEYS: &[&str] = &[
     "DEVELOPER_DIR",
     "ELIXIR_ERL_OPTIONS",
@@ -260,13 +260,15 @@ impl BuildSession {
                 .with_configuration(resolved.configuration.clone(), resolved.path_suffix.clone());
         let resolution_cache = ResolutionCache::open(workspace);
         let memo = AnalysisMemo::open(workspace);
-        let resolution_key = resolution_cache::key(
-            analyzer.module_source(),
-            workspace,
-            resolved.digest,
-            memo.executable_identity(),
-            &workspace_targets,
-        );
+        let resolution_key = memo.executable_identity().and_then(|identity| {
+            resolution_cache::key(
+                analyzer.module_source(),
+                workspace,
+                resolved.digest,
+                identity,
+                &workspace_targets,
+            )
+        });
         let reused = resolution_key
             .as_deref()
             .and_then(|key| resolution_cache.reuse(&analyzer, workspace, key, changes));
@@ -1197,6 +1199,9 @@ fn graph_tool_cache_path_from(toolchain_root: &Path, workspace: &Path) -> PathBu
 }
 
 fn graph_tool_paths_fingerprint(paths: &BTreeMap<String, String>) -> Option<Digest> {
+    if !cfg!(unix) {
+        return None;
+    }
     let mut bytes = Vec::new();
     for (name, path) in paths {
         if once_core::is_mise_shim(Path::new(path)) {
@@ -1215,6 +1220,16 @@ fn graph_tool_paths_fingerprint(paths: &BTreeMap<String, String>) -> Option<Dige
         push_fingerprint_part(&mut bytes, path.as_bytes());
         push_fingerprint_part(&mut bytes, &metadata.len().to_le_bytes());
         push_fingerprint_part(&mut bytes, &modified.as_nanos().to_le_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            for value in [metadata.ctime(), metadata.ctime_nsec()] {
+                push_fingerprint_part(&mut bytes, &value.to_le_bytes());
+            }
+            for value in [metadata.dev(), metadata.ino(), u64::from(metadata.mode())] {
+                push_fingerprint_part(&mut bytes, &value.to_le_bytes());
+            }
+        }
     }
     Some(Digest::of_bytes(&bytes))
 }
@@ -1291,14 +1306,16 @@ fn analyze_with_memo(
 ) -> Result<once_frontend::analysis::AnalysisResult> {
     let key = if memo.is_enabled() {
         precomputed_key.map(ToOwned::to_owned).or_else(|| {
-            analyzer.analysis_key(
-                target,
-                workspace,
-                dep_providers,
-                dependency_providers,
-                capability,
-                memo.executable_identity(),
-            )
+            memo.executable_identity().and_then(|identity| {
+                analyzer.analysis_key(
+                    target,
+                    workspace,
+                    dep_providers,
+                    dependency_providers,
+                    capability,
+                    identity,
+                )
+            })
         })
     } else {
         None
@@ -1381,14 +1398,16 @@ async fn build_one(
     // dependency outcomes, analysed by the same code against the same
     // configuration. Computed once and used both to look for a recorded
     // outcome and, failing that, for a recorded analysis.
-    let analysis_key = analyzer.analysis_key(
-        &target,
-        &workspace,
-        &providers,
-        &providers_by_role,
-        "build",
-        analysis_memo.executable_identity(),
-    );
+    let analysis_key = analysis_memo.executable_identity().and_then(|identity| {
+        analyzer.analysis_key(
+            &target,
+            &workspace,
+            &providers,
+            &providers_by_role,
+            "build",
+            identity,
+        )
+    });
     if let Some(key) = analysis_key
         .as_deref()
         .map(|key| target_outcomes::key(key, &action_digests, &available_inputs))

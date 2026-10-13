@@ -211,6 +211,25 @@ fn graph_tool_cache_invalidates_configuration_and_missing_executables() {
 
 #[cfg(unix)]
 #[test]
+fn graph_tool_identity_detects_same_length_rewrites_with_restored_mtime() {
+    let workspace = tempfile::tempdir().unwrap();
+    let tool = workspace.path().join("tool");
+    std::fs::write(&tool, b"aaaa").unwrap();
+    let modified = std::fs::metadata(&tool).unwrap().modified().unwrap();
+    let paths = BTreeMap::from([("tool".to_owned(), tool.display().to_string())]);
+    let before = graph_tool_paths_fingerprint(&paths).unwrap();
+    std::fs::write(&tool, b"bbbb").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&tool)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_ne!(before, graph_tool_paths_fingerprint(&paths).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
 fn graph_tool_cache_rejects_mise_shim_paths() {
     use std::os::unix::fs::symlink;
 
