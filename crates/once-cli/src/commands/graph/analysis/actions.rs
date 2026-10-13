@@ -33,8 +33,11 @@ use super::output_state;
 use super::source_digest_cache::SourceDigestCache;
 use super::{AvailableInput, BuildOutcome, PerActionOutcome};
 
+pub(super) mod legacy_outputs;
 mod recovery;
 mod runner;
+
+use self::legacy_outputs::capture_step;
 mod scheduling;
 mod uncached_process;
 mod worker_lease;
@@ -906,6 +909,16 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
     materialize_declared_arg_files(workspace, &declared.arg_files).with_context(|| {
         format!("writing arg files for action {index} for {target_id} ({identifier_for_error})")
     })?;
+    if let Some(inputs) = unmaterialized_inputs_for(&declared, available_inputs) {
+        producers
+            .verify_fingerprints(workspace, &inputs, &preparation)
+            .await
+            .with_context(|| {
+                format!(
+                    "validating inputs for action {index} for {target_id} ({identifier_for_error})"
+                )
+            })?;
+    }
     let prepared = prepare_declared_action_with_inputs(
         workspace,
         &declared,
@@ -1179,9 +1192,18 @@ async fn resolve_cacheable_declared_action(
     // A cache hit does not run command setup. Removing a clean_paths entry on
     // a hit could delete an unrelated path with no command left to recreate it.
     let action_digest = action.digest();
-    if let Some(outcome) = probe_cached_action(context, action_digest).await? {
-        context.claim_worker().await;
-        return Ok(outcome);
+    // Old consumers could cache manifest text under these unchanged input digests.
+    let reusable =
+        !legacy_outputs::reads_fingerprints(declared, context.available_inputs, context.producers);
+    if !reusable {
+        tracing::debug!(target = %context.target_id, action_index = context.index, %action_digest,
+            "fingerprint-only input prevents action-cache reuse");
+    }
+    if reusable {
+        if let Some(outcome) = probe_cached_action(context, action_digest).await? {
+            context.claim_worker().await;
+            return Ok(outcome);
+        }
     }
     // Inputs go on disk before admission: restoring one can mean running its
     // producer again, which needs capacity of its own.
@@ -1206,7 +1228,7 @@ async fn resolve_cacheable_declared_action(
         |contended, lease| async move {
             // Another process held the action, so it may have produced the
             // result while this one waited.
-            if contended {
+            if contended && reusable {
                 if let Some(outcome) = probe_cached_action(context, action_digest).await? {
                     context.claim_worker().await;
                     return Ok(outcome);
@@ -1480,6 +1502,7 @@ async fn run_uncacheable_declared_action(
         context.cache,
         declared.inherit_parent_env,
         Some(lease),
+        Some((context.producers, context.identifier)),
     )
     .await
     .with_context(|| {
@@ -1715,7 +1738,7 @@ async fn run_uncached_action(
     cache: &CacheProvider,
     inherit_parent_env: bool,
 ) -> Result<ActionResult> {
-    run_uncached_action_admitted(action, workspace, cache, inherit_parent_env, None).await
+    run_uncached_action_admitted(action, workspace, cache, inherit_parent_env, None, None).await
 }
 
 async fn run_uncached_action_admitted(
@@ -1724,6 +1747,7 @@ async fn run_uncached_action_admitted(
     cache: &CacheProvider,
     inherit_parent_env: bool,
     lease: Option<once_core::ExecutionPermit>,
+    producers: Option<(&Producers, &str)>,
 ) -> Result<ActionResult> {
     match action {
         Action::RunCommand {
@@ -1784,9 +1808,14 @@ async fn run_uncached_action_admitted(
                 run_uncached_discarding_stdout(command, *timeout_ms, cache).await?
             };
             if action.accepts_exit_code(result.exit_code) {
-                result.outputs =
-                    capture_uncached_outputs_admitted(outputs, workspace, cache, lease.as_ref())
-                        .await?;
+                result.outputs = capture_uncached_outputs_admitted(
+                    outputs,
+                    workspace,
+                    cache,
+                    lease.as_ref(),
+                    producers,
+                )
+                .await?;
                 result.exit_code = 0;
             }
             Ok(result)
@@ -1922,7 +1951,7 @@ async fn capture_uncached_outputs(
     workspace: &Path,
     cache: &CacheProvider,
 ) -> Result<BTreeMap<String, Digest>> {
-    capture_uncached_outputs_admitted(outputs, workspace, cache, None).await
+    capture_uncached_outputs_admitted(outputs, workspace, cache, None, None).await
 }
 
 async fn capture_uncached_outputs_admitted(
@@ -1930,6 +1959,7 @@ async fn capture_uncached_outputs_admitted(
     workspace: &Path,
     cache: &CacheProvider,
     lease: Option<&once_core::ExecutionPermit>,
+    producers: Option<(&Producers, &str)>,
 ) -> Result<BTreeMap<String, Digest>> {
     let mut captured = BTreeMap::new();
     for output in outputs {
@@ -1953,31 +1983,23 @@ async fn capture_uncached_outputs_admitted(
                 });
             }
         };
-        if metadata.file_type().is_symlink() {
-            let target = capture_step(lease, {
+        if metadata.file_type().is_symlink() || metadata.is_dir() {
+            let fingerprint = capture_step(lease, {
                 let absolute = absolute.clone();
-                move || std::fs::read_link(absolute)
+                move || legacy_outputs::fingerprint(&absolute)
             })
-            .await?
-            .with_context(|| format!("reading declared output symlink `{}`", output.as_str()))?;
-            let manifest = format!("once.symlink_output.v1\n{}\n", target.to_string_lossy());
-            captured.insert(
-                output.as_str().to_string(),
-                cache.put_blob(manifest.as_bytes()).await?,
-            );
-            continue;
-        }
-        if metadata.is_dir() {
-            let manifest = capture_step(lease, {
-                let absolute = absolute.clone();
-                move || directory_manifest_bytes(&absolute)
-            })
-            .await
-            .context("joining declared directory output capture")??;
-            captured.insert(
-                output.as_str().to_string(),
-                cache.put_blob(&manifest).await?,
-            );
+            .await??
+            .with_context(|| {
+                format!(
+                    "declared output `{}` changed type during capture",
+                    output.as_str()
+                )
+            })?;
+            let digest = cache.put_blob(&fingerprint.bytes).await?;
+            if let Some((producers, identifier)) = producers {
+                producers.record_fingerprint(output.as_str(), digest, fingerprint.kind, identifier);
+            }
+            captured.insert(output.as_str().to_string(), digest);
             continue;
         }
         let file = capture_step(lease, move || std::fs::File::open(absolute))
@@ -1989,67 +2011,6 @@ async fn capture_uncached_outputs_admitted(
         );
     }
     Ok(captured)
-}
-
-async fn capture_step<T, F>(
-    lease: Option<&once_core::ExecutionPermit>,
-    work: F,
-) -> std::result::Result<T, tokio::task::JoinError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    match lease {
-        Some(lease) => lease.run_blocking(work).await,
-        None => tokio::task::spawn_blocking(work).await,
-    }
-}
-
-fn directory_manifest_bytes(root: &Path) -> Result<Vec<u8>> {
-    let mut entries = Vec::new();
-    collect_directory_manifest(root, root, &mut entries)?;
-    let mut manifest = b"once.directory_output.v1\n".to_vec();
-    for entry in entries {
-        manifest.extend_from_slice(entry.as_bytes());
-        manifest.push(b'\n');
-    }
-    Ok(manifest)
-}
-
-fn collect_directory_manifest(root: &Path, dir: &Path, entries: &mut Vec<String>) -> Result<()> {
-    let mut children = std::fs::read_dir(dir)
-        .with_context(|| format!("reading declared directory output `{}`", dir.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("reading declared directory output `{}`", dir.display()))?;
-    children.sort_by_key(std::fs::DirEntry::file_name);
-    for child in children {
-        let path = child.path();
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path.as_path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("reading declared output metadata `{}`", path.display()))?;
-        if metadata.is_dir() {
-            entries.push(format!("dir\t{relative}"));
-            collect_directory_manifest(root, &path, entries)?;
-        } else if metadata.is_file() {
-            let file = std::fs::File::open(&path)
-                .with_context(|| format!("reading declared output file `{}`", path.display()))?;
-            let digest = Digest::of_reader(std::io::BufReader::new(file))
-                .with_context(|| format!("hashing declared output file `{}`", path.display()))?;
-            entries.push(format!("file\t{relative}\t{digest}"));
-        } else if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&path)
-                .with_context(|| format!("reading declared output symlink `{}`", path.display()))?;
-            entries.push(format!(
-                "symlink\t{relative}\t{}",
-                Digest::of_bytes(target.to_string_lossy().as_bytes())
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn compose_target_action_digest(target_id: &str, action_digests: &[Digest]) -> Digest {

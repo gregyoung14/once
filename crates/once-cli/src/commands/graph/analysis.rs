@@ -1448,9 +1448,15 @@ async fn build_one(
     );
     if let Some(key) = analysis_key
         .as_deref()
-        .map(|key| target_outcomes::key(key, &action_digests))
+        .map(|key| target_outcomes::key(key, &action_digests, &available_inputs))
     {
-        let reused = match target_outcomes.reuse(&target, &key, &changes) {
+        let reused = match target_outcomes.reuse_with_inputs(
+            &target,
+            &key,
+            &changes,
+            &available_inputs,
+            &producers,
+        ) {
             Some(outcome) if intermediate_outputs_cached(&outcome, &workspace, &cache).await => {
                 Some(outcome)
             }
@@ -1566,7 +1572,7 @@ async fn build_one(
     .await?;
     if let Some(key) = analysis_key
         .as_deref()
-        .map(|key| target_outcomes::key(key, &action_digests))
+        .map(|key| target_outcomes::key(key, &action_digests, &available_inputs))
     {
         if !has_deferred_actions {
             target_outcomes.record(&target, key, &observations, &declared_inputs, &outcome);

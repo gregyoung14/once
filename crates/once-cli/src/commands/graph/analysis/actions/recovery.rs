@@ -34,6 +34,7 @@ use futures::future::{BoxFuture, FutureExt as _, Shared};
 use once_cas::{ActionResult, CacheProvider, Digest};
 use once_core::{Action, ResourcePool, ResourceRequest, RunEvent, RunEventBus, TargetResult};
 
+use super::legacy_outputs::{self, FingerprintKind};
 use super::{cacheable_action_lock, restore_outputs, SourceDigestCache};
 
 /// The attempt a repair reports: the producer's first attempt was the run or
@@ -116,6 +117,12 @@ pub(in crate::commands::graph::analysis) struct CommandSetup {
     pub(super) create_dirs: Vec<String>,
 }
 
+#[derive(Clone)]
+struct FingerprintEvidence {
+    kind: FingerprintKind,
+    producer: String,
+}
+
 type RepairOutcome = std::result::Result<(), String>;
 
 /// Where repairs report themselves.
@@ -132,6 +139,7 @@ pub(in crate::commands::graph::analysis) struct Producers {
 
 struct ProducersInner {
     by_output: Mutex<HashMap<(String, Digest), Arc<Producer>>>,
+    fingerprints: Mutex<HashMap<(String, Digest), FingerprintEvidence>>,
     /// One repair per producer action, kept after it finishes so its answer
     /// is the answer for the rest of the invocation.
     repairs: Mutex<HashMap<Digest, Shared<BoxFuture<'static, RepairOutcome>>>>,
@@ -154,6 +162,7 @@ impl Producers {
         Self {
             inner: Arc::new(ProducersInner {
                 by_output: Mutex::new(HashMap::new()),
+                fingerprints: Mutex::new(HashMap::new()),
                 repairs: Mutex::new(HashMap::new()),
                 waits: Mutex::new(HashMap::new()),
                 remaining: AtomicUsize::new(limits.executions),
@@ -188,6 +197,63 @@ impl Producers {
         for (path, digest) in &producer.outputs {
             by_output.insert((path.clone(), *digest), Arc::clone(&producer));
         }
+    }
+
+    pub(in crate::commands::graph::analysis) fn record_fingerprint(
+        &self,
+        path: &str,
+        digest: Digest,
+        kind: FingerprintKind,
+        producer: &str,
+    ) {
+        // Later raw files can equal manifest bytes while earlier readers still need the tree.
+        lock(&self.inner.fingerprints)
+            .entry((path.to_string(), digest))
+            .or_insert_with(|| FingerprintEvidence {
+                kind,
+                producer: producer.to_string(),
+            });
+    }
+
+    pub(super) async fn verify_fingerprints(
+        &self,
+        workspace: &Path,
+        result: &ActionResult,
+        lease: &once_core::ExecutionPermit,
+    ) -> Result<Vec<String>> {
+        let fingerprints = {
+            let known = lock(&self.inner.fingerprints);
+            result
+                .outputs
+                .iter()
+                .filter_map(|(path, digest)| {
+                    known
+                        .get(&(path.clone(), *digest))
+                        .map(|evidence| (path.clone(), *digest, evidence.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut verified = Vec::with_capacity(fingerprints.len());
+        for (path, digest, evidence) in fingerprints {
+            legacy_outputs::verify(workspace, &path, digest, evidence.kind, lease)
+                .await
+                .with_context(|| {
+                    format!(
+                        "verifying output `{path}` of uncached action `{}`",
+                        evidence.producer
+                    )
+                })?;
+            verified.push(path);
+        }
+        Ok(verified)
+    }
+
+    pub(in crate::commands::graph::analysis) fn has_fingerprint(
+        &self,
+        path: &str,
+        digest: Digest,
+    ) -> bool {
+        lock(&self.inner.fingerprints).contains_key(&(path.to_string(), digest))
     }
 
     pub(in crate::commands::graph) fn executors(
@@ -338,10 +404,31 @@ impl Repair<'_> {
             .executors(self.resources)?
             .acquire_materialization()
             .await;
+        let fingerprints = self
+            .producers
+            .verify_fingerprints(self.workspace, result, &lease)
+            .await?;
+        if fingerprints.is_empty() {
+            return restore_outputs(
+                self.workspace,
+                self.cache,
+                result,
+                self.source_digest_cache,
+                lease,
+            )
+            .await;
+        }
+        let mut restorable = result.clone();
+        for path in fingerprints {
+            restorable.outputs.remove(&path);
+        }
+        if restorable.outputs.is_empty() {
+            return Ok(());
+        }
         restore_outputs(
             self.workspace,
             self.cache,
-            result,
+            &restorable,
             self.source_digest_cache,
             lease,
         )

@@ -11,16 +11,22 @@ async fn admitted_uncached_capture_preserves_legacy_artifact_digests() {
     let outputs = ["file", "tree", "link", "dangling"]
         .map(|path| once_core::WorkspacePath::try_from(path).unwrap());
     let capture = crate::commands::graph::analysis::actions::capture_uncached_outputs_admitted;
-    let legacy = capture(&outputs, workspace.path(), &workspace.cache, None)
+    let legacy = capture(&outputs, workspace.path(), &workspace.cache, None, None)
         .await
         .unwrap();
     let resources = once_core::ExecutorResources::new(Arc::clone(&workspace.resources));
     let lease = resources
         .acquire(once_core::Executor::Local, &ResourceRequest::default())
         .await;
-    let admitted = capture(&outputs, workspace.path(), &workspace.cache, Some(&lease))
-        .await
-        .unwrap();
+    let admitted = capture(
+        &outputs,
+        workspace.path(),
+        &workspace.cache,
+        Some(&lease),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(legacy, admitted);
     assert_legacy_digests(&admitted);
 }

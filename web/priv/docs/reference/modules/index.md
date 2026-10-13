@@ -777,7 +777,20 @@ phases during import; executing such a record fails until those settings resolve
   and its declared outputs are valid. Defaults to `[0]`. Use this for tools
   that report valid findings with a nonzero process code.
 - `cacheable`: `True` by default. Set `False` for interactive or local
-  side-effect actions.
+  side-effect actions. Uncacheable commands that run directly in the workspace
+  (`sandbox = "off"`, without network denial) record directory and symlink outputs
+  as fingerprints, not restorable contents.
+  Keep these outputs unchanged until their consumers finish. If an output needs
+  restoration after cleanup or replacement, Once refuses rather than installing
+  its fingerprint as file contents. Make the producer cacheable or use an input
+  sandbox when consumers need restorable outputs.
+  Consumers of these fingerprint-only outputs execute afresh, even when their
+  own `cacheable` setting is `True`, because older cached results may contain
+  fingerprint text instead of the original contents. This also applies to
+  implicit same-target inputs through `depends_on_prior_actions`. Fresh results
+  still use normal cache publication; ordinary file and restorable artifact
+  inputs retain cache reuse. A raw file with bytes exactly equal to an earlier
+  fingerprint at the same path cannot be restored during that invocation.
 - `inherit_parent_env`: `False` by default. Set `True` only on an
   uncacheable, unsandboxed local run action that should behave like a command
   launched from the user's development shell. Explicit `env` values take

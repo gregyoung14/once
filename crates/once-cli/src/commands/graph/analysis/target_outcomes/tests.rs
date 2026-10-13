@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+mod content_keys;
+mod fingerprint_inputs;
+
 use once_cas::{ActionResult, Digest};
 use once_core::{EvidenceCacheState, SandboxMode};
 use once_frontend::analysis::{AnalysisObservations, Observation};

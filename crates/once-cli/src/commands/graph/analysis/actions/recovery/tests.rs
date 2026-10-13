@@ -9,6 +9,8 @@ use super::*;
 
 #[cfg(unix)]
 mod admission;
+#[cfg(unix)]
+mod fingerprint_outputs;
 
 #[test]
 fn only_confirmed_absence_counts_as_a_missing_blob() {
