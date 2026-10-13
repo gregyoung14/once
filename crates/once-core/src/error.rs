@@ -59,6 +59,12 @@ pub enum Error {
     },
     #[error("remote provider `{provider}` returned an error: {message}")]
     RemoteProviderApi { provider: String, message: String },
+    #[error("command exited with code 0, which is excluded by success_exit_codes {accepted:?}; add 0 to success_exit_codes if this exit should count as success")]
+    RejectedZeroExitCode {
+        accepted: Vec<i32>,
+        stdout: Option<once_cas::Digest>,
+        stderr: Option<once_cas::Digest>,
+    },
     #[error("action requires a non-empty argv")]
     EmptyArgv,
     #[error("action exceeded its timeout of {0:?}")]

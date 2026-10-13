@@ -508,4 +508,5 @@ jobs:
           shared-key: windows-cas-test
           cache-on-failure: true
           cache-bin: false
-      - run: cargo test -p once-cas
+      - run: cargo test -p once-cas -p once-host-tree
+      - run: cargo test -p once-core --lib action::tests

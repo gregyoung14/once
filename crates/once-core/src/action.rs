@@ -371,6 +371,42 @@ impl Action {
         }
     }
 
+    /// Normalize an accepted process code to success without mistaking an
+    /// excluded zero for the zero used to represent normalized success.
+    pub fn normalize_exit_code(&self, exit_code: i32) -> crate::Result<i32> {
+        if self.accepts_exit_code(exit_code) {
+            Ok(0)
+        } else if exit_code == 0 {
+            let accepted = match self {
+                Self::RunCommand {
+                    success_exit_codes, ..
+                } => success_exit_codes.clone(),
+                _ => vec![0],
+            };
+            Err(crate::Error::RejectedZeroExitCode {
+                accepted,
+                stdout: None,
+                stderr: None,
+            })
+        } else {
+            Ok(exit_code)
+        }
+    }
+
+    /// Normalize process success while retaining captured streams in policy errors.
+    pub fn normalize_result(&self, result: &mut once_cas::ActionResult) -> crate::Result<()> {
+        result.exit_code = self
+            .normalize_exit_code(result.exit_code)
+            .map_err(|mut error| {
+                if let crate::Error::RejectedZeroExitCode { stdout, stderr, .. } = &mut error {
+                    *stdout = result.stdout;
+                    *stderr = result.stderr;
+                }
+                error
+            })?;
+        Ok(())
+    }
+
     /// Canonical, content-addressed key for this action.
     ///
     /// The key is `BLAKE3(domain || canonical_json(self))`. Bumping the
@@ -379,6 +415,12 @@ impl Action {
     pub fn digest(&self) -> Digest {
         let domain = match self {
             Action::CopyPath { .. } => b"once.action.copy_path.v2\0".as_slice(),
+            // Old normalized results cannot distinguish accepted exits from rejected zero.
+            Action::RunCommand {
+                success_exit_codes, ..
+            } if !success_exit_codes.contains(&0) => {
+                b"once.action.run_command.exit_policy.v1\0".as_slice()
+            }
             _ => ACTION_DIGEST_DOMAIN,
         };
         let mut hasher = blake3::Hasher::new();
@@ -477,6 +519,40 @@ mod tests {
             timeout_ms: None,
             success_exit_codes: vec![0],
             remote: None,
+        }
+    }
+
+    #[test]
+    fn exit_policy_preserves_failures_and_normalizes_only_accepted_codes() {
+        let mut action = action(OutputSymlinkMode::default());
+        if let Action::RunCommand {
+            success_exit_codes, ..
+        } = &mut action
+        {
+            *success_exit_codes = vec![7];
+        }
+        assert_eq!(action.normalize_exit_code(7).unwrap(), 0);
+        assert_eq!(action.normalize_exit_code(3).unwrap(), 3);
+        assert!(matches!(
+            action.normalize_exit_code(0),
+            Err(crate::Error::RejectedZeroExitCode { .. })
+        ));
+    }
+
+    #[test]
+    fn only_exit_policies_excluding_zero_partition_legacy_action_keys() {
+        for codes in [vec![0], vec![0, 7], vec![7], vec![]] {
+            let mut action = action(OutputSymlinkMode::default());
+            if let Action::RunCommand {
+                success_exit_codes, ..
+            } = &mut action
+            {
+                *success_exit_codes = codes.clone();
+            }
+            let mut encoded = ACTION_DIGEST_DOMAIN.to_vec();
+            serde_json::to_writer(&mut encoded, &action).unwrap();
+            let legacy = Digest::of_bytes(&encoded);
+            assert_eq!(action.digest() == legacy, codes.contains(&0));
         }
     }
 

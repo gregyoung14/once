@@ -775,7 +775,11 @@ phases during import; executing such a record fails until those settings resolve
   filesystem evidence remain a limitation of this investigation.
 - `success_exit_codes`: integer list whose members mean the command completed
   and its declared outputs are valid. Defaults to `[0]`. Use this for tools
-  that report valid findings with a nonzero process code.
+  that report valid findings with a nonzero process code. Accepted codes are
+  normalized to success. If the list excludes `0`, a process exiting with `0`
+  fails instead of being cached as successful. After upgrading, actions whose
+  list excludes `0` run once more instead of reusing earlier results. Policies
+  including `0` keep their action-cache keys.
 - `cacheable`: `True` by default. Set `False` for interactive or local
   side-effect actions. Uncacheable commands that run directly in the workspace
   (`sandbox = "off"`, without network denial) record directory and symlink outputs

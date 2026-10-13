@@ -3674,6 +3674,7 @@ dependencies = [
 name = "once"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "once-cas",
  "once-core",
  "once-frontend",

@@ -1305,7 +1305,7 @@ async fn execute_declared_cache_miss(
     lease: once_core::ExecutionPermit,
 ) -> Result<once_core::Outcome> {
     preparation::setup(context, declared, &lease).await?;
-    let result = once_core::run_uncached_admitted(
+    let result = match once_core::run_uncached_admitted(
         action,
         context.workspace,
         context.cache,
@@ -1314,6 +1314,10 @@ async fn execute_declared_cache_miss(
         lease,
     )
     .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) => Err(render_execution_error(error, context.cache).await),
+    }
     .with_context(|| {
         format!(
             "executing action {} for {} ({})",
@@ -1671,6 +1675,21 @@ async fn append_captured_output(
     message.push_str(&String::from_utf8_lossy(&bytes));
 }
 
+async fn render_execution_error(error: once_core::Error, cache: &CacheProvider) -> anyhow::Error {
+    let once_core::Error::RejectedZeroExitCode { stdout, stderr, .. } = &error else {
+        return error.into();
+    };
+    let mut message = String::new();
+    append_captured_output(cache, &mut message, "stdout", stdout.as_ref()).await;
+    append_captured_output(cache, &mut message, "stderr", stderr.as_ref()).await;
+    let error = anyhow::Error::new(error);
+    if message.is_empty() {
+        error
+    } else {
+        error.context(message.trim_start().to_owned())
+    }
+}
+
 #[cfg(test)]
 async fn run_uncached_action(
     action: &Action,
@@ -1747,7 +1766,10 @@ async fn run_uncached_action_admitted(
             } else {
                 run_uncached_discarding_stdout(command, *timeout_ms, cache).await?
             };
-            if action.accepts_exit_code(result.exit_code) {
+            if let Err(error) = action.normalize_result(&mut result) {
+                return Err(render_execution_error(error, cache).await);
+            }
+            if result.exit_code == 0 {
                 result.outputs = capture_uncached_outputs_admitted(
                     outputs,
                     workspace,
@@ -1756,7 +1778,6 @@ async fn run_uncached_action_admitted(
                     producers,
                 )
                 .await?;
-                result.exit_code = 0;
             }
             Ok(result)
         }
@@ -1780,15 +1801,15 @@ async fn run_core_admitted(
     cache: &CacheProvider,
     lease: Option<once_core::ExecutionPermit>,
 ) -> Result<ActionResult> {
-    match lease {
+    let result = match lease {
         Some(lease) => {
-            once_core::run_uncached_admitted(action, workspace, cache, false, None, lease)
-                .await
-                .map_err(Into::into)
+            once_core::run_uncached_admitted(action, workspace, cache, false, None, lease).await
         }
-        None => once_core::run_uncached(action, workspace, cache, false)
-            .await
-            .map_err(Into::into),
+        None => once_core::run_uncached(action, workspace, cache, false).await,
+    };
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) => Err(render_execution_error(error, cache).await),
     }
 }
 
@@ -3233,6 +3254,53 @@ mod tests {
         append_captured_output(&cache, &mut message, "stdout", Some(&missing)).await;
 
         assert_eq!(message, "base");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uncached_exit_policies_reject_zero_in_every_local_execution_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache = CacheProvider::Local(once_cas::Cas::open(workspace.path().join("cas")));
+        for sandbox in [
+            SandboxMode::Off,
+            SandboxMode::Inputs,
+            SandboxMode::CopiedInputs,
+        ] {
+            for exit_code in [0, 7] {
+                let action = Action::RunCommand {
+                    argv: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!("printf policy-detail >&2; exit {exit_code}"),
+                    ],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    input_digest: None,
+                    inputs: vec![],
+                    outputs: vec![],
+                    stdout_path: None,
+                    stderr_path: None,
+                    output_symlink_mode: OutputSymlinkMode::default(),
+                    resources: ResourceRequest::default(),
+                    sandbox,
+                    network: NetworkPolicy::default(),
+                    timeout_ms: Some(5_000),
+                    success_exit_codes: vec![7],
+                    remote: None,
+                };
+                let result = run_uncached_action(&action, workspace.path(), &cache, false).await;
+                if exit_code == 0 {
+                    let error = result.unwrap_err();
+                    assert!(format!("{error:#}").contains("policy-detail"));
+                    assert!(matches!(
+                        error.downcast_ref::<once_core::Error>(),
+                        Some(once_core::Error::RejectedZeroExitCode { .. })
+                    ));
+                } else {
+                    assert_eq!(result.unwrap().exit_code, 0);
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

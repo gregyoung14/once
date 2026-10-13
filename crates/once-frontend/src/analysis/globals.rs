@@ -2261,7 +2261,7 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     hex_lower(&hasher.finalize())
 }
 
-fn file_sha256_hex(path: &Path) -> Result<String> {
+pub(super) fn file_sha256_hex(path: &Path) -> Result<String> {
     use std::io::Read;
 
     let file = std::fs::File::open(path)?;

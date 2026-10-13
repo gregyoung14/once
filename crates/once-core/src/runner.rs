@@ -105,6 +105,13 @@ impl Runner {
         self
     }
 
+    pub(super) fn max_parallel_plan_tasks(&self) -> usize {
+        self.resources
+            .host()
+            .max_parallel_actions()
+            .saturating_add(self.resources.remote_concurrency())
+    }
+
     pub fn cache(&self) -> &CacheProvider {
         &self.cache
     }

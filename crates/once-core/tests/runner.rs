@@ -84,6 +84,33 @@ async fn many_independent_actions_execute_concurrently() {
 }
 
 #[tokio::test]
+async fn a_republished_result_with_evicted_blobs_reexecutes_safely() {
+    let (_tmp, runner) = ws();
+    let mut action = cmd("printf x >> executions; printf correct > output");
+    if let Action::RunCommand { outputs, .. } = &mut action {
+        outputs.push(WorkspacePath::try_from("output").unwrap());
+    }
+    let captured = runner.run(&action).await.unwrap().result;
+    runner.cache().gc(0, false).await.unwrap();
+    runner
+        .cache()
+        .put_action_result(&action.digest(), &captured)
+        .await
+        .unwrap();
+    std::fs::write(runner.workspace_root().join("output"), b"stale").unwrap();
+    let result = runner.run(&action).await.unwrap();
+    assert_eq!(result.cache, CacheState::Miss);
+    assert_eq!(
+        std::fs::read(runner.workspace_root().join("executions")).unwrap(),
+        b"xx"
+    );
+    assert_eq!(
+        std::fs::read(runner.workspace_root().join("output")).unwrap(),
+        b"correct"
+    );
+}
+
+#[tokio::test]
 async fn second_run_of_same_action_is_a_cache_hit() {
     let (_tmp, runner) = ws();
     let action = cmd("printf hi");
@@ -114,6 +141,94 @@ async fn accepted_nonzero_exit_captures_outputs_and_is_cached() {
     assert_eq!(first.cache, CacheState::Miss);
     assert_eq!(second.cache, CacheState::Hit);
     assert!(first.result.outputs.contains_key("out/report.sarif"));
+}
+
+#[tokio::test]
+async fn rejected_zero_is_never_returned_or_cached_as_success() {
+    let (_tmp, runner) = ws();
+    let mut action = cmd("exit 0");
+    if let Action::RunCommand {
+        success_exit_codes, ..
+    } = &mut action
+    {
+        *success_exit_codes = vec![7];
+    }
+    let mut legacy_encoding = b"once.action.v11\0".to_vec();
+    serde_json::to_writer(&mut legacy_encoding, &action).unwrap();
+    let legacy = once_cas::Digest::of_bytes(&legacy_encoding);
+    runner
+        .cache()
+        .put_action_result(
+            &legacy,
+            &once_cas::ActionResult {
+                exit_code: 0,
+                stdout: None,
+                stderr: None,
+                outputs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(action.digest(), legacy);
+    for cache_failures in [false, true] {
+        let runner = Runner::with_cache(
+            runner.cache().clone(),
+            runner.workspace_root(),
+            RunOpts { cache_failures },
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                runner.run(&action).await,
+                Err(once_core::Error::RejectedZeroExitCode { .. })
+            ));
+            assert!(runner
+                .cache()
+                .get_action_result(&action.digest())
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_zero_retains_its_policy_and_captured_diagnostics() {
+    let (_tmp, runner) = ws();
+    let mut action = cmd("printf detail >&2; exit 0");
+    if let Action::RunCommand {
+        success_exit_codes, ..
+    } = &mut action
+    {
+        *success_exit_codes = vec![7];
+    }
+    let error = runner.run(&action).await.unwrap_err();
+    let once_core::Error::RejectedZeroExitCode {
+        accepted, stderr, ..
+    } = error
+    else {
+        panic!("expected a rejected-zero policy error");
+    };
+    assert_eq!(accepted, vec![7]);
+    assert_eq!(
+        runner.cache().get_blob(&stderr.unwrap()).await.unwrap(),
+        b"detail"
+    );
+}
+
+#[tokio::test]
+async fn an_accepted_nonzero_only_policy_remains_cacheable() {
+    let (_tmp, runner) = ws();
+    let mut action = cmd("exit 7");
+    if let Action::RunCommand {
+        success_exit_codes, ..
+    } = &mut action
+    {
+        *success_exit_codes = vec![7];
+    }
+    assert_eq!(runner.run(&action).await.unwrap().cache, CacheState::Miss);
+    let hit = runner.run(&action).await.unwrap();
+    assert_eq!(hit.cache, CacheState::Hit);
+    assert_eq!(hit.result.exit_code, 0);
 }
 
 #[tokio::test]

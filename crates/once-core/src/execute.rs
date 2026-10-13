@@ -110,7 +110,8 @@ async fn run_scoped(
             lease.clone(),
         ))
         .await?;
-        let completed = action.accepts_exit_code(result.exit_code);
+        action.normalize_result(&mut result)?;
+        let completed = result.exit_code == 0;
         if completed && !validate_contract {
             result.outputs = outputs::capture_admitted(
                 outputs,
@@ -120,9 +121,6 @@ async fn run_scoped(
                 lease.as_ref(),
             )
             .await?;
-        }
-        if completed {
-            result.exit_code = 0;
         }
         return Ok(result);
     }

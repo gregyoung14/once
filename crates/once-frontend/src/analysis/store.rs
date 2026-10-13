@@ -991,6 +991,7 @@ impl HostCache {
                 self.which(program).ok().flatten()
             }
         })?;
+        #[cfg(unix)]
         let metadata = std::fs::metadata(&resolved).ok()?;
         #[cfg(unix)]
         {
@@ -1004,17 +1005,11 @@ impl HostCache {
         }
         #[cfg(not(unix))]
         {
-            let modified = metadata
-                .modified()
-                .ok()?
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            Some(format!(
-                "{resolved}:{}:{}.{}",
-                metadata.len(),
-                modified.as_secs(),
-                modified.subsec_nanos()
-            ))
+            let path = Path::new(&resolved);
+            let digest = self
+                .host_file_digest(path, || super::globals::file_sha256_hex(path))
+                .ok()?;
+            Some(format!("{resolved}:sha256:{digest}"))
         }
     }
 

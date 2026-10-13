@@ -16,13 +16,12 @@ impl Cas {
     /// 2. Action results, oldest first. Evicting an action releases the
     ///    blobs that only it referenced, which then become collectable.
     ///
-    /// A blob is never removed while a surviving action result still
-    /// references it, so a pass never manufactures a dangling cache
-    /// entry (which would force an otherwise-avoidable re-execution). A
-    /// large, stable input shared by a recent action therefore stays
-    /// cached even when it is the oldest thing on disk - the opposite of
-    /// a plain oldest-first sweep, which would evict exactly those hot
-    /// toolchain blobs first.
+    /// Blobs referenced by action results in this pass's snapshot survive
+    /// until those results are evicted. A large, stable input shared by a
+    /// recent action therefore stays cached even when it is the oldest thing
+    /// on disk, unlike a plain oldest-first sweep of hot toolchain blobs.
+    /// Concurrent publication is not part of that snapshot and may race
+    /// eviction, producing a recoverable cache miss rather than a restorable result.
     ///
     /// Recency is a file's modification time. Because content-addressed
     /// blobs are immutable, a blob's own mtime is its first-seen time,
@@ -211,10 +210,9 @@ async fn collect_blob_files(root: &Path) -> Result<Vec<BlobFile>> {
             path: dir.clone(),
             source,
         })? {
-            let ft = entry.file_type().await.map_err(|source| Error::Io {
-                path: entry.path(),
-                source,
-            })?;
+            let Some(ft) = present(entry.path(), entry.file_type().await)? else {
+                continue;
+            };
             if ft.is_dir() {
                 stack.push(entry.path());
             } else if ft.is_file() {
@@ -223,10 +221,9 @@ async fn collect_blob_files(root: &Path) -> Result<Vec<BlobFile>> {
                     continue;
                 }
                 let path = entry.path();
-                let metadata = entry.metadata().await.map_err(|source| Error::Io {
-                    path: path.clone(),
-                    source,
-                })?;
+                let Some(metadata) = present(path.clone(), entry.metadata().await)? else {
+                    continue;
+                };
                 let digest = digest_from_blob_path(&path);
                 out.push(BlobFile {
                     digest,
@@ -253,10 +250,9 @@ async fn collect_action_files(root: &Path) -> Result<Vec<ActionFile>> {
             path: dir.clone(),
             source,
         })? {
-            let ft = entry.file_type().await.map_err(|source| Error::Io {
-                path: entry.path(),
-                source,
-            })?;
+            let Some(ft) = present(entry.path(), entry.file_type().await)? else {
+                continue;
+            };
             if ft.is_dir() {
                 stack.push(entry.path());
             } else if ft.is_file() {
@@ -266,10 +262,9 @@ async fn collect_action_files(root: &Path) -> Result<Vec<ActionFile>> {
                     continue;
                 }
                 let path = entry.path();
-                let metadata = entry.metadata().await.map_err(|source| Error::Io {
-                    path: path.clone(),
-                    source,
-                })?;
+                let Some(metadata) = present(path.clone(), entry.metadata().await)? else {
+                    continue;
+                };
                 let refs = match fs::read(&path).await {
                     Ok(bytes) => parse_action_refs(&bytes),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -285,6 +280,14 @@ async fn collect_action_files(root: &Path) -> Result<Vec<ActionFile>> {
         }
     }
     Ok(out)
+}
+
+fn present<T>(path: PathBuf, result: io::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Io { path, source }),
+    }
 }
 
 /// The blob digests an action result depends on. A corrupt or foreign
@@ -317,6 +320,21 @@ fn digest_from_blob_path(path: &Path) -> Option<Digest> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_disappeared_scan_entry_is_skipped_but_other_io_errors_are_preserved() {
+        assert_eq!(present(PathBuf::from("entry"), Ok(7)).unwrap(), Some(7));
+        assert!(
+            present::<u8>(PathBuf::from("entry"), Err(io::ErrorKind::NotFound.into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(present::<u8>(PathBuf::from("entry"), Err(io::ErrorKind::PermissionDenied.into())),
+            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::PermissionDenied)
+        );
+    }
+
     #[tokio::test]
     async fn gc_on_empty_cas_reports_nothing_removed() {
         let tmp = TempDir::new().unwrap();
