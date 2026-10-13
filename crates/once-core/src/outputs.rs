@@ -15,9 +15,14 @@ use crate::directory_blob::{
 use crate::file_blob::{
     digest_file_blob, file_blob_header, restore_file_blob_from_reader, FILE_BLOB_MAGIC,
 };
-use crate::{Error, OutputSymlinkMode, Result, WorkspacePath};
+use crate::{Error, ExecutionPermit, OutputSymlinkMode, Result, WorkspacePath};
 
 const RESTORE_PREFETCH_CONCURRENCY: usize = 16;
+
+/// Memory one concurrent output validation is budgeted: a streaming hash
+/// buffer plus directory-walk state. Admitted restores run as many
+/// validations as their reservation covers, up to the prefetch concurrency.
+const VALIDATION_MEMORY_BYTES: u64 = 1024 * 1024;
 
 /// Materialize every cached output blob to its declared workspace path.
 /// On cache hit this is what makes a downstream action see a file the
@@ -27,33 +32,74 @@ pub(crate) async fn restore(
     workspace_root: &Path,
     cache: &CacheProvider,
 ) -> Result<()> {
-    let outputs = outputs_needing_restore(result, workspace_root).await?;
+    restore_admitted(result, workspace_root, cache, None).await
+}
+
+pub(crate) async fn restore_admitted(
+    result: &ActionResult,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    lease: Option<ExecutionPermit>,
+) -> Result<()> {
+    let outputs = outputs_needing_restore(result, workspace_root, lease.as_ref()).await?;
     if outputs.outputs.is_empty() {
         return Ok(());
     }
     let staging = StagingDir::create(workspace_root)?;
     let prefetched = prefetch_output_blobs(&outputs, cache, staging.path()).await?;
+    let workspace = workspace_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        let _staging = staging;
+        with_output_lock(&workspace, || {
+            for output in prefetched {
+                let PrefetchedOutput {
+                    rel,
+                    digest,
+                    blob_path,
+                    ..
+                } = output;
+                let abs = workspace.join(&rel);
+                if existing_output_matches_digest(&abs, digest) {
+                    continue;
+                }
+                restore_prefetched_output(&rel, &abs, &blob_path)?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|source| Error::RestoreOutput {
+        path: "cached outputs".to_string(),
+        source: std::io::Error::other(source.to_string()),
+    })?
+}
+
+pub(crate) fn with_output_lock<T>(
+    workspace_root: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let mut lock = output_restore_lock(workspace_root)?;
-    let _guard = lock.write().map_err(|source| Error::RestoreOutput {
-        path: output_restore_lock_path(workspace_root)
-            .display()
-            .to_string(),
-        source,
-    })?;
-    for output in prefetched {
-        let PrefetchedOutput {
-            rel,
-            digest,
-            blob_path,
-            ..
-        } = output;
-        let abs = workspace_root.join(&rel);
-        if existing_output_matches_digest(&abs, digest) {
-            continue;
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_write() {
+            Ok(_guard) => return operation(),
+            Err(source)
+                if source.kind() == std::io::ErrorKind::WouldBlock
+                    && started.elapsed() < std::time::Duration::from_secs(30) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(source) => {
+                return Err(Error::RestoreOutput {
+                    path: output_restore_lock_path(workspace_root)
+                        .display()
+                        .to_string(),
+                    source,
+                })
+            }
         }
-        restore_prefetched_output(&rel, &abs, &blob_path)?;
     }
-    Ok(())
 }
 
 fn output_restore_lock(workspace_root: &Path) -> Result<RwLock<std::fs::File>> {
@@ -112,21 +158,35 @@ fn restore_prefetched_output(rel: &str, abs: &Path, blob_path: &Path) -> Result<
     restore_legacy_file(rel, abs, blob)
 }
 
+/// How many outputs to validate at once: what `lease` covers at
+/// [`VALIDATION_MEMORY_BYTES`] each, between one and the prefetch
+/// concurrency. Unadmitted restores keep the prefetch concurrency.
+fn validation_concurrency(lease: Option<&ExecutionPermit>) -> usize {
+    lease.map_or(RESTORE_PREFETCH_CONCURRENCY, |lease| {
+        let covered = lease.host_request().memory_bytes / VALIDATION_MEMORY_BYTES;
+        usize::try_from(covered)
+            .unwrap_or(usize::MAX)
+            .clamp(1, RESTORE_PREFETCH_CONCURRENCY)
+    })
+}
+
 async fn outputs_needing_restore(
     result: &ActionResult,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<ActionResult> {
     let mut pending = result
         .outputs
         .iter()
         .map(|(path, digest)| (path.clone(), *digest))
         .collect::<VecDeque<_>>();
+    let concurrency = validation_concurrency(lease);
     let mut tasks = JoinSet::new();
-    while tasks.len() < RESTORE_PREFETCH_CONCURRENCY {
+    while tasks.len() < concurrency {
         let Some((path, digest)) = pending.pop_front() else {
             break;
         };
-        spawn_output_validation(&mut tasks, workspace_root, path, digest);
+        spawn_output_validation(&mut tasks, workspace_root, path, digest, lease);
     }
     let mut outputs = BTreeMap::new();
     while let Some(joined) = tasks.join_next().await {
@@ -138,7 +198,7 @@ async fn outputs_needing_restore(
             outputs.insert(path, digest);
         }
         if let Some((path, digest)) = pending.pop_front() {
-            spawn_output_validation(&mut tasks, workspace_root, path, digest);
+            spawn_output_validation(&mut tasks, workspace_root, path, digest, lease);
         }
     }
     for (path, digest) in &result.outputs {
@@ -159,14 +219,20 @@ async fn outputs_needing_restore(
     })
 }
 
+/// Validate one output on the blocking pool. The task owns a clone of
+/// `lease`: dropping the set cannot stop a blocking task that has started,
+/// so the reservation must outlive the hash, not the awaiting future.
 fn spawn_output_validation(
     tasks: &mut JoinSet<(String, Digest, bool)>,
     workspace_root: &Path,
     path: String,
     digest: Digest,
+    lease: Option<&ExecutionPermit>,
 ) {
     let absolute = workspace_root.join(&path);
+    let lease = lease.cloned();
     tasks.spawn_blocking(move || {
+        let _lease = lease;
         let matches = existing_output_matches_digest(&absolute, digest);
         (path, digest, matches)
     });
@@ -195,7 +261,9 @@ fn existing_output_matches_digest(path: &Path, expected: Digest) -> bool {
         return true;
     }
     metadata.is_file()
-        && std::fs::read(path).is_ok_and(|bytes| Digest::of_bytes(&bytes) == expected)
+        && std::fs::File::open(path)
+            .and_then(Digest::of_reader)
+            .is_ok_and(|digest| digest == expected)
 }
 
 async fn prefetch_output_blobs(
@@ -329,11 +397,24 @@ fn restore_legacy_file(rel: &str, abs: &Path, blob: impl Read) -> Result<()> {
 
 /// Hash and store every declared output in the CAS, returning the
 /// (path -> digest) map that goes into the cached `ActionResult`.
+#[cfg(test)]
 pub(crate) async fn capture(
     outputs: &[WorkspacePath],
     workspace_root: &Path,
     cache: &CacheProvider,
     symlink_mode: OutputSymlinkMode,
+) -> Result<BTreeMap<String, Digest>> {
+    capture_admitted(outputs, workspace_root, cache, symlink_mode, None).await
+}
+
+/// Capture outputs with blocking work that owns a clone of `lease`, so a
+/// cancelled capture keeps the action's reservation until that work stops.
+pub(crate) async fn capture_admitted(
+    outputs: &[WorkspacePath],
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    symlink_mode: OutputSymlinkMode,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<BTreeMap<String, Digest>> {
     let mut captured = BTreeMap::new();
     for rel in outputs {
@@ -353,13 +434,16 @@ pub(crate) async fn capture(
             }
         };
         let digest = if metadata.is_dir() {
-            let staging = StagingDir::create(workspace_root)?;
+            let staging = std::sync::Arc::new(StagingDir::create(workspace_root)?);
             let blob_path = staging.path().join("directory.blob");
             let output_path = blob_path.clone();
             let logical_path = rel.as_str().to_string();
-            tokio::task::spawn_blocking({
+            crate::execute::spawn_admitted(lease, {
                 let abs = abs.clone();
+                // The blob directory is removed only after the writer stops.
+                let staging = std::sync::Arc::clone(&staging);
                 move || {
+                    let _staging = staging;
                     let file = std::fs::File::create(&output_path)?;
                     let mut writer = BufWriter::new(file);
                     write_directory_blob(&abs, symlink_mode, &mut writer)?;
@@ -403,6 +487,42 @@ pub(crate) async fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn validation_fan_out_follows_the_admitted_memory() {
+        use crate::{Executor, ExecutorResources, ResourceLimits, ResourcePool, ResourceRequest};
+
+        let resources = ExecutorResources::new(std::sync::Arc::new(ResourcePool::new(
+            ResourceLimits::new(4, 4 << 30),
+        )));
+        let admitted = |memory_bytes| {
+            let resources = resources.clone();
+            async move {
+                resources
+                    .acquire(
+                        Executor::Local,
+                        &ResourceRequest {
+                            cpu_slots: 1,
+                            memory_bytes,
+                            slots: BTreeMap::new(),
+                        },
+                    )
+                    .await
+            }
+        };
+        let small = admitted(VALIDATION_MEMORY_BYTES / 2).await;
+        assert_eq!(validation_concurrency(Some(&small)), 1);
+        drop(small);
+        let three = admitted(3 * VALIDATION_MEMORY_BYTES).await;
+        assert_eq!(validation_concurrency(Some(&three)), 3);
+        drop(three);
+        let large = admitted(1 << 30).await;
+        assert_eq!(
+            validation_concurrency(Some(&large)),
+            RESTORE_PREFETCH_CONCURRENCY
+        );
+        assert_eq!(validation_concurrency(None), RESTORE_PREFETCH_CONCURRENCY);
+    }
     use once_cas::Cas;
     use tempfile::TempDir;
 

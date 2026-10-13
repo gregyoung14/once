@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::{Executor, ResourceDomain};
+use super::staging::{CapturePermit, StagingPermit, StagingPool};
+use super::{Executor, RemoteIoLimits, ResourceDomain};
 use crate::resources::ResourcePermit;
 use crate::{ResourcePool, ResourceRequest};
 
@@ -20,6 +21,8 @@ pub struct ExecutorResources {
     remote_concurrency: usize,
     remote_configured: bool,
     client_memory_bytes: u64,
+    io_limits: RemoteIoLimits,
+    staging: StagingPool,
 }
 
 impl ExecutorResources {
@@ -31,6 +34,8 @@ impl ExecutorResources {
             remote_concurrency,
             remote_configured: false,
             client_memory_bytes: 0,
+            io_limits: RemoteIoLimits::default(),
+            staging: StagingPool::for_limits(&RemoteIoLimits::default()),
         }
     }
 
@@ -49,6 +54,15 @@ impl ExecutorResources {
     #[must_use]
     pub fn with_client_memory_bytes(mut self, memory_bytes: u64) -> Self {
         self.client_memory_bytes = memory_bytes;
+        self
+    }
+
+    /// Limit hosted protocol responses and per-action archive staging.
+    /// Buffer and entry limits are also bounded by the actual host reservation.
+    #[must_use]
+    pub fn with_remote_io_limits(mut self, limits: RemoteIoLimits) -> Self {
+        self.io_limits = limits;
+        self.staging = StagingPool::for_limits(&limits);
         self
     }
 
@@ -86,10 +100,14 @@ impl ExecutorResources {
             }
         };
         let permit = ExecutionPermit {
+            staging: self.staging.clone(),
+            io_limits: self.io_limits.for_memory(host.request().memory_bytes),
             leases: Arc::new(Leases {
                 host,
                 _remote: remote,
             }),
+            owners: Vec::new(),
+            executor: Some(executor),
         };
         tracing::debug!(
             executor = executor.name(),
@@ -104,6 +122,8 @@ impl ExecutorResources {
     /// Cache lookup and output restoration only need the host, not a worker.
     pub async fn acquire_materialization(&self) -> ExecutionPermit {
         ExecutionPermit {
+            staging: self.staging.clone(),
+            io_limits: self.io_limits.for_memory(MATERIALIZATION_MEMORY_BYTES),
             leases: Arc::new(Leases {
                 host: self
                     .host
@@ -111,6 +131,8 @@ impl ExecutorResources {
                     .await,
                 _remote: None,
             }),
+            owners: Vec::new(),
+            executor: None,
         }
     }
 }
@@ -119,9 +141,62 @@ impl ExecutorResources {
 #[derive(Debug, Clone)]
 pub struct ExecutionPermit {
     leases: Arc<Leases>,
+    io_limits: RemoteIoLimits,
+    staging: StagingPool,
+    owners: Vec<Arc<LifetimeOwner>>,
+    executor: Option<Executor>,
+}
+
+struct LifetimeOwner {
+    _owner: Box<dyn Send + Sync>,
+}
+
+impl std::fmt::Debug for LifetimeOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LifetimeOwner")
+    }
 }
 
 impl ExecutionPermit {
+    /// Retain a caller-owned lock or guard through physical cleanup.
+    /// Attach before cloning; earlier clones do not inherit the owner.
+    /// Owners are runtime state and never participate in action identity.
+    #[must_use]
+    pub fn with_lifetime_owner<T: Send + Sync + 'static>(mut self, owner: T) -> Self {
+        self.owners.push(Arc::new(LifetimeOwner {
+            _owner: Box::new(owner),
+        }));
+        self
+    }
+
+    /// Run a blocking step with an owned lease, even if its observer is dropped.
+    pub async fn run_blocking<T, F>(
+        &self,
+        work: F,
+    ) -> std::result::Result<T, tokio::task::JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        crate::execute::spawn_admitted(Some(self), work).await
+    }
+
+    pub(crate) async fn acquire_staging(&self, bytes: u64) -> crate::Result<StagingPermit> {
+        self.staging.acquire(bytes).await
+    }
+
+    pub(crate) fn capture_budget(&self) -> CapturePermit {
+        self.staging.capture()
+    }
+
+    pub(crate) fn io_limits(&self) -> RemoteIoLimits {
+        self.io_limits
+    }
+
+    pub(crate) fn executor(&self) -> Option<Executor> {
+        self.executor
+    }
+
     pub(crate) fn host_request(&self) -> &ResourceRequest {
         self.leases.host.request()
     }

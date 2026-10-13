@@ -1,28 +1,93 @@
 use std::path::{Path, PathBuf};
 
 use super::archive_error;
+use super::limits::check_entries;
 use crate::remote::output_install::OutputStaging;
 use crate::remote::path::{path_is_declared, relative_link_stays_within};
-use crate::{Error, Result, WorkspacePath};
+use crate::remote::PhasePermit;
+use crate::{Error, RemoteIoLimits, Result, WorkspacePath};
 
-pub(in crate::remote) async fn install_output_archive(
+#[cfg(test)]
+async fn install_output_archive(
     archive_path: &Path,
     workspace_root: &Path,
     outputs: &[WorkspacePath],
     provider: &'static str,
 ) -> Result<()> {
+    install_output_archive_limited(
+        archive_path,
+        workspace_root,
+        outputs,
+        provider,
+        RemoteIoLimits::default(),
+        PhasePermit::default(),
+    )
+    .await
+}
+
+pub(in crate::remote) async fn install_output_archive_limited(
+    archive_path: &Path,
+    workspace_root: &Path,
+    outputs: &[WorkspacePath],
+    provider: &'static str,
+    limits: RemoteIoLimits,
+    lease: PhasePermit,
+) -> Result<()> {
     let archive = archive_path.to_path_buf();
     let workspace = workspace_root.to_path_buf();
     let outputs = outputs.to_vec();
     let staged_outputs = outputs.clone();
+    let extraction_lease = lease.clone();
     let staging = tokio::task::spawn_blocking(move || {
+        let _lease = extraction_lease;
+        validate_headers(&archive, limits, provider)?;
         let staging = OutputStaging::create(&workspace)?;
-        extract_output_archive(&archive, staging.files(), &staged_outputs, provider)?;
+        extract_output_archive(&archive, staging.files(), &staged_outputs, provider, limits)?;
         Ok::<_, Error>(staging)
     })
     .await
     .map_err(|source| archive_error(provider, format!("output archive task failed: {source}")))??;
-    staging.install(outputs.as_slice(), workspace_root).await
+    staging
+        .install_admitted(outputs.as_slice(), workspace_root, lease)
+        .await
+}
+
+fn validate_headers(path: &Path, limits: RemoteIoLimits, provider: &'static str) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .map_err(|source| super::file_error("open_remote_output_archive", path, source))?;
+    let size = file
+        .metadata()
+        .map_err(|source| super::file_error("read_remote_output_archive", path, source))?
+        .len();
+    super::super::http::check_size(size, limits.max_archive_bytes, provider, "archive bytes")?;
+    let mut archive = tar::Archive::new(file);
+    let entries = archive
+        .entries()
+        .map_err(|source| archive_error(provider, source.to_string()))?;
+    let mut extension_bytes = 0_u64;
+    for (index, entry) in entries.raw(true).enumerate() {
+        check_entries(
+            index.saturating_add(1),
+            limits.max_archive_entries,
+            provider,
+        )?;
+        let entry = entry.map_err(|source| archive_error(provider, source.to_string()))?;
+        let kind = entry.header().entry_type();
+        if kind.is_gnu_longname()
+            || kind.is_gnu_longlink()
+            || kind.is_pax_local_extensions()
+            || kind.is_pax_global_extensions()
+        {
+            extension_bytes = extension_bytes.saturating_add(entry.size());
+            super::super::http::check_size(
+                extension_bytes,
+                limits.max_response_bytes,
+                provider,
+                "archive metadata bytes",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn extract_output_archive(
@@ -30,6 +95,7 @@ fn extract_output_archive(
     staging_root: &Path,
     outputs: &[WorkspacePath],
     provider: &'static str,
+    limits: RemoteIoLimits,
 ) -> Result<()> {
     let declared_roots = outputs
         .iter()
@@ -41,18 +107,35 @@ fn extract_output_archive(
         source,
     })?;
     let mut archive = tar::Archive::new(file);
-    for entry in archive.entries().map_err(|source| {
-        archive_error(
+    let mut total_bytes = 0_u64;
+    for (index, entry) in archive
+        .entries()
+        .map_err(|source| {
+            archive_error(
+                provider,
+                format!("cannot read remote output archive: {source}"),
+            )
+        })?
+        .enumerate()
+    {
+        check_entries(
+            index.saturating_add(1),
+            limits.max_archive_entries,
             provider,
-            format!("cannot read remote output archive: {source}"),
-        )
-    })? {
+        )?;
         let mut entry = entry.map_err(|source| {
             archive_error(
                 provider,
                 format!("cannot read remote output entry: {source}"),
             )
         })?;
+        total_bytes = total_bytes.saturating_add(entry.size());
+        super::super::http::check_size(
+            total_bytes,
+            limits.max_archive_bytes,
+            provider,
+            "extracted archive bytes",
+        )?;
         extract_output_entry(&mut entry, staging_root, &declared_roots, provider)?;
     }
     for output in outputs {
@@ -165,6 +248,80 @@ mod tests {
                 .unwrap();
         }
         archive.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_limits_fail_before_publication() {
+        let workspace = tempfile::tempdir().unwrap();
+        let archive = workspace.path().join("outputs.tar");
+        write_archive(&archive, &[("./reports/a", b"a"), ("./reports/b", b"b")]);
+        std::fs::create_dir(workspace.path().join("reports")).unwrap();
+        std::fs::write(workspace.path().join("reports/original"), b"original").unwrap();
+        let outputs = [WorkspacePath::try_from("reports").unwrap()];
+        for limits in [
+            RemoteIoLimits {
+                max_archive_bytes: 1,
+                ..RemoteIoLimits::default()
+            },
+            RemoteIoLimits {
+                max_archive_entries: 1,
+                ..RemoteIoLimits::default()
+            },
+        ] {
+            let error = install_output_archive_limited(
+                &archive,
+                workspace.path(),
+                &outputs,
+                "test",
+                limits,
+                PhasePermit::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, Error::ExecutorResourceLimit { .. }));
+            assert_eq!(
+                std::fs::read(workspace.path().join("reports/original")).unwrap(),
+                b"original"
+            );
+            assert!(!workspace.path().join("reports/a").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_large_extension_headers_before_tar_buffers_them() {
+        let workspace = tempfile::tempdir().unwrap();
+        let archive = workspace.path().join("outputs.tar");
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::XHeader);
+        header.set_size(1024);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "extension", &vec![b'x'; 1024][..])
+            .unwrap();
+        builder.finish().unwrap();
+        let limits = RemoteIoLimits {
+            max_response_bytes: 64,
+            ..RemoteIoLimits::default()
+        };
+        let error = install_output_archive_limited(
+            &archive,
+            workspace.path(),
+            &[],
+            "test",
+            limits,
+            PhasePermit::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ExecutorResourceLimit {
+                resource: "archive metadata bytes",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

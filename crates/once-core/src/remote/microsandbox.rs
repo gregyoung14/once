@@ -73,7 +73,10 @@ pub(super) async fn execute_command(
     stream_to_parent: bool,
 ) -> Result<ActionResult> {
     let image = remote.environment.clone().unwrap_or_else(|| {
-        std::env::var("ONCE_MICROSANDBOX_IMAGE").unwrap_or_else(|_| "alpine".to_string())
+        std::env::var("ONCE_MICROSANDBOX_IMAGE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "alpine".to_string())
     });
     let guest_root =
         std::env::var("ONCE_MICROSANDBOX_WORKDIR").unwrap_or_else(|_| "/workspace".to_string());

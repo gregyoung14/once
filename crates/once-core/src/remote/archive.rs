@@ -5,10 +5,11 @@ use tempfile::TempPath;
 use crate::{Error, Result};
 
 mod input;
+mod limits;
 mod output;
 
-pub(super) use input::create_input_archive;
-pub(super) use output::install_output_archive;
+pub(super) use input::create_input_archive_limited;
+pub(super) use output::install_output_archive_limited;
 
 pub(super) struct TempArchive {
     path: TempPath,

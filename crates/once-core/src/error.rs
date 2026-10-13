@@ -31,11 +31,31 @@ pub enum Error {
     },
     #[error("remote provider `{provider}` is not configured: {message}")]
     RemoteProviderConfig { provider: String, message: String },
+    #[error("remote provider `{provider}` returned HTTP {status}")]
+    RemoteProviderStatus { provider: String, status: u16 },
     #[error("remote provider `{provider}` request failed: {source}")]
     RemoteProviderHttp {
         provider: String,
         #[source]
         source: reqwest::Error,
+    },
+    #[error("required {resource} capacity {requested} exceeds available capacity {capacity}")]
+    ResourceRequirementUnsatisfied {
+        resource: String,
+        requested: u64,
+        capacity: u64,
+    },
+    #[error("executor `{executor}` exceeded its {resource} limit of {limit}")]
+    ExecutorResourceLimit {
+        executor: String,
+        resource: &'static str,
+        limit: u64,
+    },
+    #[error("executor `{executor}` made no progress during {phase} for {timeout:?}")]
+    ExecutorStalled {
+        executor: String,
+        phase: &'static str,
+        timeout: Duration,
     },
     #[error("remote provider `{provider}` returned an error: {message}")]
     RemoteProviderApi { provider: String, message: String },

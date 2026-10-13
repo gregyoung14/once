@@ -688,6 +688,22 @@ Built-in history currently covers Rust compilation/build scripts/test-runner com
   into a declared directory output. An optional environment-variable name
   provides a web Authorization header only while the action executes, so its
   value is excluded from action declarations, cache keys, logs, and evidence.
+  Runtime policy defaults to a 4 GiB downloaded archive and one million entries.
+  Expanded regular-file data is capped at 4 GiB, or 64 times the declared download
+  length when that is smaller. Symlinks and directories have separate metadata
+  and entry-count limits; this is not a hard filesystem-space ceiling. Highly compressible archives exceeding this bound are
+  refused. Archive bytes and the expansion bound are reserved together, so small
+  known-length downloads can run concurrently without an extraction admission
+  cycle. Unknown-length downloads reserve the full worst case and can serialize.
+  Downloads share admitted staging, have a
+  30-second progress-stall bound, and must finish within 30 minutes, including
+  staging waits and private archive writes. Checksum validation and extraction
+  follow download completion; extraction retains admission until its physical
+  filesystem work ends rather than being treated as cancellable.
+  ZIP metadata is checked before decoder allocation. Multi-disk archives,
+  prefixed data, trailing bytes, inconsistent ZIP64 records and excessive
+  metadata are refused. Embedded end records with excessive entry counts may
+  also be refused to prevent decoder fallback from bypassing the limits.
 - `toml_decode(src)` and `json_decode(src)` decode data into Starlark
   values.
 
@@ -696,7 +712,9 @@ inputs, not from unrelated actions declared earlier by the same target. Copy,
 link, tree-digest, and archive actions infer their direct source inputs. Use the
 `inputs` argument for additional paths that influence the operation. Portable
 actions still execute in declaration order, and Once hashes generated inputs
-directly.
+directly. Blocking file operations and output capture own their scheduling
+reservations until the work stops, even when the caller is cancelled. A cancelled
+observer does not publish a completed action-cache entry for partial work.
 
 Use these primitives to express resolver commands, source filtering, file
 formats, tool selection, compiler flags, provider conventions, and action
@@ -887,7 +905,13 @@ Consecutive actions with `depends_on_prior_actions = False` may run concurrently
 when their declared reads, writes, argument files, and cleanup paths do not
 conflict. Uncacheable actions and ordering barriers remain sequential. Both
 target and action concurrency respect the command's memory budget. Independent
-graph targets become ready after their dependencies complete.
+graph targets become ready after their dependencies complete. Command preparation,
+portable filesystem operations, output capture, producer repairs, and cached output
+restoration use shared invocation admission. Inputs are restored before admitting
+their consumer, and each restore attempt releases its admission before repairing a
+missing producer. Cancellation does not release a reservation or action lock while
+its blocking filesystem work still runs. These execution guards do not change
+cache identity or authorize remote graph placement.
 
 ## Deferred Action Planning
 

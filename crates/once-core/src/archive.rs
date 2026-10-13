@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use sha2::{Digest as _, Sha256};
 use tar::{Builder, EntryType, Header};
 
-use crate::{ArchiveEntry, ArchiveEntryKind, ArchiveFormat, Error, Result, WorkspacePath};
+use crate::{
+    ArchiveEntry, ArchiveEntryKind, ArchiveFormat, Error, ExecutionPermit, Result, WorkspacePath,
+};
 
 pub(crate) async fn write(
     entries: &[ArchiveEntry],
@@ -15,6 +17,7 @@ pub(crate) async fn write(
     uncompressed_sha256_output: Option<&WorkspacePath>,
     format: ArchiveFormat,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     let entries = entries.to_vec();
     let output_path = output.resolve(workspace_root);
@@ -23,7 +26,7 @@ pub(crate) async fn write(
     let uncompressed_path = uncompressed_sha256_output.map(|path| path.resolve(workspace_root));
     let sha256_label = sha256_output.map(|path| path.as_str().to_string());
     let workspace_root = workspace_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::execute::spawn_admitted(lease, move || {
         write_blocking(
             &entries,
             &output_path,

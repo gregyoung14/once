@@ -1,16 +1,26 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use once_cas::{ActionResult, CacheProvider};
 use sha2::Digest as ShaDigest;
-use tokio::io::AsyncWriteExt;
+use std::io::Write as _;
 
+mod sandbox;
+mod zip_preflight;
+
+#[cfg(all(test, unix))]
+mod admission_tests;
+#[cfg(test)]
+mod download_tests;
+
+use crate::executor::staging::StagingPermit;
 use crate::stream::ActionOutputObserver;
 use crate::{
-    archive, contract, local, outputs, remote, Action, CopyPathMode, Error, ExecutionPermit,
-    Executor, OutputSymlinkMode, PreparePathMode, Result, SandboxMode, WorkspacePath,
+    archive, local, outputs, remote, Action, CopyPathMode, Error, ExecutionPermit, Executor,
+    OutputSymlinkMode, PreparePathMode, RemoteIoLimits, Result, SandboxMode, WorkspacePath,
 };
 
 pub(crate) async fn run(
@@ -73,13 +83,19 @@ pub(crate) async fn run_admitted(
             stream_to_parent,
             validate_contract,
             observer,
-            lease,
+            lease.clone(),
         ))
         .await?;
         let completed = action.accepts_exit_code(result.exit_code);
         if completed && !validate_contract {
-            result.outputs =
-                outputs::capture(outputs, workspace_root, cache, *output_symlink_mode).await?;
+            result.outputs = outputs::capture_admitted(
+                outputs,
+                workspace_root,
+                cache,
+                *output_symlink_mode,
+                lease.as_ref(),
+            )
+            .await?;
         }
         if completed {
             result.exit_code = 0;
@@ -87,7 +103,48 @@ pub(crate) async fn run_admitted(
         return Ok(result);
     }
 
-    execute_portable_action(action, workspace_root, cache).await
+    execute_portable_action(action, workspace_root, cache, lease.as_ref()).await
+}
+
+/// Start filesystem work on the blocking pool, owning a clone of the
+/// admission lease. A blocking task keeps running after its caller is
+/// cancelled, so the task, not the awaiting future, holds the reservation
+/// until the work actually stops.
+pub(crate) fn spawn_admitted<T, F>(
+    lease: Option<&ExecutionPermit>,
+    work: F,
+) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let lease = lease.cloned();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        work()
+    })
+}
+
+/// [`spawn_admitted`] for one I/O step, reported as a failed `action` on
+/// `path`.
+async fn file_step<T, F>(
+    lease: Option<&ExecutionPermit>,
+    action: &'static str,
+    path: &str,
+    work: F,
+) -> Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_admitted(lease, work)
+        .await
+        .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+        .map_err(|source| Error::FileAction {
+            action,
+            path: path.to_string(),
+            source,
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -95,11 +152,13 @@ async fn execute_portable_action(
     action: &Action,
     workspace_root: &Path,
     cache: &CacheProvider,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<ActionResult> {
     match action {
         Action::WriteFile { path, bytes, .. } => {
-            write_file(path, bytes, workspace_root).await?;
-            capture_file_action_outputs(std::slice::from_ref(path), workspace_root, cache).await
+            write_file(path, bytes, workspace_root, lease).await?;
+            capture_file_action_outputs(std::slice::from_ref(path), workspace_root, cache, lease)
+                .await
         }
         Action::CopyPath {
             sources,
@@ -114,21 +173,26 @@ async fn execute_portable_action(
                             reason: "file copy requires exactly one source".to_string(),
                         });
                     }
-                    copy_file(&sources[0], destination, workspace_root).await?;
+                    copy_file(&sources[0], destination, workspace_root, lease).await?;
                 }
                 CopyPathMode::Tree => {
-                    copy_tree(sources, destination, workspace_root).await?;
+                    copy_tree(sources, destination, workspace_root, lease).await?;
                 }
             }
-            capture_file_action_outputs(std::slice::from_ref(destination), workspace_root, cache)
-                .await
+            capture_file_action_outputs(
+                std::slice::from_ref(destination),
+                workspace_root,
+                cache,
+                lease,
+            )
+            .await
         }
         Action::LinkPath {
             source,
             destination,
             ..
         } => {
-            link_path(source, destination, workspace_root).await?;
+            link_path(source, destination, workspace_root, lease).await?;
             Ok(empty_file_action_result())
         }
         Action::MaterializeHostFile {
@@ -137,9 +201,15 @@ async fn execute_portable_action(
             destination,
             ..
         } => {
-            materialize_host_file(source, source_sha256, destination, workspace_root).await?;
-            capture_file_action_outputs(std::slice::from_ref(destination), workspace_root, cache)
-                .await
+            materialize_host_file(source, source_sha256, destination, workspace_root, lease)
+                .await?;
+            capture_file_action_outputs(
+                std::slice::from_ref(destination),
+                workspace_root,
+                cache,
+                lease,
+            )
+            .await
         }
         Action::MaterializeHostTree {
             source,
@@ -147,18 +217,30 @@ async fn execute_portable_action(
             destination,
             ..
         } => {
-            materialize_host_tree(source, source_sha256, destination, workspace_root).await?;
-            capture_file_action_outputs(std::slice::from_ref(destination), workspace_root, cache)
-                .await
+            materialize_host_tree(source, source_sha256, destination, workspace_root, lease)
+                .await?;
+            capture_file_action_outputs(
+                std::slice::from_ref(destination),
+                workspace_root,
+                cache,
+                lease,
+            )
+            .await
         }
         Action::PreparePath { path, mode, .. } => match mode {
             PreparePathMode::Remove => {
-                remove_path(path, workspace_root).await?;
+                remove_path(path, workspace_root, lease).await?;
                 Ok(empty_file_action_result())
             }
             PreparePathMode::Directory => {
-                ensure_dir(path, workspace_root).await?;
-                capture_file_action_outputs(std::slice::from_ref(path), workspace_root, cache).await
+                ensure_dir(path, workspace_root, lease).await?;
+                capture_file_action_outputs(
+                    std::slice::from_ref(path),
+                    workspace_root,
+                    cache,
+                    lease,
+                )
+                .await
             }
         },
         Action::WriteTreeDigest {
@@ -167,8 +249,9 @@ async fn execute_portable_action(
             include_suffixes,
             ..
         } => {
-            write_tree_digest(root, output, include_suffixes, workspace_root).await?;
-            capture_file_action_outputs(std::slice::from_ref(output), workspace_root, cache).await
+            write_tree_digest(root, output, include_suffixes, workspace_root, lease).await?;
+            capture_file_action_outputs(std::slice::from_ref(output), workspace_root, cache, lease)
+                .await
         }
         Action::WriteArchive {
             entries,
@@ -185,6 +268,7 @@ async fn execute_portable_action(
                 uncompressed_sha256_output.as_ref(),
                 *format,
                 workspace_root,
+                lease,
             )
             .await?;
             let mut outputs = vec![output.clone()];
@@ -194,7 +278,7 @@ async fn execute_portable_action(
             {
                 outputs.push(path.clone());
             }
-            capture_file_action_outputs(&outputs, workspace_root, cache).await
+            capture_file_action_outputs(&outputs, workspace_root, cache, lease).await
         }
         Action::DownloadAndExtract {
             url,
@@ -209,10 +293,16 @@ async fn execute_portable_action(
                 destination,
                 authorization_env.as_deref(),
                 workspace_root,
+                lease,
             )
             .await?;
-            capture_file_action_outputs(std::slice::from_ref(destination), workspace_root, cache)
-                .await
+            capture_file_action_outputs(
+                std::slice::from_ref(destination),
+                workspace_root,
+                cache,
+                lease,
+            )
+            .await
         }
         Action::RunCommand { .. } => unreachable!("command actions are dispatched separately"),
     }
@@ -225,10 +315,12 @@ async fn download_and_extract(
     destination: &WorkspacePath,
     authorization_env: Option<&str>,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     let parsed = reqwest::Url::parse(url).map_err(|source| Error::InvalidDownloadAndExtract {
-        reason: format!("invalid URL `{url}`: {source}"),
+        reason: format!("invalid URL: {source}"),
     })?;
+    let display_url = redacted_url(&parsed);
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(Error::InvalidDownloadAndExtract {
             reason: "URL must use HTTP or HTTPS".to_string(),
@@ -254,13 +346,14 @@ async fn download_and_extract(
                     destination.as_str()
                 ),
             })?;
-    tokio::fs::create_dir_all(destination_parent)
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "download_and_extract",
-            path: destination.as_str().to_string(),
-            source,
-        })?;
+    let parent = destination_parent.to_path_buf();
+    file_step(
+        lease,
+        "download_and_extract",
+        destination.as_str(),
+        move || std::fs::create_dir_all(parent),
+    )
+    .await?;
 
     let client =
         reqwest::Client::builder()
@@ -278,53 +371,80 @@ async fn download_and_extract(
             })?;
         request = request.header(reqwest::header::AUTHORIZATION, value);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|source| Error::InvalidDownloadAndExtract {
-            reason: format!("requesting `{url}`: {source}"),
-        })?
-        .error_for_status()
-        .map_err(|source| Error::InvalidDownloadAndExtract {
-            reason: format!("requesting `{url}`: {source}"),
-        })?;
-
-    let archive = tempfile::NamedTempFile::new_in(destination_parent).map_err(|source| {
-        Error::FileAction {
-            action: "download_and_extract",
-            path: destination.as_str().to_string(),
-            source,
-        }
-    })?;
-    let archive_path = archive.path().to_path_buf();
-    let mut file = tokio::fs::File::create(&archive_path)
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "download_and_extract",
-            path: archive_path.display().to_string(),
-            source,
-        })?;
-    let mut digest = sha2::Sha256::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| Error::InvalidDownloadAndExtract {
-            reason: format!("reading `{url}`: {source}"),
-        })?;
-        digest.update(&chunk);
-        file.write_all(&chunk)
+    let limits = lease.map_or_else(RemoteIoLimits::default, ExecutionPermit::io_limits);
+    // One absolute deadline covers the response headers, the whole body, and
+    // its writes to the private archive, so a server that keeps trickling
+    // bytes cannot hold the action forever. Running out of time drops only
+    // this future: a write already on the blocking pool keeps its own handle
+    // on the archive, its staging, and the lease until it stops. Extraction
+    // starts after the deadline and is not covered by it.
+    let deadline = tokio::time::Instant::now() + limits.artifact_download_timeout;
+    let download = async {
+        let response = tokio::time::timeout(limits.stall_timeout, request.send())
             .await
-            .map_err(|source| Error::FileAction {
-                action: "download_and_extract",
-                path: archive_path.display().to_string(),
-                source,
+            .map_err(|_| download_stalled(limits))?
+            .map_err(|source| Error::InvalidDownloadAndExtract {
+                reason: format!("requesting `{display_url}`: {}", source.without_url()),
+            })?
+            .error_for_status()
+            .map_err(|source| Error::InvalidDownloadAndExtract {
+                reason: format!("requesting `{display_url}`: {}", source.without_url()),
             })?;
-    }
-    file.flush().await.map_err(|source| Error::FileAction {
-        action: "download_and_extract",
-        path: archive_path.display().to_string(),
-        source,
-    })?;
-    drop(file);
+        let declared = response.content_length();
+        check_download_size(declared.unwrap_or(0), limits)?;
+        let staging = match lease {
+            Some(lease) => Some(
+                lease
+                    .acquire_staging(download_staging_bytes(declared, limits))
+                    .await?,
+            ),
+            None => None,
+        };
+
+        let archive_parent = destination_parent.to_path_buf();
+        // Created on the blocking pool with its staging, so the two are
+        // never apart.
+        let archive = Arc::new(
+            file_step(
+                lease,
+                "download_and_extract",
+                destination.as_str(),
+                move || {
+                    Ok(DownloadedArchive {
+                        file: tempfile::NamedTempFile::new_in(archive_parent)?,
+                        _staging: staging,
+                    })
+                },
+            )
+            .await?,
+        );
+        let archive_label = archive.file.path().display().to_string();
+        let mut digest = sha2::Sha256::new();
+        let mut stream = response.bytes_stream();
+        let mut size = 0_u64;
+        while let Some(chunk) = tokio::time::timeout(limits.stall_timeout, stream.next())
+            .await
+            .map_err(|_| download_stalled(limits))?
+        {
+            let chunk = chunk.map_err(|source| Error::InvalidDownloadAndExtract {
+                reason: format!("reading `{display_url}`: {}", source.without_url()),
+            })?;
+            size = size.saturating_add(chunk.len() as u64);
+            check_download_size(size, limits)?;
+            // The staging reservation covers the declared length only.
+            if declared.is_some_and(|declared| size > declared) {
+                return Err(Error::InvalidDownloadAndExtract {
+                    reason: format!("`{display_url}` sent more bytes than it declared"),
+                });
+            }
+            digest.update(&chunk);
+            write_archive_chunk(lease, Arc::clone(&archive), &archive_label, chunk).await?;
+        }
+        Ok::<_, Error>((archive, digest, declared))
+    };
+    let (archive, digest, declared) = tokio::time::timeout_at(deadline, download)
+        .await
+        .map_err(|_| Error::Timeout(limits.artifact_download_timeout))??;
 
     let digest = digest.finalize();
     let mut actual_sha256 = String::with_capacity(digest.len() * 2);
@@ -333,7 +453,7 @@ async fn download_and_extract(
     }
     if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
         return Err(Error::DownloadChecksumMismatch {
-            url: url.to_string(),
+            url: display_url,
             expected: expected_sha256.to_string(),
             actual: actual_sha256,
         });
@@ -341,7 +461,10 @@ async fn download_and_extract(
 
     let extracted_destination = absolute_destination.clone();
     let staging_parent = destination_parent.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    spawn_admitted(lease, move || {
+        // Owned here so the archive is deleted, and its staging released,
+        // only after extraction stops.
+        let archive = archive;
         let staging = tempfile::Builder::new()
             .prefix(".once-download-")
             .tempdir_in(&staging_parent)
@@ -351,7 +474,12 @@ async fn download_and_extract(
                 source,
             })?;
         let staged_output = staging.path().join("output");
-        extract_zip_archive(&archive_path, &staged_output)?;
+        extract_zip_archive(
+            archive.file.path(),
+            &staged_output,
+            limits,
+            expansion_bound(declared, limits),
+        )?;
         remove_path_blocking(&extracted_destination).map_err(|source| Error::FileAction {
             action: "download_and_extract",
             path: extracted_destination.display().to_string(),
@@ -374,11 +502,102 @@ async fn download_and_extract(
     Ok(())
 }
 
+/// A downloaded archive and the staging reserved for it and its extracted
+/// copy. Every blocking write and the extraction own a clone, so the file is
+/// deleted and the reservation released only after the last task touching
+/// it stops, extraction and publication included; on Windows an open handle
+/// would otherwise keep the delete from succeeding.
+struct DownloadedArchive {
+    file: tempfile::NamedTempFile,
+    _staging: Option<StagingPermit>,
+}
+
+/// The most bytes extraction may write for a download that declared
+/// `declared` bytes on the wire: `max_archive_expansion_ratio` times that,
+/// capped by the archive limit. A download that declares no length may
+/// expand to the whole archive limit.
+fn expansion_bound(declared: Option<u64>, limits: RemoteIoLimits) -> u64 {
+    declared.map_or(limits.max_archive_bytes, |declared| {
+        declared
+            .saturating_mul(limits.max_archive_expansion_ratio)
+            .min(limits.max_archive_bytes)
+    })
+}
+
+/// Staging one download needs, reserved in a single all-or-nothing request
+/// before anything is written, so the download never waits for a second
+/// permit while it holds the first: the archive (its declared length, or the
+/// archive limit when it declares none) plus its [`expansion_bound`].
+/// Downloads that declare their length reserve in proportion to it and run
+/// side by side. With the default limits a download that declares none
+/// reserves the whole staging pool, so such downloads run one at a time. A
+/// staging limit below this sum fails the download instead of starting it.
+fn download_staging_bytes(declared: Option<u64>, limits: RemoteIoLimits) -> u64 {
+    declared
+        .unwrap_or(limits.max_archive_bytes)
+        .saturating_add(expansion_bound(declared, limits))
+}
+
+/// Append `chunk` to the archive on the blocking pool. The write owns a
+/// clone of the archive, its staging, and the lease, so cancelling the
+/// caller releases none of them while the write is queued or running.
+async fn write_archive_chunk(
+    lease: Option<&ExecutionPermit>,
+    archive: Arc<DownloadedArchive>,
+    label: &str,
+    chunk: impl AsRef<[u8]> + Send + 'static,
+) -> Result<()> {
+    file_step(lease, "download_and_extract", label, move || {
+        archive.file.as_file().write_all(chunk.as_ref())
+    })
+    .await
+}
+
+fn check_download_size(size: u64, limits: RemoteIoLimits) -> Result<()> {
+    if size > limits.max_archive_bytes {
+        Err(Error::ExecutorResourceLimit {
+            executor: Executor::Local.name().to_string(),
+            resource: "download bytes",
+            limit: limits.max_archive_bytes,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn download_stalled(limits: RemoteIoLimits) -> Error {
+    Error::ExecutorStalled {
+        executor: Executor::Local.name().to_string(),
+        phase: "download",
+        timeout: limits.stall_timeout,
+    }
+}
+
+/// `url` without user-info, query, or fragment, which can carry credentials
+/// the caller owns and must not reach errors or logs.
+fn redacted_url(url: &reqwest::Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    if redacted.query().is_some() {
+        redacted.set_query(Some("redacted"));
+    }
+    redacted.set_fragment(None);
+    redacted.to_string()
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<()> {
+/// Extract the archive at `archive_path` into `destination`, writing at
+/// most `expansion` bytes of file contents.
+fn extract_zip_archive(
+    archive_path: &Path,
+    destination: &Path,
+    limits: RemoteIoLimits,
+    expansion: u64,
+) -> Result<()> {
     std::fs::create_dir_all(destination).map_err(|source| Error::FileAction {
         action: "download_and_extract",
         path: destination.display().to_string(),
@@ -389,10 +608,20 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<()> {
         path: archive_path.display().to_string(),
         source,
     })?;
-    let mut archive =
-        zip::ZipArchive::new(archive_file).map_err(|source| Error::InvalidDownloadAndExtract {
-            reason: format!("opening ZIP archive: {source}"),
-        })?;
+    let mut archive = zip_preflight::open(archive_file, limits)?;
+    if archive.len() > limits.max_archive_entries {
+        return Err(Error::ExecutorResourceLimit {
+            executor: Executor::Local.name().to_string(),
+            resource: "archive entries",
+            limit: u64::try_from(limits.max_archive_entries).unwrap_or(u64::MAX),
+        });
+    }
+    let expanded_too_far = || Error::ExecutorResourceLimit {
+        executor: Executor::Local.name().to_string(),
+        resource: "extracted bytes",
+        limit: expansion,
+    };
+    let mut remaining = expansion;
     for index in 0..archive.len() {
         let mut entry =
             archive
@@ -437,7 +666,8 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<()> {
         }
         if file_type == 0o120_000 {
             let mut target = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut target).map_err(|source| {
+            let mut bounded = std::io::Read::take(&mut entry, limits.max_metadata_bytes);
+            std::io::Read::read_to_string(&mut bounded, &mut target).map_err(|source| {
                 Error::InvalidDownloadAndExtract {
                     reason: format!("reading ZIP symbolic link `{}`: {source}", entry.name()),
                 }
@@ -457,10 +687,42 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<()> {
             })?;
             continue;
         }
+        // Refuse an entry that declares more than is left before creating
+        // its file; `extract_bounded_file` never writes past the bound for
+        // one that lies.
+        if entry.size() > remaining {
+            return Err(expanded_too_far());
+        }
         let name = entry.name().to_string();
-        extract_zip_file(&mut entry, &name, &output, unix_mode)?;
+        let written = extract_bounded_file(&mut entry, &name, &output, unix_mode, remaining)?
+            .ok_or_else(expanded_too_far)?;
+        remaining -= written;
     }
     Ok(())
+}
+
+/// Extract one entry, writing at most `remaining` bytes. Returns `None` when
+/// the entry holds more than that.
+fn extract_bounded_file(
+    entry: &mut impl std::io::Read,
+    name: &str,
+    output: &Path,
+    unix_mode: u32,
+    remaining: u64,
+) -> Result<Option<u64>> {
+    let written = extract_zip_file(
+        &mut std::io::Read::take(&mut *entry, remaining),
+        name,
+        output,
+        unix_mode,
+    )?;
+    let mut probe = [0_u8; 1];
+    let more = entry.read(&mut probe).map_err(|source| Error::FileAction {
+        action: "download_and_extract",
+        path: output.display().to_string(),
+        source,
+    })?;
+    Ok((more == 0).then_some(written))
 }
 
 fn extract_zip_file(
@@ -468,7 +730,7 @@ fn extract_zip_file(
     name: &str,
     output: &Path,
     unix_mode: u32,
-) -> Result<()> {
+) -> Result<u64> {
     let parent = output
         .parent()
         .ok_or_else(|| Error::InvalidDownloadAndExtract {
@@ -484,7 +746,7 @@ fn extract_zip_file(
         path: output.display().to_string(),
         source,
     })?;
-    std::io::copy(entry, &mut output_file).map_err(|source| Error::FileAction {
+    let written = std::io::copy(entry, &mut output_file).map_err(|source| Error::FileAction {
         action: "download_and_extract",
         path: output.display().to_string(),
         source,
@@ -501,7 +763,7 @@ fn extract_zip_file(
     }
     #[cfg(not(unix))]
     let _ = unix_mode;
-    Ok(())
+    Ok(written)
 }
 
 /// Whether `relative`, or any directory above it, is a symbolic link that an
@@ -605,7 +867,7 @@ async fn execute_command(
     }
     match (executor, stream_to_parent, sandbox) {
         (Executor::Microsandbox | Executor::E2b | Executor::Daytona, _, _) => {
-            remote::execute_command(
+            Box::pin(remote::execute_command(
                 executor,
                 remote.as_deref().expect("remote executor has a binding"),
                 remote::PreparedCommand {
@@ -622,18 +884,19 @@ async fn execute_command(
                 workspace_root,
                 cache,
                 stream_to_parent,
-            )
+            ))
             .await
         }
         (Executor::Local, _, SandboxMode::Inputs | SandboxMode::CopiedInputs) => {
-            execute_sandboxed_command(
+            sandbox::execute_sandboxed_command(
                 action,
                 invocation,
-                SandboxPolicy {
+                sandbox::SandboxPolicy {
                     inputs,
                     outputs,
                     copy_inputs: *sandbox == SandboxMode::CopiedInputs,
                     validate_contract,
+                    lease: lease.as_ref(),
                 },
                 workspace_root,
                 cache,
@@ -661,287 +924,6 @@ async fn execute_command(
     }
 }
 
-/// The filesystem contract a sandboxed run is held to.
-///
-/// Separate from the command itself because these describe the policy
-/// around the run rather than what is executed, and because three bare
-/// `bool`s in a positional argument list were unreadable at the call
-/// site.
-struct SandboxPolicy<'a> {
-    /// Paths the action declared it reads.
-    inputs: &'a [WorkspacePath],
-    /// Paths the action declared it writes.
-    outputs: &'a [WorkspacePath],
-    /// Copy inputs into the execroot instead of linking them.
-    copy_inputs: bool,
-    /// Audit the execroot against the declaration once the child exits.
-    validate_contract: bool,
-}
-
-async fn execute_sandboxed_command(
-    action: &Action,
-    invocation: local::Invocation<'_>,
-    policy: SandboxPolicy<'_>,
-    workspace_root: &Path,
-    cache: &CacheProvider,
-    stream_to_parent: bool,
-    observer: Option<&dyn ActionOutputObserver>,
-) -> Result<ActionResult> {
-    let sandbox = prepare_input_sandbox(action, &policy, invocation.cwd, workspace_root).await?;
-    let result = if let Some(observer) = observer {
-        local::execute_command_observed(
-            invocation,
-            &sandbox.execroot,
-            cache,
-            stream_to_parent,
-            observer,
-        )
-        .await
-    } else if stream_to_parent {
-        local::execute_command_streaming(invocation, &sandbox.execroot, cache).await
-    } else {
-        local::execute_command(invocation, &sandbox.execroot, cache).await
-    };
-
-    let result = result?;
-    if policy.validate_contract {
-        let violations = contract::audit_filesystem(
-            &sandbox.execroot,
-            workspace_root,
-            policy.inputs,
-            policy.outputs,
-            &sandbox.before_execroot,
-            &sandbox.before_workspace,
-            &result,
-            cache,
-        )
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "audit_sandbox",
-            path: sandbox.execroot.display().to_string(),
-            source,
-        })?;
-        if !violations.is_empty() {
-            return Err(Error::ContractViolation { violations });
-        }
-        return Ok(result);
-    }
-    if action.accepts_exit_code(result.exit_code) {
-        copy_sandbox_outputs(policy.outputs, &sandbox.execroot, workspace_root).await?;
-    }
-    Ok(result)
-}
-
-struct PreparedSandbox {
-    root: std::path::PathBuf,
-    execroot: std::path::PathBuf,
-    keep: bool,
-    before_execroot: contract::ContractSnapshot,
-    before_workspace: contract::ContractSnapshot,
-}
-
-impl Drop for PreparedSandbox {
-    fn drop(&mut self) {
-        if self.keep {
-            return;
-        }
-        if let Err(error) = remove_tree_blocking(&self.root) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    sandbox = %self.root.display(),
-                    %error,
-                    "failed to remove action sandbox"
-                );
-            }
-        }
-    }
-}
-
-async fn prepare_input_sandbox(
-    action: &Action,
-    policy: &SandboxPolicy<'_>,
-    cwd: Option<&WorkspacePath>,
-    workspace_root: &Path,
-) -> Result<PreparedSandbox> {
-    let SandboxPolicy {
-        inputs,
-        outputs,
-        copy_inputs,
-        validate_contract,
-    } = *policy;
-    let root = workspace_root
-        .join(".once")
-        .join("sandboxes")
-        .join(action.digest().to_string());
-    let execroot = root.join("execroot");
-    let sandbox_root = root.clone();
-    let sandbox_execroot = execroot.clone();
-    let input_paths = inputs.to_vec();
-    let output_paths = outputs.to_vec();
-    let cwd_path = cwd.cloned();
-    let workspace = workspace_root.to_path_buf();
-    // Contract validation stages copies rather than symlinks so a probe that
-    // writes one of its declared inputs mutates the private execroot copy (where
-    // the audit still flags the write) instead of reaching through a symlink and
-    // corrupting the real workspace source the docs promise to leave untouched.
-    let copy_inputs = validate_contract || copy_inputs;
-    tokio::task::spawn_blocking(move || {
-        remove_path_blocking(&sandbox_root)?;
-        std::fs::create_dir_all(&sandbox_execroot)?;
-        for input in &input_paths {
-            stage_sandbox_input_blocking(&workspace, &sandbox_execroot, input, copy_inputs)?;
-        }
-        for output in &output_paths {
-            if let Some(parent) = output.resolve(&sandbox_execroot).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        if let Some(cwd) = &cwd_path {
-            std::fs::create_dir_all(cwd.resolve(&sandbox_execroot))?;
-        }
-        if copy_inputs {
-            let keep_writable = output_paths
-                .iter()
-                .map(|output| std::path::PathBuf::from(output.as_str()))
-                .chain(
-                    cwd_path
-                        .iter()
-                        .map(|cwd| std::path::PathBuf::from(cwd.as_str())),
-                )
-                .collect::<Vec<_>>();
-            mirror_ancestor_permissions(
-                &workspace,
-                &sandbox_execroot,
-                &input_paths,
-                &keep_writable,
-            )?;
-        }
-        Ok::<_, std::io::Error>(())
-    })
-    .await
-    .map_err(|source| Error::FileAction {
-        action: "prepare_sandbox",
-        path: root.display().to_string(),
-        source: std::io::Error::other(source.to_string()),
-    })?
-    .map_err(|source| Error::FileAction {
-        action: "prepare_sandbox",
-        path: root.display().to_string(),
-        source,
-    })?;
-
-    let before_execroot = if validate_contract {
-        contract::snapshot_tree(&execroot, &[]).map_err(|source| Error::FileAction {
-            action: "snapshot_sandbox",
-            path: execroot.display().to_string(),
-            source,
-        })?
-    } else {
-        contract::ContractSnapshot(std::collections::BTreeMap::new())
-    };
-    let before_workspace = if validate_contract {
-        contract::snapshot_tree(workspace_root, &[".once"]).map_err(|source| Error::FileAction {
-            action: "snapshot_workspace",
-            path: workspace_root.display().to_string(),
-            source,
-        })?
-    } else {
-        contract::ContractSnapshot(std::collections::BTreeMap::new())
-    };
-    Ok(PreparedSandbox {
-        root,
-        execroot,
-        keep: keep_sandbox(),
-        before_execroot,
-        before_workspace,
-    })
-}
-
-fn keep_sandbox() -> bool {
-    std::env::var("ONCE_KEEP_SANDBOX")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-}
-
-fn stage_sandbox_input_blocking(
-    workspace_root: &Path,
-    sandbox_execroot: &Path,
-    input: &WorkspacePath,
-    copy: bool,
-) -> std::io::Result<()> {
-    let source = input.resolve(workspace_root);
-    let destination = input.resolve(sandbox_execroot);
-    if copy {
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        remove_path_blocking(&destination)?;
-        return copy_sandbox_output_blocking(&source, &destination);
-    }
-    let metadata = std::fs::symlink_metadata(&source)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        stage_sandbox_directory_blocking(&source, &destination)
-    } else {
-        link_sandbox_input_blocking(&source, &destination)
-    }
-}
-
-fn stage_sandbox_directory_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(destination)?;
-    let mut children = std::fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
-    children.sort_by_key(std::fs::DirEntry::file_name);
-    for child in children {
-        let child_source = child.path();
-        let child_destination = destination.join(child.file_name());
-        let metadata = std::fs::symlink_metadata(&child_source)?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            stage_sandbox_directory_blocking(&child_source, &child_destination)?;
-        } else {
-            link_sandbox_input_blocking(&child_source, &child_destination)?;
-        }
-    }
-    Ok(())
-}
-
-fn link_sandbox_input_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    remove_path_blocking(destination)?;
-    create_symlink_blocking(source, destination, source)
-}
-
-async fn copy_sandbox_outputs(
-    outputs: &[WorkspacePath],
-    sandbox_execroot: &Path,
-    workspace_root: &Path,
-) -> Result<()> {
-    let output_paths = outputs.to_vec();
-    let sandbox = sandbox_execroot.to_path_buf();
-    let workspace = workspace_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        for output in output_paths {
-            let source = output.resolve(&sandbox);
-            if !source.try_exists()? {
-                continue;
-            }
-            let destination = output.resolve(&workspace);
-            copy_sandbox_output_blocking(&source, &destination)?;
-        }
-        Ok::<_, std::io::Error>(())
-    })
-    .await
-    .map_err(|source| Error::FileAction {
-        action: "copy_sandbox_outputs",
-        path: sandbox_execroot.display().to_string(),
-        source: std::io::Error::other(source.to_string()),
-    })?
-    .map_err(|source| Error::FileAction {
-        action: "copy_sandbox_outputs",
-        path: sandbox_execroot.display().to_string(),
-        source,
-    })
-}
-
 fn copy_sandbox_output_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
@@ -960,13 +942,15 @@ async fn capture_file_action_outputs(
     action_outputs: &[WorkspacePath],
     workspace_root: &Path,
     cache: &CacheProvider,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<ActionResult> {
     let mut result = empty_file_action_result();
-    result.outputs = outputs::capture(
+    result.outputs = outputs::capture_admitted(
         action_outputs,
         workspace_root,
         cache,
         OutputSymlinkMode::default(),
+        lease,
     )
     .await?;
     Ok(result)
@@ -981,24 +965,36 @@ fn empty_file_action_result() -> ActionResult {
     }
 }
 
-async fn write_file(path: &WorkspacePath, bytes: &[u8], workspace_root: &Path) -> Result<()> {
+/// Largest piece of a borrowed buffer copied into one blocking write, so a
+/// write never clones the whole buffer.
+const WRITE_CHUNK_BYTES: usize = 1 << 20;
+
+async fn write_file(
+    path: &WorkspacePath,
+    bytes: &[u8],
+    workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
+) -> Result<()> {
     let absolute = path.resolve(workspace_root);
     if let Some(parent) = absolute.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| Error::FileAction {
-                action: "create_parent_dir",
-                path: path.as_str().to_string(),
-                source,
-            })?;
+        let parent = parent.to_path_buf();
+        file_step(lease, "create_parent_dir", path.as_str(), move || {
+            std::fs::create_dir_all(parent)
+        })
+        .await?;
     }
-    tokio::fs::write(&absolute, bytes)
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "write_file",
-            path: path.as_str().to_string(),
-            source,
-        })?;
+    let mut file = file_step(lease, "write_file", path.as_str(), move || {
+        std::fs::File::create(absolute)
+    })
+    .await?;
+    for chunk in bytes.chunks(WRITE_CHUNK_BYTES) {
+        let chunk = chunk.to_vec();
+        file = file_step(lease, "write_file", path.as_str(), move || {
+            file.write_all(&chunk)?;
+            Ok(file)
+        })
+        .await?;
+    }
     Ok(())
 }
 
@@ -1006,11 +1002,12 @@ async fn copy_file(
     source: &WorkspacePath,
     destination: &WorkspacePath,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     let absolute_source = source.resolve(workspace_root);
     let absolute_destination = destination.resolve(workspace_root);
     let destination_label = destination.as_str().to_string();
-    tokio::task::spawn_blocking(move || {
+    spawn_admitted(lease, move || {
         let metadata = std::fs::metadata(&absolute_source)?;
         if let Some(parent) = absolute_destination.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1041,32 +1038,51 @@ async fn materialize_host_file(
     source_sha256: &str,
     destination: &WorkspacePath,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     if !source.is_absolute() {
         return Err(Error::InvalidHostFile {
             reason: format!("source `{}` must be absolute", source.display()),
         });
     }
-    let bytes = tokio::fs::read(source)
-        .await
-        .map_err(|source_error| Error::FileAction {
-            action: "read_host_file",
-            path: source.display().to_string(),
-            source: source_error,
-        })?;
-    let digest = sha2::Sha256::digest(&bytes);
-    let mut actual = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut actual, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    if actual != source_sha256 {
-        return Err(Error::HostFileDigestMismatch {
-            path: source.display().to_string(),
-            expected: source_sha256.to_string(),
-            actual,
-        });
-    }
-    write_file(destination, &bytes, workspace_root).await
+    let source = source.to_path_buf();
+    let expected = source_sha256.to_string();
+    let absolute = destination.resolve(workspace_root);
+    let label = destination.as_str().to_string();
+    let file_action = |action: &'static str, path: String| {
+        move |source: std::io::Error| Error::FileAction {
+            action,
+            path,
+            source,
+        }
+    };
+    spawn_admitted(lease, move || {
+        let bytes = std::fs::read(&source)
+            .map_err(file_action("read_host_file", source.display().to_string()))?;
+        let digest = sha2::Sha256::digest(&bytes);
+        let mut actual = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            write!(&mut actual, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        if actual != expected {
+            return Err(Error::HostFileDigestMismatch {
+                path: source.display().to_string(),
+                expected,
+                actual,
+            });
+        }
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(file_action("create_parent_dir", label.clone()))?;
+        }
+        std::fs::write(&absolute, &bytes).map_err(file_action("write_file", label))
+    })
+    .await
+    .map_err(|join| Error::FileAction {
+        action: "materialize_host_file",
+        path: destination.as_str().to_string(),
+        source: std::io::Error::other(join.to_string()),
+    })?
 }
 
 async fn materialize_host_tree(
@@ -1074,6 +1090,7 @@ async fn materialize_host_tree(
     source_sha256: &str,
     destination: &WorkspacePath,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     if !source.is_absolute() {
         return Err(Error::InvalidHostFile {
@@ -1089,7 +1106,7 @@ async fn materialize_host_tree(
     let destination_path = destination.resolve(workspace_root);
     let destination_label = destination.as_str().to_string();
     let expected = source_sha256.to_string();
-    tokio::task::spawn_blocking(move || {
+    spawn_admitted(lease, move || {
         // Copying a tree into itself (destination equal to, nested under, or an
         // ancestor of the source) would remove the verified source before
         // recreating it or recurse the fresh destination into itself, silently
@@ -1194,6 +1211,7 @@ async fn copy_tree(
     sources: &[WorkspacePath],
     destination: &WorkspacePath,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     let source_paths = sources
         .iter()
@@ -1201,7 +1219,7 @@ async fn copy_tree(
         .collect::<Vec<_>>();
     let destination_path = destination.resolve(workspace_root);
     let destination_label = destination.as_str().to_string();
-    tokio::task::spawn_blocking(move || {
+    spawn_admitted(lease, move || {
         if destination_path.exists() {
             remove_path_blocking(&destination_path).map_err(|source| Error::FileAction {
                 action: "remove_path",
@@ -1233,25 +1251,44 @@ async fn copy_tree(
     })?
 }
 
-async fn remove_path(path: &WorkspacePath, workspace_root: &Path) -> Result<()> {
+async fn remove_path(
+    path: &WorkspacePath,
+    workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
+) -> Result<()> {
     let absolute = path.resolve(workspace_root);
-    remove_path_if_exists(&absolute, "remove_path", path.as_str()).await
+    file_step(lease, "remove_path", path.as_str(), move || {
+        let metadata = match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(source),
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&absolute)
+        } else {
+            std::fs::remove_file(&absolute)
+        }
+    })
+    .await
 }
 
-async fn ensure_dir(path: &WorkspacePath, workspace_root: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(path.resolve(workspace_root))
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "ensure_dir",
-            path: path.as_str().to_string(),
-            source,
-        })
+async fn ensure_dir(
+    path: &WorkspacePath,
+    workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
+) -> Result<()> {
+    let absolute = path.resolve(workspace_root);
+    file_step(lease, "ensure_dir", path.as_str(), move || {
+        std::fs::create_dir_all(absolute)
+    })
+    .await
 }
 
 async fn link_path(
     source: &WorkspacePath,
     destination: &WorkspacePath,
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     if Path::new(source.as_str()).starts_with(Path::new(destination.as_str())) {
         return Err(Error::InvalidLinkPath {
@@ -1265,7 +1302,7 @@ async fn link_path(
     let destination = destination.resolve(workspace_root);
     let source_for_link = source.clone();
     let destination_for_link = destination.clone();
-    tokio::task::spawn_blocking(move || {
+    spawn_admitted(lease, move || {
         std::fs::symlink_metadata(&source_for_link)?;
         if let Some(parent) = destination_for_link.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1324,63 +1361,34 @@ async fn write_tree_digest(
     output: &WorkspacePath,
     include_suffixes: &[String],
     workspace_root: &Path,
+    lease: Option<&ExecutionPermit>,
 ) -> Result<()> {
     let root_path = root.resolve(workspace_root);
     let output_path = output.resolve(workspace_root);
     let output_label = output.as_str().to_string();
     let suffixes = include_suffixes.to_vec();
-    let bytes = tokio::task::spawn_blocking(move || tree_digest_bytes(&root_path, &suffixes))
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "write_tree_digest",
-            path: output_label.clone(),
-            source: std::io::Error::other(source.to_string()),
-        })?
-        .map_err(|source| Error::FileAction {
-            action: "write_tree_digest",
-            path: output_label.clone(),
-            source,
-        })?;
-    if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| Error::FileAction {
-                action: "create_parent_dir",
-                path: output.as_str().to_string(),
-                source,
-            })?;
-    }
-    tokio::fs::write(&output_path, bytes)
-        .await
-        .map_err(|source| Error::FileAction {
-            action: "write_tree_digest",
-            path: output.as_str().to_string(),
-            source,
-        })
-}
-
-async fn remove_path_if_exists(abs: &Path, action: &'static str, label: &str) -> Result<()> {
-    let metadata = match tokio::fs::symlink_metadata(abs).await {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(Error::FileAction {
+    spawn_admitted(lease, move || {
+        let file_action = |action: &'static str| {
+            let path = output_label.clone();
+            move |source: std::io::Error| Error::FileAction {
                 action,
-                path: label.to_string(),
+                path,
                 source,
-            });
+            }
+        };
+        let bytes =
+            tree_digest_bytes(&root_path, &suffixes).map_err(file_action("write_tree_digest"))?;
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).map_err(file_action("create_parent_dir"))?;
         }
-    };
-    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        tokio::fs::remove_dir_all(abs).await
-    } else {
-        tokio::fs::remove_file(abs).await
-    };
-    result.map_err(|source| Error::FileAction {
-        action,
-        path: label.to_string(),
-        source,
+        std::fs::write(&output_path, bytes).map_err(file_action("write_tree_digest"))
     })
+    .await
+    .map_err(|join| Error::FileAction {
+        action: "write_tree_digest",
+        path: output.as_str().to_string(),
+        source: std::io::Error::other(join.to_string()),
+    })?
 }
 
 fn remove_path_blocking(path: &Path) -> std::io::Result<()> {
@@ -1426,49 +1434,6 @@ fn make_tree_removable(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = path;
-    }
-    Ok(())
-}
-
-/// Give the directories above each staged input the permissions they have in
-/// the workspace. Directories created on the way to an input otherwise take
-/// default modes, so a `0700` directory would arrive as `0755`. Runs after
-/// every input is staged, deepest directories first, so a restrictive parent
-/// cannot block staging its siblings.
-fn mirror_ancestor_permissions(
-    workspace_root: &Path,
-    sandbox_execroot: &Path,
-    inputs: &[WorkspacePath],
-    keep_writable: &[std::path::PathBuf],
-) -> std::io::Result<()> {
-    let mut directories = std::collections::BTreeSet::new();
-    for input in inputs {
-        for ancestor in Path::new(input.as_str()).ancestors().skip(1) {
-            if !ancestor.as_os_str().is_empty() {
-                directories.insert(ancestor.to_path_buf());
-            }
-        }
-    }
-    let mut ordered = directories.into_iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-    for directory in ordered {
-        if keep_writable
-            .iter()
-            .any(|kept| kept.starts_with(&directory))
-        {
-            continue;
-        }
-        let source = std::fs::symlink_metadata(workspace_root.join(&directory));
-        let destination = std::fs::symlink_metadata(sandbox_execroot.join(&directory));
-        if let (Ok(source), Ok(destination)) = (source, destination) {
-            if source.is_dir()
-                && destination.is_dir()
-                && !source.file_type().is_symlink()
-                && !destination.file_type().is_symlink()
-            {
-                std::fs::set_permissions(sandbox_execroot.join(&directory), source.permissions())?;
-            }
-        }
     }
     Ok(())
 }
@@ -1682,11 +1647,60 @@ mod tests {
     }
 
     fn extract_fixture(entries: &[ZipFixtureEntry<'_>]) -> (tempfile::TempDir, crate::Result<()>) {
+        extract_fixture_within(entries, crate::RemoteIoLimits::default())
+    }
+
+    fn extract_fixture_within(
+        entries: &[ZipFixtureEntry<'_>],
+        limits: crate::RemoteIoLimits,
+    ) -> (tempfile::TempDir, crate::Result<()>) {
         let tmp = tempfile::TempDir::new().unwrap();
         let archive = tmp.path().join("fixture.zip");
         write_zip(&archive, entries);
-        let result = extract_zip_archive(&archive, &tmp.path().join("output"));
+        let result = extract_zip_archive(
+            &archive,
+            &tmp.path().join("output"),
+            limits,
+            limits.max_archive_bytes,
+        );
         (tmp, result)
+    }
+
+    #[test]
+    fn extraction_stops_at_the_extracted_byte_limit() {
+        use ZipFixtureEntry::File;
+        let limits = crate::RemoteIoLimits {
+            max_archive_bytes: 8,
+            ..crate::RemoteIoLimits::default()
+        };
+        let (_tmp, within) =
+            extract_fixture_within(&[File("a", "1234"), File("b", "5678")], limits);
+        within.unwrap();
+        let (_tmp, over) = extract_fixture_within(&[File("a", "1234"), File("b", "56789")], limits);
+        assert!(matches!(
+            over,
+            Err(crate::Error::ExecutorResourceLimit {
+                resource: "extracted bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn extraction_refuses_archives_with_too_many_entries() {
+        use ZipFixtureEntry::File;
+        let limits = crate::RemoteIoLimits {
+            max_archive_entries: 1,
+            ..crate::RemoteIoLimits::default()
+        };
+        let (_tmp, result) = extract_fixture_within(&[File("a", "1"), File("b", "2")], limits);
+        assert!(matches!(
+            result,
+            Err(crate::Error::ExecutorResourceLimit {
+                resource: "archive entries",
+                ..
+            })
+        ));
     }
 
     #[cfg(unix)]
@@ -1872,5 +1886,29 @@ mod tests {
             std::fs::read_link(&copied).unwrap(),
             std::path::Path::new("target.txt")
         );
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redacted_url;
+
+    #[test]
+    fn download_urls_drop_credentials_before_reaching_errors() {
+        let url = reqwest::Url::parse(
+            "https://user:secret@example.com/archive.zip?X-Amz-Signature=abc&token=t#frag",
+        )
+        .unwrap();
+        let redacted = redacted_url(&url);
+        assert_eq!(redacted, "https://example.com/archive.zip?redacted");
+        for secret in ["user", "secret", "abc", "token", "frag"] {
+            assert!(!redacted.contains(secret), "{redacted} leaks {secret}");
+        }
+    }
+
+    #[test]
+    fn download_urls_without_credentials_are_unchanged() {
+        let url = reqwest::Url::parse("https://example.com/a/b.zip").unwrap();
+        assert_eq!(redacted_url(&url), "https://example.com/a/b.zip");
     }
 }

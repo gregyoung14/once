@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::remote::PhasePermit;
 use crate::{Error, Result, WorkspacePath};
+
+#[cfg(test)]
+mod tests;
 
 pub(super) struct OutputStaging {
     root: PathBuf,
@@ -68,24 +72,39 @@ impl OutputStaging {
         &self.files
     }
 
+    #[cfg(any(feature = "remote-microsandbox", test))]
     pub(super) async fn install(
         self,
         outputs: &[WorkspacePath],
         workspace_root: &Path,
     ) -> Result<()> {
-        let files = self.files.clone();
-        let backup = self.backup.clone();
+        self.install_admitted(outputs, workspace_root, PhasePermit::default())
+            .await
+    }
+
+    pub(super) async fn install_admitted(
+        self,
+        outputs: &[WorkspacePath],
+        workspace_root: &Path,
+        lease: PhasePermit,
+    ) -> Result<()> {
         let workspace = workspace_root.to_path_buf();
         let outputs = outputs.to_vec();
-        tokio::task::spawn_blocking(move || install_outputs(&files, &backup, &workspace, &outputs))
-            .await
-            .map_err(|source| {
-                host_error(
-                    "install_remote_outputs",
-                    Path::new(".once/tmp"),
-                    std::io::Error::other(source.to_string()),
-                )
-            })?
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            let staging = self;
+            crate::outputs::with_output_lock(&workspace, || {
+                install_outputs(&staging.files, &staging.backup, &workspace, &outputs)
+            })
+        })
+        .await
+        .map_err(|source| {
+            host_error(
+                "install_remote_outputs",
+                Path::new(".once/tmp"),
+                std::io::Error::other(source.to_string()),
+            )
+        })?
     }
 }
 
