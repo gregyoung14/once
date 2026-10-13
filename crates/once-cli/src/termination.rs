@@ -57,9 +57,17 @@ pub use fallback::{forward, SignalWatcher};
 /// End the process as `signal` would have: restore its default disposition and
 /// deliver it to the process, so the parent observes a death by signal. Falls
 /// back to the conventional `128 + n` exit status.
+pub(crate) fn install_forwarding() {
+    #[cfg(unix)]
+    unix::installed();
+}
+
 pub fn terminate(signal: Termination) -> ! {
     #[cfg(unix)]
-    unix::reraise(signal);
+    {
+        once_core::signal_action_process_groups(libc::SIGKILL);
+        unix::reraise(signal);
+    }
     std::process::exit(signal.exit_code())
 }
 
@@ -112,7 +120,7 @@ mod unix {
         }
     }
 
-    fn installed() -> bool {
+    pub(super) fn installed() -> bool {
         *INSTALLED.get_or_init(|| {
             let interrupt = install_handler(Termination::Interrupt);
             let terminate = install_handler(Termination::Terminate);
@@ -167,9 +175,12 @@ mod unix {
         };
         let now = monotonic_ns();
         match STATE.compare_exchange(WATCHING, caught, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => FIRST_CAUGHT_NS.store(now.max(1), Ordering::SeqCst),
+            Ok(_) => {
+                FIRST_CAUGHT_NS.store(now.max(1), Ordering::SeqCst);
+            }
             Err(state) if state == caught && is_repeat(now) => {}
             Err(_) => {
+                once_core::signal_action_process_groups(libc::SIGKILL);
                 let _ = signal_hook::low_level::emulate_default_handler(raw);
             }
         }

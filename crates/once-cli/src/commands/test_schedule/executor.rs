@@ -27,9 +27,12 @@ pub(super) fn execute(
 ) -> Result<CompletedSchedule> {
     let requested_workers = bounded_worker_request(requested_workers, resource_limits);
     let workers = worker_count(Some(requested_workers), plan.batches.len());
-    let memory_limit_bytes = worker_memory_limit(resource_limits.memory_bytes, workers);
+    let child_limits = ChildLimits {
+        memory_bytes: worker_memory_limit(resource_limits.memory_bytes, workers),
+        cpu_slots: worker_cpu_limit(resource_limits.cpu_slots, workers),
+    };
     execute_with(plan, estimates, Some(workers), |batch| {
-        run_test_target(executable, workspace, batch, sandbox, memory_limit_bytes)
+        run_test_target(executable, workspace, batch, sandbox, child_limits)
     })
 }
 
@@ -40,6 +43,21 @@ fn bounded_worker_request(
     requested_workers
         .unwrap_or(resource_limits.max_parallel_actions())
         .min(resource_limits.max_parallel_actions())
+}
+
+/// The share of the schedule's budget each concurrently running batch gets,
+/// so batches together never admit more than the schedule itself would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ChildLimits {
+    /// Zero leaves memory budgeting disabled in the batch, as it is here.
+    pub memory_bytes: u64,
+    pub cpu_slots: usize,
+}
+
+/// Workers never outnumber the CPU slots they share, so every batch keeps at
+/// least one slot without the batches together exceeding the budget.
+fn worker_cpu_limit(cpu_slots: usize, workers: usize) -> usize {
+    (cpu_slots / workers.max(1)).max(1)
 }
 
 fn worker_memory_limit(memory_limit_bytes: u64, workers: usize) -> u64 {

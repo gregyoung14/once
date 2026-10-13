@@ -77,11 +77,65 @@ fn startup_failure_preserves_its_exit_status_and_stderr_despite_old_evidence() {
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let run = run_test_target(&executable, workspace.path(), &batch, SandboxMode::Off, 0).unwrap();
+    let limits = super::super::executor::ChildLimits {
+        memory_bytes: 0,
+        cpu_slots: 1,
+    };
+    let run = run_test_target(
+        &executable,
+        workspace.path(),
+        &batch,
+        SandboxMode::Off,
+        limits,
+    )
+    .unwrap();
     assert_eq!(run["success"], false);
     assert_eq!(run["exit_code"], 17);
     assert!(run["stderr"]
         .as_str()
         .unwrap()
         .contains("runner startup failed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn each_batch_is_given_its_share_of_the_cpu_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = super::super::cancellation::TEST_LOCK.lock().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let batch = TestBatch::new("tests", Vec::new()).unwrap();
+    let arguments = workspace.path().join("arguments");
+    let executable = workspace.path().join("recording-runner");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+            arguments.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let limits = super::super::executor::ChildLimits {
+        memory_bytes: 0,
+        cpu_slots: 3,
+    };
+
+    run_test_target(
+        &executable,
+        workspace.path(),
+        &batch,
+        SandboxMode::Off,
+        limits,
+    )
+    .unwrap();
+
+    let arguments = std::fs::read_to_string(arguments).unwrap();
+    let arguments = arguments.lines().collect::<Vec<_>>();
+    let flag = arguments
+        .iter()
+        .position(|argument| *argument == "--cpu-limit");
+    assert_eq!(flag.map(|index| arguments[index + 1]), Some("3"));
+    assert!(!arguments.contains(&"--memory-limit"));
+    let subcommand = arguments.iter().position(|argument| *argument == "test");
+    assert!(flag < subcommand, "global flags precede the subcommand");
 }

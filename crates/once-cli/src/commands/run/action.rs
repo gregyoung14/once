@@ -16,9 +16,10 @@ pub(super) struct ActionPlan {
 pub(super) async fn action_for(
     workspace: &Path,
     target: &once_frontend::Target,
+    xdg: &once_core::Xdg,
 ) -> Result<ActionPlan> {
     match target.kind.as_str() {
-        "script" | "runtime_script" => script::script_action(workspace, target).await,
+        "script" | "runtime_script" => script::script_action(workspace, target, xdg).await,
         "task" | "runtime_task" | "runner_task" => task::task_action(workspace, target),
         other => anyhow::bail!("running `{other}` targets is not yet supported"),
     }

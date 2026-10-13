@@ -241,6 +241,11 @@ pub struct Cli {
     #[usage(long, global = true, value_name = "SIZE")]
     pub(crate) memory_limit: Option<MemoryLimit>,
 
+    /// Maximum CPU scheduling slots for local actions, including nested test batches.
+    /// Defaults to the CPU capacity visible to the host or container.
+    #[usage(long, global = true, value_name = "COUNT")]
+    pub(crate) cpu_limit: Option<std::num::NonZeroUsize>,
+
     #[usage(subcommand)]
     pub command: Option<Cmd>,
 }
@@ -486,9 +491,9 @@ pub enum Cmd {
 
         /// Whether the command may reach the network. Defaults to
         /// `unrestricted` (the host network is available, matching existing
-        /// behavior). `deny` isolates the command from the network on Linux
-        /// so an undeclared fetch fails loudly instead of leaking into the
-        /// cache key.
+        /// behavior). `deny` blocks Internet sockets, including loopback,
+        /// on supported hosts and refuses execution when enforcement is
+        /// unavailable. Local Unix-domain IPC remains available.
         #[usage(long, default = "unrestricted")]
         network: NetworkPolicy,
 

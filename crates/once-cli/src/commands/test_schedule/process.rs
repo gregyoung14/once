@@ -10,7 +10,7 @@ pub(super) fn run_test_target(
     workspace: &Path,
     batch: &TestBatch,
     sandbox: SandboxMode,
-    memory_limit_bytes: u64,
+    limits: super::executor::ChildLimits,
 ) -> Result<Value> {
     if super::cancellation::cancelled() {
         anyhow::bail!(
@@ -25,11 +25,14 @@ pub(super) fn run_test_target(
     };
     let mut command = Command::new(executable);
     command.arg("-C").arg(workspace).arg("--format").arg("json");
-    if memory_limit_bytes > 0 {
+    if limits.memory_bytes > 0 {
         command
             .arg("--memory-limit")
-            .arg(memory_limit_bytes.to_string());
+            .arg(limits.memory_bytes.to_string());
     }
+    command
+        .arg("--cpu-limit")
+        .arg(limits.cpu_slots.max(1).to_string());
     command
         .arg("test")
         .arg("--sandbox")

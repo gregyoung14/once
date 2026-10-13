@@ -1,3 +1,5 @@
+mod cache_budget;
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,19 +26,32 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
+    crate::termination::install_forwarding();
     let directory = resolve_workspace(cli.directory)?;
     let native = crate::native_invocation::prepare(&directory, &mut command)?;
     let workspace = native
         .as_ref()
         .map_or(&directory, |invocation| &invocation.workspace);
     let xdg = Xdg::from_env();
-    let resource_limits = cli
+    let mut resource_limits = cli
         .memory_limit
         .map_or_else(ResourceLimits::default, |memory_limit| {
             ResourceLimits::default().with_memory_bytes(memory_limit.bytes())
         });
+    if let Some(cpu_limit) = cli.cpu_limit {
+        resource_limits.cpu_slots = cpu_limit.get();
+    }
+    let total_memory_bytes = resource_limits.memory_bytes;
+    let uses_remote_cache = matches!(
+        crate::cache_provider::resolve_config(workspace, &xdg),
+        Ok(crate::cache_provider::ResolvedCacheProviderConfig::Tuist(_))
+    );
+    let cache_memory_bytes =
+        cache_budget::configure(&mut resource_limits, &command, uses_remote_cache)?;
     tracing::debug!(
-        memory_limit_bytes = resource_limits.memory_bytes,
+        memory_limit_bytes = total_memory_bytes,
+        action_memory_budget_bytes = resource_limits.memory_bytes,
+        cache_memory_budget_bytes = cache_memory_bytes,
         default_action_memory_bytes = resource_limits.default_action_memory_bytes,
         cpu_slots = resource_limits.cpu_slots,
         "resolved local resource limits"
@@ -914,6 +929,7 @@ async fn dispatch_run(workspace: &Path, xdg: &Xdg, args: RunDispatchArgs) -> Res
     let cache = crate::cache_provider::resolve(workspace, xdg)?;
     run_target_command(
         workspace,
+        xdg,
         &cache,
         output,
         Some(resolved_target),
@@ -939,6 +955,7 @@ async fn dispatch_exec(
 #[allow(clippy::too_many_arguments)]
 async fn run_target_command(
     workspace: &Path,
+    xdg: &Xdg,
     cache: &CacheProvider,
     output: Output,
     target: Option<String>,
@@ -954,6 +971,7 @@ async fn run_target_command(
         cache,
         &target,
         commands::run::RunArgs {
+            xdg: xdg.clone(),
             output,
             runtime_rpc,
             runtime_rpc_socket,
