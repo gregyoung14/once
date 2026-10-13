@@ -9,6 +9,7 @@ mod action;
 pub use once_presentation::ActionHistoryKey;
 mod archive;
 mod contract;
+mod digest_writer;
 mod directory_blob;
 mod env;
 mod error;
@@ -29,6 +30,7 @@ mod path;
 mod plan;
 mod remote;
 mod reproducibility;
+mod resource_scope;
 mod resources;
 mod restore_file;
 mod runner;
@@ -85,7 +87,8 @@ pub use once_host_tree::tree_stat_fingerprint;
 pub use path::{WorkspacePath, WorkspacePathError};
 pub use plan::{BuiltPlan, NodeInfo, Plan, PlanError, PlanNode, PlanOutcome};
 pub use reproducibility::{verify_reproducible, ReproducibilityDifference, ReproducibilityReport};
-pub use resources::{ResourceLimits, ResourcePool, ResourceRequest};
+pub use resource_scope::{with_execution_permit, with_resource_permit};
+pub use resources::{ResourceLimits, ResourcePermit, ResourcePool, ResourceRequest};
 pub use runner::{
     materialize_outputs, materialize_outputs_admitted, run, run_uncached, run_uncached_admitted,
     run_uncached_contract, run_uncached_observed, run_with_cache, run_with_cache_streaming,

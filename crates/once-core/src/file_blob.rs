@@ -9,6 +9,7 @@ use std::path::Path;
 
 use once_cas::Digest;
 
+use crate::digest_writer::DigestWriter;
 use crate::{Error, Result};
 
 pub(crate) const FILE_BLOB_MAGIC: &[u8] = b"once.file.v1\0";
@@ -22,6 +23,29 @@ pub(crate) fn capture_file_blob(path: &Path) -> std::io::Result<Vec<u8>> {
     out.extend_from_slice(&header);
     out.extend_from_slice(&content);
     Ok(out)
+}
+
+pub(crate) fn write_file_blob(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()> {
+    writer.write_all(&file_blob_header(metadata))?;
+    write_file_content(path, metadata, writer)
+}
+
+pub(crate) fn write_file_content(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(usize::MAX)
+        .clamp(8 * 1024, 256 * 1024);
+    let mut reader = std::io::BufReader::with_capacity(capacity, file);
+    std::io::copy(&mut reader, &mut writer)?;
+    Ok(())
 }
 
 pub(crate) fn file_blob_header(metadata: &std::fs::Metadata) -> Vec<u8> {
@@ -65,9 +89,18 @@ pub(crate) fn digest_file_blob(
     path: &Path,
     metadata: &std::fs::Metadata,
 ) -> std::io::Result<Digest> {
-    let header = file_blob_header(metadata);
-    let file = std::fs::File::open(path)?;
-    Digest::of_parts_and_reader(&[&header], file)
+    let mut writer = DigestWriter::default();
+    write_file_blob(path, metadata, &mut writer)?;
+    Ok(writer.finish())
+}
+
+pub(crate) fn digest_raw_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<Digest> {
+    let mut writer = DigestWriter::default();
+    write_file_content(path, metadata, &mut writer)?;
+    Ok(writer.finish())
 }
 
 pub(crate) fn restore_file_blob_from_reader(
@@ -119,6 +152,25 @@ fn decode_file_blob<'a>(logical_path: &str, bytes: &'a [u8]) -> Result<(u32, &'a
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn streamed_modern_and_legacy_digests_match_exact_reference_bytes() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("file");
+        for size in [0_usize, 4096, 256 * 1024 + 37, 1024 * 1024 + 5] {
+            let bytes: Vec<u8> = (0..size).map(|index| index.to_le_bytes()[0]).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                digest_raw_file(&path, &metadata).unwrap(),
+                Digest::of_bytes(&bytes)
+            );
+            assert_eq!(
+                digest_file_blob(&path, &metadata).unwrap(),
+                Digest::of_bytes(&capture_file_blob(&path).unwrap())
+            );
+        }
+    }
 
     #[test]
     fn restoring_a_file_preserves_existing_readers() {

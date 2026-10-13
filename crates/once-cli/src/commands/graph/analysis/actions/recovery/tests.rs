@@ -10,6 +10,8 @@ use super::*;
 #[cfg(unix)]
 mod admission;
 #[cfg(unix)]
+mod arg_files;
+#[cfg(unix)]
 mod fingerprint_outputs;
 
 #[test]

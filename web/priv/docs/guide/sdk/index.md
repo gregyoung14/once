@@ -95,10 +95,13 @@ fetched again once before the read fails.
 ## Transfer Budgets
 
 A remote provider bounds the memory buffers and scratch disk its transfers
-use. Each download reserves disk for the full size the remote declares before
-it starts, and each transfer or cache lookup reserves the largest buffers it
-can hold, sized from the blob it moves. Capacity returns as soon as the work
-finishes, fails, or is cancelled. Providers cloned from one another share
+use. A streamed download reserves scratch space for both its declared raw
+size and its bounded encoded representation before it starts. This is slightly
+more than twice the declared size, so a staging budget that previously fitted
+only one raw copy can now refuse the transfer. Encoded bodies cannot grow past
+that allowance. Transfers and cache lookups also reserve their bounded buffers.
+Cancellation releases capacity only when the physical worker has stopped and
+its temporary storage is no longer needed. Providers cloned from one another share
 their budget; separately constructed providers each have their own, and the
 command line shares one budget across the providers it resolves.
 
@@ -111,8 +114,10 @@ allows; earlier releases had no such limit.
 
 Every remote operation runs within a memory budget of at least 32 mebibytes
 and 64 kibibytes, which the Rust crate exposes as its minimum transfer memory.
-That is what downloading a large blob reserves: one full-size stream message
-and the pipe it is written through. Cache lookups, small blob reads, and
+Streamed downloads reserve at least that minimum, including bounded codec
+working space and producer queues. Their response-message ceiling is reduced
+when necessary to leave room for those buffers; it never exceeds 32 mebibytes.
+Cache lookups, small blob reads, and
 uploads streamed from a file need less. Uploading a buffer the caller already
 holds reserves about twice its size, so buffers larger than roughly 15
 mebibytes need more than the minimum. With a smaller budget, the operations
@@ -120,8 +125,8 @@ that need more fail as exhausted; they are never treated as a cache miss.
 
 These budgets are an accounting of the buffers the cache sizes for its
 transfers, not a limit on process memory. Connecting, endpoint discovery,
-authentication, capability discovery, transport internals, and compression
-working memory are outside them.
+authentication, capability discovery, transport internals, and upload
+compression working memory are outside them.
 
 Error messages and logs name remote endpoints by scheme, host, and port only,
 and describe remote failures by category and status code. Text a server sends

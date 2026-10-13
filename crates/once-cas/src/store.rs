@@ -1,19 +1,24 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
 use tokio::fs::{self, File};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::filesystem::{
-    ensure_dir, rename_into_place, write_durably, write_with_durable_contents, TMP_COUNTER,
+    ensure_dir, rename_into_place, write_durably, write_with_durable_contents,
 };
 use crate::integrity::{self, CorruptBlob};
 use crate::{blob, ActionResult, Digest, Error, Result};
 
-const STREAM_CHUNK: usize = 64 * 1024;
+mod copy;
+mod producer;
+mod staged;
+mod staging;
+mod stream;
+pub(crate) use staging::PendingBlob;
+
+pub use staged::{StagedBlob, StagedBlobReader};
+
+const STREAM_CHUNK: usize = 256 * 1024;
 
 /// Local content-addressed store rooted at a workspace `.once/` directory.
 ///
@@ -84,63 +89,6 @@ impl Cas {
         }
     }
 
-    /// Write a blob's contents to `destination`, streaming rather than
-    /// buffering, and creating parent directories as needed.
-    ///
-    /// The bytes are hashed as they are written and only appear at
-    /// `destination` when they match `digest`. A stored blob that fails the
-    /// check is removed from the store so it can be fetched or produced again,
-    /// and the copy fails with an error whose kind is corrupt.
-    pub async fn copy_blob_to_file(&self, digest: &Digest, destination: &Path) -> Result<()> {
-        let stored_path = self.blob_path(digest);
-        if !fs::try_exists(&stored_path).await.unwrap_or(false) {
-            return Err(Error::BlobNotFound(*digest));
-        }
-        let output_path = destination.to_path_buf();
-        let error_path = output_path.clone();
-        let decode_path = stored_path.clone();
-        let expected = *digest;
-        let stop = Arc::new(AtomicBool::new(false));
-        let _stop_on_drop = blob::StopOnDrop(Arc::clone(&stop));
-        let decoded = tokio::task::spawn_blocking(move || {
-            blob::decode_file(&decode_path, &output_path, &expected, &stop)
-        })
-        .await
-        .map_err(|source| Error::Io {
-            path: error_path.clone(),
-            source: io::Error::other(source.to_string()),
-        })?;
-        match decoded {
-            Ok(()) => Ok(()),
-            Err(source) if CorruptBlob::is(&source) => {
-                self.quarantine(digest, &stored_path).await;
-                Err(Error::Io {
-                    path: stored_path,
-                    source,
-                })
-            }
-            Err(source) => Err(Error::Io {
-                path: error_path,
-                source,
-            }),
-        }
-    }
-
-    /// Remove a stored blob that failed verification. Best effort: the caller
-    /// reports the corruption either way.
-    async fn quarantine(&self, digest: &Digest, path: &Path) {
-        tracing::warn!(
-            blob_digest = %digest,
-            path = %path.display(),
-            "removing a local cache blob that failed its integrity check"
-        );
-        if let Err(error) = fs::remove_file(path).await {
-            if error.kind() != io::ErrorKind::NotFound {
-                tracing::warn!(blob_digest = %digest, error = %error, "could not remove corrupt blob");
-            }
-        }
-    }
-
     pub(crate) fn action_path(&self, digest: &Digest) -> PathBuf {
         Self::shard_path(&self.actions_dir(), digest, ".json")
     }
@@ -183,137 +131,66 @@ impl Cas {
     /// Memory use while reading is bounded by `STREAM_CHUNK` regardless
     /// of the input size - this is the path subprocess stdout/stderr go
     /// through, so a multi-GB linker log doesn't OOM the executor. The
-    /// stream is hashed and written to a scratch file in one pass; on
-    /// completion the scratch file is optionally compressed, then
-    /// renamed into place or discarded if the blob already exists. On
+    /// stream is hashed, written and compressed as bytes arrive. On completion,
+    /// the selected scratch representation is renamed into place or discarded
+    /// if the blob already exists. On
     /// returned error or cancellation, temporary files are cleaned up.
     /// A process crash can leave scratch files that future cache invocations ignore.
     pub async fn put_stream<R: AsyncRead + Unpin>(&self, reader: R) -> Result<Digest> {
-        let (tmp, digest) = self.stream_to_tmp("stream", reader).await?;
-        self.commit_stream(tmp, &digest).await?;
+        let scratch = self.scratch_dir();
+        ensure_dir(&scratch).await?;
+        let (stored, digest, file) = stream::prepare(&scratch, reader).await?;
+        let final_path = self.blob_path(&digest);
+        if !fs::try_exists(&final_path).await.unwrap_or(false) {
+            File::from_std(file)
+                .sync_all()
+                .await
+                .map_err(|source| Error::Io {
+                    path: stored.to_path_buf(),
+                    source,
+                })?;
+            rename_into_place(&stored, &final_path).await?;
+        }
         Ok(digest)
     }
 
-    pub(crate) async fn commit_stream(
-        &self,
-        tmp: tempfile::TempPath,
-        digest: &Digest,
-    ) -> Result<()> {
-        let final_path = self.blob_path(digest);
-        if fs::try_exists(&final_path).await.unwrap_or(false) {
-            return Ok(());
-        }
-
-        let stored_tmp = self.prepare_blob_tmp(tmp).await?;
-        if fs::try_exists(&final_path).await.unwrap_or(false) {
-            return Ok(());
-        }
-
-        rename_into_place(&stored_tmp, &final_path).await
+    pub(crate) fn remote_window_limit_exceeded(error: &Error) -> bool {
+        stream::window_limit_exceeded(error)
     }
 
-    /// Stream `reader` into the scratch dir and compute the BLAKE3 of
-    /// the bytes. The caller is responsible for renaming the returned
-    /// tmp path into its final location.
-    pub(crate) async fn stream_to_tmp<R: AsyncRead + Unpin>(
+    pub(crate) async fn mirror_remote_verified<R: AsyncRead + Unpin, G: Send + 'static>(
         &self,
-        prefix: &str,
         reader: R,
-    ) -> Result<(tempfile::TempPath, Digest)> {
-        let scratch = self.scratch_dir();
-        ensure_dir(&scratch).await?;
-        let temporary = tempfile::Builder::new()
-            .prefix(&format!("{prefix}-"))
-            .make_in(&scratch, |path| {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-            })
-            .map_err(|source| Error::Io {
-                path: scratch,
-                source,
-            })?;
-        let (file, temporary_path) = temporary.into_parts();
-        let tmp = temporary_path.to_path_buf();
-        let digest = self
-            .write_stream_to(&tmp, File::from_std(file), reader)
-            .await?;
-        Ok((temporary_path, digest))
-    }
-
-    async fn write_stream_to<R: AsyncRead + Unpin>(
-        &self,
-        tmp: &Path,
-        mut file: File,
-        mut reader: R,
+        expected: u64,
+        compressed: bool,
+        expected_digest: Option<Digest>,
+        sha256: Option<String>,
+        guard: G,
     ) -> Result<Digest> {
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = vec![0u8; STREAM_CHUNK];
-        loop {
-            let n = reader.read(&mut buf).await.map_err(|source| Error::Io {
-                path: tmp.to_path_buf(),
-                source,
-            })?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            file.write_all(&buf[..n])
-                .await
-                .map_err(|source| Error::Io {
-                    path: tmp.to_path_buf(),
-                    source,
-                })?;
-        }
-        file.sync_all().await.map_err(|source| Error::Io {
-            path: tmp.to_path_buf(),
-            source,
-        })?;
-        Ok(Digest::from_bytes(*hasher.finalize().as_bytes()))
-    }
-
-    async fn prepare_blob_tmp(&self, raw_tmp: tempfile::TempPath) -> Result<tempfile::TempPath> {
         let scratch = self.scratch_dir();
         ensure_dir(&scratch).await?;
-        let pid = process::id();
-        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let encoded_tmp = scratch.join(format!("zstd-{pid}-{seq}"));
-        let raw_path = raw_tmp.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let encoded_tmp =
-                tempfile::TempPath::try_from_path(encoded_tmp).map_err(|source| Error::Io {
-                    path: raw_tmp.to_path_buf(),
-                    source,
-                })?;
-            let encoded =
-                blob::encode_file(&raw_tmp, &encoded_tmp).map_err(|source| Error::Io {
-                    path: raw_tmp.to_path_buf(),
-                    source,
-                })?;
-            if encoded.should_store {
-                Ok(encoded_tmp)
-            } else {
-                Ok(raw_tmp)
-            }
-        })
-        .await
-        .map_err(|source| Error::Io {
-            path: raw_path,
-            source: io::Error::other(source.to_string()),
-        })?
+        let (stored, digest) =
+            stream::ingest_remote_verified(&scratch, reader, expected, compressed, sha256, guard)
+                .await?;
+        if let Some(expected) = expected_digest {
+            integrity::verify(&expected, &digest).map_err(|source| Error::Io {
+                path: stored.to_path_buf(),
+                source,
+            })?;
+        }
+        let final_path = self.blob_path(&digest);
+        if !fs::try_exists(&final_path).await.unwrap_or(false) {
+            rename_into_place(&stored, &final_path).await?;
+        }
+        Ok(digest)
     }
 
-    /// Read a content-addressed blob, verifying it against `digest`.
-    ///
-    /// A stored blob that cannot be decoded or does not hash to `digest` is
-    /// removed and reported with an error whose kind is corrupt.
+    /// Read a content-addressed blob, verifying its contents before returning.
     pub async fn get_blob(&self, digest: &Digest) -> Result<Vec<u8>> {
         let path = self.blob_path(digest);
         let stored = match fs::read(&path).await {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(Error::BlobNotFound(*digest))
             }
             Err(source) => return Err(Error::Io { path, source }),
@@ -329,6 +206,15 @@ impl Cas {
             Err(source) => {
                 self.quarantine(digest, &path).await;
                 Err(Error::Io { path, source })
+            }
+        }
+    }
+
+    pub(crate) async fn quarantine(&self, digest: &Digest, path: &Path) {
+        tracing::warn!(blob_digest = %digest, "removing a local cache blob that failed its integrity check");
+        if let Err(error) = fs::remove_file(path).await {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(blob_digest = %digest, %error, "could not remove corrupt blob");
             }
         }
     }
@@ -385,8 +271,11 @@ impl Cas {
     }
 }
 
-mod staging;
+#[cfg(test)]
+#[path = "store/compression_benchmarks.rs"]
+mod compression_benchmarks;
+#[cfg(test)]
+#[path = "store/stream_publication_tests.rs"]
+mod stream_publication_tests;
 #[cfg(test)]
 mod tests;
-
-pub(crate) use staging::StagedBlob;

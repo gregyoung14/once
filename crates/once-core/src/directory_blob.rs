@@ -9,17 +9,34 @@
 //! targets, and unix permission bits.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use once_cas::Digest;
 
+use crate::digest_writer::DigestWriter;
 use crate::path::WorkspacePath;
 use crate::{Error, OutputSymlinkMode, Result};
 
 pub(crate) const DIRECTORY_BLOB_MAGIC: &[u8] = b"once.directory.v2\0";
 const DIRECTORY_BLOB_V1_MAGIC: &[u8] = b"once.directory.v1\0";
 const MAX_DIRECTORY_PATH_BYTES: usize = 1024 * 1024;
+const CAPTURE_BUFFER: usize = 512 * 1024;
+
+#[cfg(test)]
+#[path = "directory_capture_tests.rs"]
+mod capture_tests;
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[path = "directory_stage.rs"]
+mod stage;
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[path = "directory_prepare.rs"]
+mod prepare;
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub(crate) use prepare::{prepare as prepare_directory, Preparation};
 
 #[derive(Clone, Copy)]
 enum DirectoryEntryKind {
@@ -62,8 +79,12 @@ impl DirectoryEntryContent {
     fn write_to(&self, writer: &mut impl Write) -> std::io::Result<()> {
         match self {
             Self::File { path, len } => {
-                let mut file = std::fs::File::open(path)?.take(*len);
-                let written = std::io::copy(&mut file, writer)?;
+                let capacity = usize::try_from(*len)
+                    .unwrap_or(usize::MAX)
+                    .clamp(8192, CAPTURE_BUFFER);
+                let file = std::fs::File::open(path)?.take(*len);
+                let mut reader = BufReader::with_capacity(capacity, file);
+                let written = std::io::copy(&mut reader, writer)?;
                 if written != *len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -96,26 +117,6 @@ pub(crate) fn digest_directory_blob(
     let mut writer = DigestWriter::default();
     write_directory_blob(root, symlink_mode, &mut writer)?;
     Ok(writer.finish())
-}
-
-#[derive(Default)]
-struct DigestWriter(blake3::Hasher);
-
-impl DigestWriter {
-    fn finish(self) -> Digest {
-        Digest::from_bytes(*self.0.finalize().as_bytes())
-    }
-}
-
-impl Write for DigestWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -438,6 +439,15 @@ pub(crate) fn restore_directory_blob_from_reader(
             "missing directory blob magic",
         ));
     }
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    if let Some(staged) = stage::Tree::begin(logical_path, abs)? {
+        while let Some(entry) =
+            read_streamed_directory_entry(logical_path, staged.root(), version_one, &mut reader)?
+        {
+            staged.restore_entry(logical_path, &entry, &mut reader)?;
+        }
+        return staged.publish(logical_path, abs);
+    }
     prepare_directory_restore(logical_path, abs)?;
     while let Some(entry) =
         read_streamed_directory_entry(logical_path, abs, version_one, &mut reader)?
@@ -521,12 +531,6 @@ fn restore_streamed_directory_entry(
     entry: &StreamedDirectoryEntry,
     reader: &mut impl Read,
 ) -> Result<()> {
-    if let Some(parent) = entry.destination.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::RestoreOutput {
-            path: logical_path.to_string(),
-            source,
-        })?;
-    }
     match entry.kind {
         DirectoryEntryKind::File => restore_streamed_directory_file(logical_path, entry, reader),
         DirectoryEntryKind::SymlinkFile | DirectoryEntryKind::SymlinkDir => {
@@ -563,6 +567,12 @@ fn restore_streamed_directory_symlink(
     entry: &StreamedDirectoryEntry,
     reader: &mut impl Read,
 ) -> Result<()> {
+    if let Some(parent) = entry.destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::RestoreOutput {
+            path: logical_path.to_string(),
+            source,
+        })?;
+    }
     let content_len = usize::try_from(entry.content_len)
         .map_err(|_| invalid_directory(logical_path, "symlink target is too long"))?;
     if content_len > MAX_DIRECTORY_PATH_BYTES {

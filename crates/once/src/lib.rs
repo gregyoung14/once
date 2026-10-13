@@ -17,7 +17,9 @@
 
 pub use action_key::ActionKeyBuilder;
 pub use cache::{digest_from_hex, Cache, Error, Result};
-pub use once_cas::{ActionResult, CacheProvider, Digest, Stats, TuistCacheConfig};
+pub use once_cas::{
+    ActionResult, CacheProvider, Digest, StagedBlob, StagedBlobReader, Stats, TuistCacheConfig,
+};
 
 mod action_key;
 mod cache;

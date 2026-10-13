@@ -36,7 +36,7 @@ pub use error::{Error, ErrorKind, Result};
 pub use gc::GcReport;
 pub use model::{ActionResult, Stats};
 pub use provider::CacheProvider;
-pub use store::Cas;
+pub use store::{Cas, StagedBlob, StagedBlobReader};
 pub use tuist::{
     ProjectCreateError, RemoteProject, TuistAuth, TuistAuthPrompt, TuistCacheConfig, TuistProjects,
     TUIST_APP_OAUTH_CLIENT_ID, TUIST_OAUTH_CLIENT_ID_ENV,

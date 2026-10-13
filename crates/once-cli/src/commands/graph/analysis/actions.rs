@@ -34,6 +34,8 @@ use super::source_digest_cache::SourceDigestCache;
 use super::{AvailableInput, BuildOutcome, PerActionOutcome};
 
 pub(super) mod legacy_outputs;
+mod pending_outputs;
+mod preparation;
 mod recovery;
 mod runner;
 
@@ -76,8 +78,9 @@ struct DeclaredActionOutcome {
     cache_state: EvidenceCacheState,
     result: ActionResult,
     evidence_record: Option<EvidenceRecord>,
-    /// Wall time spent hashing inputs, writing arg files, and
-    /// building the action digest (the "prepare" phase). Rendered as
+    restored_outputs: pending_outputs::Restoration,
+    /// Wall time spent hashing inputs and building the action digest
+    /// (the "prepare" phase). Rendered as
     /// a distinct sub-span so cache-hit runs still show what
     /// consumed the wall clock instead of a 1 ms dash.
     prepare_ms: i64,
@@ -150,11 +153,7 @@ impl DeclaredActionsState {
         per_action: Option<PerActionOutcome>,
         policy: &CachedResultPolicy,
     ) {
-        let restored = if outcome.cache_state == EvidenceCacheState::Hit {
-            Vec::new()
-        } else {
-            self.restored_before(policy)
-        };
+        pending_outputs::mark_restored(self, &outcome.restored_outputs);
         self.per_action_outcomes.extend(per_action);
         self.prior_actions_digest = Some(extend_prior_actions_digest(
             self.prior_actions_digest,
@@ -203,14 +202,6 @@ impl DeclaredActionsState {
                 self.intermediate_outputs.remove(path);
             }
         }
-        // What was restored before the action ran is on disk now, possibly
-        // with the action's changes inside it, so it must not be restored
-        // again for a later reader.
-        for path in restored {
-            if let Some(input) = self.available_inputs.get_mut(&path) {
-                input.materialized = true;
-            }
-        }
         if outcome.cache_state != EvidenceCacheState::Hit {
             output_state::forget_replaced_materializations(
                 &mut self.available_inputs,
@@ -231,21 +222,6 @@ impl DeclaredActionsState {
             restored_at_end: &self.cached_results,
             intermediate: &self.pending_intermediate,
         }
-    }
-
-    /// Paths of the pending outputs an action under `policy` found restored
-    /// before it ran.
-    fn restored_before(&self, policy: &CachedResultPolicy) -> Vec<String> {
-        let pending = self.pending();
-        let results = if policy.restores_prior {
-            pending.all().cloned().collect::<Vec<_>>()
-        } else {
-            overlapping_results(pending.all(), &policy.touched)
-        };
-        results
-            .into_iter()
-            .flat_map(|result| result.outputs.into_keys())
-            .collect()
     }
 
     fn take_evidence_records(&mut self) -> Vec<EvidenceRecord> {
@@ -551,7 +527,7 @@ pub(super) struct PendingResults<'a> {
 }
 
 impl<'a> PendingResults<'a> {
-    fn all(self) -> impl Iterator<Item = &'a ActionResult> {
+    fn all(self) -> impl DoubleEndedIterator<Item = &'a ActionResult> {
         self.restored_at_end.iter().chain(self.intermediate)
     }
 }
@@ -906,9 +882,6 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
         .executors(resources)?
         .acquire_materialization()
         .await;
-    materialize_declared_arg_files(workspace, &declared.arg_files).with_context(|| {
-        format!("writing arg files for action {index} for {target_id} ({identifier_for_error})")
-    })?;
     if let Some(inputs) = unmaterialized_inputs_for(&declared, available_inputs) {
         producers
             .verify_fingerprints(workspace, &inputs, &preparation)
@@ -956,19 +929,13 @@ async fn run_declared_action(run: DeclaredActionRun<'_>) -> Result<DeclaredActio
     let outcome = if cacheable {
         run_cacheable_declared_action(context, action, &declared).await
     } else {
-        restore_declared_inputs(
-            &context.repair(),
-            prior_cached_results,
-            &declared,
-            available_inputs,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "materializing inputs for action {index} for {target_id} ({identifier_for_error})"
-            )
-        })?;
-        run_uncacheable_declared_action(context, action, &declared).await
+        let restored_outputs = preparation::restore(&context, &declared).await?;
+        run_uncacheable_declared_action(context, action, &declared)
+            .await
+            .map(|mut outcome| {
+                outcome.restored_outputs = restored_outputs;
+                outcome
+            })
     };
     let execute_ms = i64::try_from(execute_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     outcome.map(|mut o| {
@@ -1054,7 +1021,8 @@ async fn run_cacheable_declared_action(
     action: Action,
     declared: &DeclaredAction,
 ) -> Result<DeclaredActionOutcome> {
-    let outcome = resolve_cacheable_declared_action(&context, &action, declared).await?;
+    let (outcome, restored_outputs) =
+        resolve_cacheable_declared_action(&context, &action, declared).await?;
     let exit_code = outcome.result.exit_code;
     if exit_code != 0 {
         record_declared_action_evidence(
@@ -1114,6 +1082,7 @@ async fn run_cacheable_declared_action(
         cache_state,
         result: outcome.result,
         evidence_record,
+        restored_outputs,
         // The outer `run_declared_action` fills these in after
         // observing prepare + execute spans from the outside.
         prepare_ms: 0,
@@ -1174,6 +1143,7 @@ fn record_producer(
             .operation
             .is_none()
             .then(|| recovery::CommandSetup {
+                arg_files: declared.arg_files.clone(),
                 clean_paths: declared.clean_paths.clone(),
                 create_dirs: declared.create_dirs.clone(),
             }),
@@ -1186,7 +1156,7 @@ async fn resolve_cacheable_declared_action(
     context: &DeclaredActionContext<'_>,
     action: &Action,
     declared: &DeclaredAction,
-) -> Result<once_core::Outcome> {
+) -> Result<(once_core::Outcome, pending_outputs::Restoration)> {
     // clean_paths and create_dirs model the command's own filesystem
     // setup, so they must only run when the command actually executes.
     // A cache hit does not run command setup. Removing a clean_paths entry on
@@ -1202,24 +1172,12 @@ async fn resolve_cacheable_declared_action(
     if reusable {
         if let Some(outcome) = probe_cached_action(context, action_digest).await? {
             context.claim_worker().await;
-            return Ok(outcome);
+            return Ok((outcome, pending_outputs::Restoration::default()));
         }
     }
     // Inputs go on disk before admission: restoring one can mean running its
     // producer again, which needs capacity of its own.
-    restore_declared_inputs(
-        &context.repair(),
-        context.prior_cached_results,
-        declared,
-        context.available_inputs,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "materializing inputs for action {} for {} ({})",
-            context.index, context.target_id, context.identifier
-        )
-    })?;
+    let restored_outputs = preparation::restore(context, declared).await?;
     let outcome = recovery::with_action_lock_and_permit(
         context.workspace,
         action_digest,
@@ -1250,7 +1208,7 @@ async fn resolve_cacheable_declared_action(
             cache.record_outputs(&outcome.result, context.workspace);
         }
     }
-    Ok(outcome)
+    Ok((outcome, restored_outputs))
 }
 
 /// The cached result for the action, when every blob it names can still be
@@ -1346,22 +1304,7 @@ async fn execute_declared_cache_miss(
     declared: &DeclaredAction,
     lease: once_core::ExecutionPermit,
 ) -> Result<once_core::Outcome> {
-    if declared.operation.is_none() {
-        prepare_command_setup_admitted(
-            context.workspace,
-            context.cache,
-            &declared.clean_paths,
-            &declared.create_dirs,
-            &lease,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "preparing action {} for {} ({})",
-                context.index, context.target_id, context.identifier
-            )
-        })?;
-    }
+    preparation::setup(context, declared, &lease).await?;
     let result = once_core::run_uncached_admitted(
         action,
         context.workspace,
@@ -1433,21 +1376,23 @@ fn unmaterialized_inputs_for(
     })
 }
 
-/// Put what the action reads on disk, running the producer of anything the
-/// cache confirms it lost. Callers must not hold an admission permit.
-async fn restore_declared_inputs(
-    repair: &Repair<'_>,
-    pending: PendingResults<'_>,
-    declared: &DeclaredAction,
-    available_inputs: &BTreeMap<String, AvailableInput>,
+#[cfg(test)]
+async fn materialize_prior_cached_results(
+    workspace: &Path,
+    cache: &CacheProvider,
+    results: &[ActionResult],
+    digests: Option<&SourceDigestCache>,
 ) -> Result<()> {
-    for result in prior_results_for(pending, declared) {
-        repair.restore(&result).await?;
-    }
-    if let Some(result) = unmaterialized_inputs_for(declared, available_inputs) {
-        repair.restore(&result).await?;
-    }
-    Ok(())
+    let resources = Arc::new(ResourcePool::new(once_core::ResourceLimits::default()));
+    let producers = Producers::default();
+    let repair = Repair {
+        workspace,
+        cache,
+        source_digest_cache: digests,
+        resources: &resources,
+        producers: &producers,
+    };
+    super::materialization::restore_recovering(results, repair).await
 }
 
 /// Put an action's outputs back on disk, skipping the ones already there.
@@ -1486,23 +1431,17 @@ async fn run_uncacheable_declared_action(
         .acquire(once_core::Executor::Local, action.resource_request())
         .await;
     context.claim_worker().await;
-    if declared.operation.is_none() {
-        prepare_command_setup_admitted(
+    preparation::setup(&context, declared, &lease).await?;
+    let result = once_core::with_execution_permit(
+        lease.clone(),
+        Box::pin(run_uncached_action_admitted(
+            &action,
             context.workspace,
             context.cache,
-            &declared.clean_paths,
-            &declared.create_dirs,
-            &lease,
-        )
-        .await?;
-    }
-    let result = run_uncached_action_admitted(
-        &action,
-        context.workspace,
-        context.cache,
-        declared.inherit_parent_env,
-        Some(lease),
-        Some((context.producers, context.identifier)),
+            declared.inherit_parent_env,
+            Some(lease),
+            Some((context.producers, context.identifier)),
+        )),
     )
     .await
     .with_context(|| {
@@ -1566,6 +1505,7 @@ async fn run_uncacheable_declared_action(
         cache_state: EvidenceCacheState::Bypass,
         result,
         evidence_record,
+        restored_outputs: pending_outputs::Restoration::default(),
         prepare_ms: 0,
         execute_ms: 0,
     })

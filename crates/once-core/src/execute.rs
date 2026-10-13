@@ -70,6 +70,30 @@ pub(crate) async fn run_admitted(
     observer: Option<&dyn ActionOutputObserver>,
     lease: Option<ExecutionPermit>,
 ) -> Result<ActionResult> {
+    let work = Box::pin(run_scoped(
+        action,
+        workspace_root,
+        cache,
+        stream_to_parent,
+        validate_contract,
+        observer,
+        lease.clone(),
+    ));
+    match lease {
+        Some(lease) => crate::with_execution_permit(lease, work).await,
+        None => work.await,
+    }
+}
+
+async fn run_scoped(
+    action: &Action,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    stream_to_parent: bool,
+    validate_contract: bool,
+    observer: Option<&dyn ActionOutputObserver>,
+    lease: Option<ExecutionPermit>,
+) -> Result<ActionResult> {
     if let Action::RunCommand {
         outputs,
         output_symlink_mode,
@@ -119,10 +143,10 @@ where
     T: Send + 'static,
 {
     let lease = lease.cloned();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(crate::resource_scope::owned_blocking(move || {
         let _lease = lease;
         work()
-    })
+    }))
 }
 
 /// [`spawn_admitted`] for one I/O step, reported as a failed `action` on

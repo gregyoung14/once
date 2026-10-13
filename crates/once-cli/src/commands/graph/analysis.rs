@@ -17,6 +17,7 @@
 
 mod actions;
 mod analysis_memo;
+mod materialization;
 mod output_state;
 mod resolution_cache;
 mod scheduler;
@@ -909,65 +910,7 @@ async fn intermediate_outputs_cached(
 /// replaces part of an earlier one. The rest touch disjoint paths and restore
 /// concurrently, bounded by how many actions may run at once.
 async fn materialize_cached_outputs(outcome: &BuildOutcome, repair: Repair<'_>) -> Result<()> {
-    use futures::StreamExt as _;
-
-    let (independent, ordered) = partition_overlapping(&outcome.cached_results);
-    let limit = repair.resources.max_parallel_actions().max(1);
-    let mut waiting = independent.into_iter();
-    let mut restoring = futures::stream::FuturesUnordered::new();
-    loop {
-        while restoring.len() < limit {
-            let Some(result) = waiting.next() else { break };
-            restoring.push(repair.restore(result));
-        }
-        match restoring.next().await {
-            Some(restored) => restored?,
-            None => break,
-        }
-    }
-    for result in ordered {
-        repair.restore(result).await?;
-    }
-    Ok(())
-}
-
-/// Split results into those whose outputs overlap no other result's and the
-/// rest, which keep their order.
-fn partition_overlapping(results: &[ActionResult]) -> (Vec<&ActionResult>, Vec<&ActionResult>) {
-    let mut owners: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (index, result) in results.iter().enumerate() {
-        for path in result.outputs.keys() {
-            owners.entry(path.as_str()).or_default().push(index);
-        }
-    }
-    let mut overlapping = vec![false; results.len()];
-    for (index, result) in results.iter().enumerate() {
-        for path in result.outputs.keys() {
-            let mut candidate = path.as_str();
-            let mut others = owners
-                .get(candidate)
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>();
-            while let Some((parent, _)) = candidate.rsplit_once('/') {
-                others.extend(owners.get(parent).into_iter().flatten().copied());
-                candidate = parent;
-            }
-            for other in others.into_iter().filter(|other| *other != index) {
-                overlapping[index] = true;
-                overlapping[other] = true;
-            }
-        }
-    }
-    let (ordered, independent): (Vec<_>, Vec<_>) = results
-        .iter()
-        .zip(overlapping)
-        .partition(|(_, overlapping)| *overlapping);
-    (
-        independent.into_iter().map(|(result, _)| result).collect(),
-        ordered.into_iter().map(|(result, _)| result).collect(),
-    )
+    materialization::restore_recovering(&outcome.cached_results, repair).await
 }
 
 /// Resolve the executables declared by the graph's tools to concrete

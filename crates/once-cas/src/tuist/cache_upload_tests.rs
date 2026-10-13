@@ -8,6 +8,11 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use tonic::Response;
 
+#[path = "cache_publication_benchmarks.rs"]
+mod publication_benchmarks;
+#[path = "cache_publication_tests.rs"]
+mod publication_tests;
+
 type RpcResult<T> = std::result::Result<Response<T>, Status>;
 type ReadStream = Pin<
     Box<dyn futures::Stream<Item = std::result::Result<bytestream::ReadResponse, Status>> + Send>,
@@ -258,6 +263,82 @@ async fn fixture_with_timeout(
 }
 
 #[tokio::test]
+#[ignore = "manual transfer performance measurement"]
+async fn benchmark_large_stream_uploads() {
+    let mut state = 0x1234_5678_u64;
+    let bytes: Vec<u8> = (0..32 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (cache, service, server) = fixture(&temp).await;
+        let digest = cache.local.put_blob(&bytes).await.unwrap();
+        let started = Instant::now();
+        cache
+            .upload_local_blob(Some(&digest), "put action result")
+            .await
+            .unwrap();
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        let state = service.0.lock().await;
+        assert_eq!(state.writes.len(), 1);
+        let uploaded: Vec<u8> = state.writes[0]
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(uploaded, bytes);
+        assert_eq!(state.actions.len(), 1);
+        server.abort();
+    }
+    samples.sort_by(f64::total_cmp);
+    println!("METRIC stream_upload_ms={}", samples[3]);
+    println!("METRIC upload_mib_per_s={}", 32_000.0 / samples[3]);
+}
+
+#[tokio::test]
+async fn staging_hashes_decoded_blobs_and_rejects_corruption_before_remote_publication() {
+    for payload in [b"raw blob".to_vec(), vec![42; 256 * 1024]] {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (cache, service, server) = fixture(&temp).await;
+        let digest = cache.local.put_blob(&payload).await.unwrap();
+        let remote = cache
+            .upload_local_blob(Some(&digest), "put action result")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote, sha256_digest(&payload).unwrap());
+        let state = service.0.lock().await;
+        assert_eq!(state.writes.len(), 1);
+        let uploaded: Vec<_> = state.writes[0]
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(uploaded, payload);
+        drop(state);
+        server.abort();
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (cache, service, server) = fixture(&temp).await;
+        let digest = cache.local.put_blob(&payload).await.unwrap();
+        std::fs::write(cache.local.blob_path(&digest), b"wrong bytes").unwrap();
+        assert!(cache
+            .upload_local_blob(Some(&digest), "put action result")
+            .await
+            .is_err());
+        let state = service.0.lock().await;
+        assert!(state.heads.is_empty());
+        assert!(state.writes.is_empty());
+        assert!(state.actions.is_empty());
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn blob_publication_recovers_from_transient_head_upload_and_mapping_failures() {
     let temp = tempfile::TempDir::new().unwrap();
     let (cache, service, server) = fixture(&temp).await;
@@ -426,7 +507,20 @@ async fn streamed_upload_outlasts_the_request_timeout_while_it_progresses() {
         }
         let state = service.0.lock().await;
         assert_eq!(state.writes.len(), 1);
-        assert_eq!(state.writes[0].len(), 8);
+        let chunks = &state.writes[0];
+        assert_eq!(
+            chunks.iter().filter(|chunk| !chunk.data.is_empty()).count(),
+            8
+        );
+        assert_eq!(chunks.len(), if from_file { 9 } else { 8 });
+        assert!(chunks.last().unwrap().finish_write);
+        assert!(chunks[..chunks.len() - 1]
+            .iter()
+            .all(|chunk| !chunk.finish_write));
+        if from_file {
+            assert!(chunks.last().unwrap().data.is_empty());
+            assert_eq!(chunks.last().unwrap().write_offset, digest.size_bytes);
+        }
         server.abort();
     }
 }

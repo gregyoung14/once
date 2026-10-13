@@ -170,8 +170,9 @@ carves cache memory out of its command budget, rather than granting cache work
 an additional full allowance alongside action reservations. Required buffers
 must not be silently clamped or untrusted declared sizes allowed to grow disk
 without admission. Capacities round down and requests round up to 4 KiB units.
-The minimum CLI cache allowance is 32 MiB + 64 KiB, derived from the streamed
-message decoder and bounded pipe. Finite budgets reserve one eighth, clamped to
+The minimum CLI cache allowance remains 32 MiB + 64 KiB. Streamed ingestion
+includes bounded codec and producer queues in that allowance, reducing its
+message ceiling when necessary rather than adding buffers outside the budget. Finite budgets reserve one eighth, clamped to
 that floor and 256 MiB, and give actions exactly the remainder. Totals at or below
 the floor fail rather than creating a zero action budget that means unbounded.
 MCP/runtime sessions reserve headroom for later provider changes even if initially
@@ -393,3 +394,37 @@ from a green baseline. Preliminary checks run before the intermediate-hop fix,
 and checks overlapping mutation edits, are not final acceptance. All mutations
 were restored before the settled-tree commands above; ShellSpec used its rebuilt
 release binary.
+
+### Streaming Integration Acceptance
+
+Integrating the newer streaming and selective-materialization paths retains
+executor leases and their lifetime owners in scoped filesystem workers,
+including opportunistic extra workers. Producer recovery still runs only for
+confirmed missing blobs, outside consumer admission. It now recreates deferred
+argument files under the producer lease, so a cached producer need not have
+written those files before a later repair. A regression fails without this
+recreation and passes with it.
+
+Read-only staging verifies both pinned raw blobs and decoded blobs before
+returning a reader, with one remote refetch after local corruption. Download
+workers retain transfer reservations after observer cancellation. Raw and
+encoded scratch files are admitted together, and encoded body growth is
+bounded. This deliberately raises the staging requirement to slightly more than
+twice the declared raw size; it does not change action identities, artifact
+bytes, or the cache-centered SDK scope. The SDK guides describe the accounting
+and compatibility cost.
+
+The integrated settled tree passed:
+
+- `mise exec -- cargo test --workspace`: 579 CLI, 471 core, and 262 CAS unit
+  tests passed, together with workspace integration and documentation tests.
+- `mise exec -- cargo test -p once-core --all-targets --no-default-features`.
+- `mise exec -- cargo clippy --workspace --all-targets -- -D warnings`.
+- `mise exec -- cargo clippy -p once-core --all-targets --no-default-features -- -D warnings`.
+- `mise exec -- cargo fmt --all -- --check` and `git diff --check`.
+- `mise exec -- cargo build --release`, rebuilt after the production changes.
+- `ONCE_RUN_MICROSANDBOX_SPECS=1 mise exec -- shellspec`: 328 examples, zero
+  failures, seven existing Cargo/container skips, 614.30 seconds.
+
+The earlier adversarial review applies to its reviewed tree. These integration
+checks do not supersede the separate live-platform and future-feature gates.

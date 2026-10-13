@@ -11,7 +11,7 @@ use once_frontend::analysis::{AnalysisResult, DeclaredActionOperation};
 use once_frontend::GraphTarget;
 
 use super::{
-    expose_target_tools, restore_declared_inputs, run_declared_action, scheduling, AvailableInput,
+    expose_target_tools, pending_outputs, run_declared_action, scheduling, AvailableInput,
     BuildOutcome, DeclaredActionRun, DeclaredActionsState, Producers, Repair, SourceDigestCache,
     WorkerLease, EVIDENCE_FLUSH_BATCH_SIZE,
 };
@@ -171,13 +171,14 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions_with<'a>(
                 // Restored without a permit: a lost input may need its
                 // producer to run again, which needs capacity of its own.
                 for action in &batch {
-                    restore_declared_inputs(
+                    let restored = pending_outputs::restore_admitted(
                         &repair,
                         state.pending(),
-                        action,
                         &state.available_inputs,
+                        action,
                     )
                     .await?;
+                    pending_outputs::mark_restored(&mut state, &restored);
                 }
             }
             for action in &batch {

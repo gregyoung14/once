@@ -1,12 +1,13 @@
 //! Remote transfers draw from a shared byte budget: disk is reserved before a
 //! download streams, capacity returns on every exit path, and a budget too
-//! small for a request degrades to running alone instead of deadlocking.
+//! small for a request refuses it instead of deadlocking.
 
 use super::fault_server::{connected_cache, FaultServer};
 use super::fault_tests::publish_large;
 use super::*;
 
 const LARGE: u64 = 2 * download::IN_MEMORY_BLOB_LIMIT as u64;
+const LARGE_STAGING: u64 = stream_limits::staging_bytes(LARGE);
 
 async fn served_large() -> (tempfile::TempDir, FaultServer, String, Digest, Vec<u8>) {
     let temp = tempfile::TempDir::new().unwrap();
@@ -66,7 +67,7 @@ async fn short_and_long_streams_fail_their_size_check_and_return_their_budget() 
             state.read_replacement = replacement;
             state.read_suffix = suffix;
         }
-        let budget = TransferBudget::new(64 * 1024 * 1024, LARGE);
+        let budget = TransferBudget::new(64 * 1024 * 1024, LARGE_STAGING);
         let cache = reader(&temp, "mismatch", &url, &budget).await;
 
         let error = cache.ensure_blob_local(&digest).await.unwrap_err();
@@ -83,7 +84,7 @@ async fn cancelled_concurrent_downloads_release_their_budget_and_scratch() {
     let (temp, server, url, digest, bytes) = served_large().await;
     server.0.lock().await.read_stalls = true;
     // Staging fits one download at a time, so the others queue for it.
-    let budget = TransferBudget::new(64 * 1024 * 1024, LARGE);
+    let budget = TransferBudget::new(64 * 1024 * 1024, LARGE_STAGING);
     let mut caches = Vec::new();
     for index in 0..4 {
         caches.push(reader(&temp, &format!("cancel-{index}"), &url, &budget).await);
@@ -95,9 +96,13 @@ async fn cancelled_concurrent_downloads_release_their_budget_and_scratch() {
             tokio::spawn(async move { cache.ensure_blob_local(&digest).await })
         })
         .collect();
-    while server.calls("read").await < 1 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.calls("read").await < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the admitted download opens its stream");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         server.calls("read").await,
@@ -112,7 +117,13 @@ async fn cancelled_concurrent_downloads_release_their_budget_and_scratch() {
     for task in tasks {
         assert!(task.await.unwrap_err().is_cancelled());
     }
-    assert_eq!(budget.available(), full(&budget));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget.available() != full(&budget) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("physical ingestion releases its budget after cancellation");
     assert!(caches.iter().all(scratch_is_empty));
 
     server.0.lock().await.read_stalls = false;
@@ -180,7 +191,10 @@ async fn served_beyond_one_message() -> (tempfile::TempDir, FaultServer, String,
 #[tokio::test]
 async fn the_minimum_budget_downloads_a_blob_larger_than_one_stream_message() {
     let (temp, server, url, digest, bytes) = served_beyond_one_message().await;
-    let budget = TransferBudget::new(crate::MIN_TRANSFER_MEMORY_BYTES, bytes.len() as u64);
+    let budget = TransferBudget::new(
+        crate::MIN_TRANSFER_MEMORY_BYTES,
+        stream_limits::staging_bytes(bytes.len() as u64),
+    );
     assert_eq!(budget.memory_bytes(), crate::MIN_TRANSFER_MEMORY_BYTES);
     let cache = reader(&temp, "minimum", &url, &budget).await;
 
@@ -200,7 +214,10 @@ async fn the_minimum_budget_downloads_a_blob_larger_than_one_stream_message() {
 async fn one_unit_below_the_minimum_refuses_that_download_before_reading() {
     let (temp, server, url, digest, bytes) = served_beyond_one_message().await;
     // Not a whole unit short: the capacity rounds down to one unit less.
-    let budget = TransferBudget::new(crate::MIN_TRANSFER_MEMORY_BYTES - 1, bytes.len() as u64);
+    let budget = TransferBudget::new(
+        crate::MIN_TRANSFER_MEMORY_BYTES - 1,
+        stream_limits::staging_bytes(bytes.len() as u64),
+    );
     assert_eq!(
         budget.memory_bytes(),
         crate::MIN_TRANSFER_MEMORY_BYTES - 4096
@@ -220,8 +237,8 @@ async fn one_unit_below_the_minimum_refuses_that_download_before_reading() {
 #[tokio::test]
 async fn concurrent_work_queues_on_a_budget_that_fits_one_transfer() {
     let (temp, server, url, digest, bytes) = served_large().await;
-    let one_stream = LARGE + 128 * 1024;
-    let budget = TransferBudget::new(one_stream, LARGE);
+    let one_stream = crate::MIN_TRANSFER_MEMORY_BYTES;
+    let budget = TransferBudget::new(one_stream, LARGE_STAGING);
     let readers = futures::future::join_all((0..6).map(|index| {
         let (temp, url, budget) = (&temp, &url, &budget);
         async move { reader(temp, &format!("queued-{index}"), url, budget).await }

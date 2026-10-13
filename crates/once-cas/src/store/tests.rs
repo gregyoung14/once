@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 
 #[test]
 fn open_does_no_io() {
@@ -201,8 +202,6 @@ async fn put_stream_handles_empty_input() {
 
 #[tokio::test]
 async fn put_stream_handles_payload_larger_than_chunk() {
-    // STREAM_CHUNK = 64 KiB; use a payload that crosses the
-    // boundary several times to exercise the loop.
     let tmp = TempDir::new().unwrap();
     let cas = Cas::open(tmp.path());
     let payload: Vec<u8> = (0..(STREAM_CHUNK * 3 + 7))

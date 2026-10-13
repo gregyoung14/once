@@ -107,8 +107,11 @@ impl ResourcePool {
             "resource request acquired"
         );
         ResourcePermit {
-            pool: Arc::clone(self),
-            request,
+            reservation: Arc::new(Reservation {
+                pool: Arc::clone(self),
+                request,
+            }),
+            owners: Vec::new(),
         }
     }
 
@@ -183,27 +186,54 @@ impl Drop for Ticket<'_> {
 ///
 /// Releasing is tied to `Drop`, so a panicking or cancelled action cannot
 /// leak its reservation and starve the pool.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct ResourcePermit {
-    pool: Arc<ResourcePool>,
-    request: ResourceRequest,
+    reservation: Arc<Reservation>,
+    owners: Vec<Arc<dyn Send + Sync>>,
+}
+
+impl std::fmt::Debug for ResourcePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResourcePermit")
+            .field("request", self.request())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResourcePermit {
     pub(crate) fn request(&self) -> &ResourceRequest {
-        &self.request
+        &self.reservation.request
+    }
+
+    pub(crate) fn with_lifetime_owner(mut self, owner: impl Send + Sync + 'static) -> Self {
+        self.owners.push(Arc::new(owner));
+        self
+    }
+
+    pub(crate) fn try_additional_default(&self) -> Option<Self> {
+        use futures::FutureExt;
+        let mut extra = self
+            .reservation
+            .pool
+            .acquire(ResourceRequest::default())
+            .now_or_never()?;
+        extra.owners.clone_from(&self.owners);
+        Some(extra)
     }
 }
 
-impl Drop for ResourcePermit {
+#[derive(Debug)]
+struct Reservation {
+    pool: Arc<ResourcePool>,
+    request: ResourceRequest,
+}
+
+impl Drop for Reservation {
     fn drop(&mut self) {
         self.pool.release(&self.request);
-        debug!(
-            request_cpu_slots = self.request.cpu_slots,
-            request_memory_bytes = self.request.memory_bytes,
-            request_slots = ?self.request.slots,
-            "resource request released"
-        );
+        debug!(request_cpu_slots = self.request.cpu_slots, request_memory_bytes = self.request.memory_bytes,
+            request_slots = ?self.request.slots, "resource request released");
     }
 }
 

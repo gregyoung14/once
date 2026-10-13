@@ -41,6 +41,9 @@ libc.workspace = true
 [target.'cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 microsandbox = { git = "https://github.com/superradcompany/microsandbox.git", rev = "975b62bfd331df7111b2de9abc1416fc87d7790b", version = "0.5.1", default-features = false, features = ["prebuilt"], optional = true }
 
+[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 

@@ -13,7 +13,7 @@ use sha2::Digest as _;
 use tokio::io::AsyncWriteExt;
 
 use super::*;
-use crate::store::StagedBlob;
+use crate::store::PendingBlob;
 
 /// Largest blob read whole into memory from the remote tier.
 pub(super) const IN_MEMORY_BLOB_LIMIT: i64 = BATCH_BLOB_LIMIT_I64;
@@ -22,15 +22,6 @@ pub(super) const IN_MEMORY_BLOB_LIMIT: i64 = BATCH_BLOB_LIMIT_I64;
 const FRAMING_SLACK: usize = 16 * 1024;
 #[allow(clippy::cast_possible_truncation)]
 const DUPLEX_BUFFER: usize = crate::budget::STREAM_PIPE_BYTES as usize;
-
-/// Largest `ByteStream` read message accepted for a blob of `declared` bytes:
-/// the whole blob plus framing, never more than the transport-wide cap.
-fn stream_message_limit(declared: u64) -> usize {
-    usize::try_from(declared)
-        .unwrap_or(usize::MAX)
-        .saturating_add(FRAMING_SLACK)
-        .min(BYTE_STREAM_MESSAGE_LIMIT)
-}
 
 /// Largest `BatchReadBlobs` response accepted for one blob of `declared`
 /// bytes, allowing for a zstd frame that is slightly larger than its input.
@@ -53,48 +44,6 @@ const _: () = {
 };
 
 impl TuistCache {
-    pub async fn ensure_blob_local(&self, digest: &Digest) -> Result<()> {
-        if self.local.has_blob(digest).await? {
-            return Ok(());
-        }
-        if is_empty_blob(digest) {
-            self.local.mirror_blob(digest, &[]).await?;
-            return Ok(());
-        }
-        let remote_digest = self.remote_blob_digest(digest).await?;
-        let started = Instant::now();
-        let staged = retry::grpc("get blob", || {
-            self.stage_remote_blob(&remote_digest, "get blob")
-        })
-        .await
-        .map_err(|error| {
-            if error.is_not_found() {
-                Error::BlobNotFound(*digest)
-            } else {
-                error
-            }
-        })?;
-        if staged.digest() != *digest {
-            return Err(status::remote(
-                "get blob",
-                ErrorKind::Corrupt,
-                format!(
-                    "remote blob {digest} failed verification: content hashes to {}",
-                    staged.digest()
-                ),
-            ));
-        }
-        let size = staged.len();
-        self.local.commit_staged(staged).await?;
-        transfer::record(
-            TransferDirection::Download,
-            *digest,
-            size,
-            started.elapsed(),
-        );
-        Ok(())
-    }
-
     /// Streams one remote blob into scratch space. Each attempt opens a fresh
     /// read stream, so a dropped HTTP/2 stream can be retried. The staged
     /// blob is returned only if its size and SHA-256 match `remote_digest`;
@@ -103,25 +52,23 @@ impl TuistCache {
         &self,
         remote_digest: &reapi::Digest,
         operation: &'static str,
-    ) -> std::result::Result<StagedBlob, retry::Failure> {
+    ) -> std::result::Result<PendingBlob, retry::Failure> {
         let declared = declared_size(remote_digest, operation)?;
-        // Disk for the whole declared size is reserved before the stream is
-        // opened, and staging stops one byte past it, so a size the remote
-        // declares cannot write more than the staging budget allows. Budgets
-        // are taken before the transfer slot, the order every transfer uses,
-        // and are returned when this attempt ends or is cancelled.
-        let _staging = self.budget.reserve_staging(declared).await?;
-        // The decoder never accepts a message larger than the blob plus its
-        // framing, and that cap is exactly what is reserved, so the buffers
-        // this read can hold are the ones the budget admitted.
-        let message_limit = stream_message_limit(declared);
-        let _memory = self
+        // Raw and encoded staging precede memory and the transfer slot, so
+        // concurrent transfers cannot cycle while holding partial capacity.
+        let staging = self
             .budget
-            .reserve_memory(message_limit as u64 + DUPLEX_BUFFER as u64)
+            .reserve_staging(stream_limits::staging_bytes(declared))
             .await?;
-        let _permit = self
-            .transfer_limit
-            .acquire()
+        // Leave codec and queue capacity inside the same reservation.
+        let message_bytes = stream_limits::message_bytes(declared, self.budget.memory_bytes());
+        let message_limit = usize::try_from(message_bytes).unwrap_or(BYTE_STREAM_MESSAGE_LIMIT);
+        let memory = self
+            .budget
+            .reserve_memory(stream_limits::memory_bytes(message_bytes))
+            .await?;
+        let permit = Arc::clone(&self.transfer_limit)
+            .acquire_owned()
             .await
             .expect("transfer semaphore remains open");
         let channel = self.grpc_channel().await?;
@@ -172,7 +119,7 @@ impl TuistCache {
         };
         let store = async {
             self.local
-                .stage_stream(reader, declared)
+                .stage_stream_guarded(reader, declared, (permit, memory, staging))
                 .await
                 .map_err(|error| match error {
                     error if error.is_corrupt() => retry::Failure::Local(status::remote(

@@ -366,7 +366,7 @@ async fn a_declared_size_never_drives_allocation_or_acceptance() {
 
     // A budget that admits it still rejects the short body by its size.
     let mut generous = connected_cache(&temp, "generous-reader", &url).await;
-    generous.set_transfer_budget(crate::TransferBudget::new(64 << 20, 1 << 41));
+    generous.set_transfer_budget(crate::TransferBudget::new(64 << 20, 1 << 42));
     let error = generous.get_action_result(&action).await.unwrap_err();
     assert!(error.is_corrupt(), "{error}");
     assert_eq!(server.calls("batch_read").await, 0);

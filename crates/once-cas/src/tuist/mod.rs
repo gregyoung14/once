@@ -1,6 +1,7 @@
 mod auth;
 mod cache;
 mod file_body;
+mod flights;
 #[cfg(test)]
 pub(crate) mod log_capture;
 mod projects;

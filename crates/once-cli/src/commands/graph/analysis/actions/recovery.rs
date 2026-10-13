@@ -113,6 +113,7 @@ pub(in crate::commands::graph::analysis) struct ProducerReport {
 }
 
 pub(in crate::commands::graph::analysis) struct CommandSetup {
+    pub(super) arg_files: Vec<once_frontend::analysis::DeclaredArgFile>,
     pub(super) clean_paths: Vec<String>,
     pub(super) create_dirs: Vec<String>,
 }
@@ -591,6 +592,8 @@ impl Repair<'_> {
                             &lease,
                         )
                         .await?;
+                        super::preparation::write_args(self.workspace, &setup.arg_files, &lease)
+                            .await?;
                     }
                     let result = once_core::run_uncached_admitted(
                         &producer.action,

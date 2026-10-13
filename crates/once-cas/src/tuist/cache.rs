@@ -28,13 +28,17 @@ use uuid::Uuid;
 use super::recovery::Recovering;
 use super::status;
 use super::{
-    env_token, file_body, join_url, redact, retry, stall, TuistAuth, TuistCacheConfig,
-    ENDPOINTS_PATH, PROVIDER_NAME,
+    env_token, file_body, flights::Flights, join_url, redact, retry, stall, TuistAuth,
+    TuistCacheConfig, ENDPOINTS_PATH, PROVIDER_NAME,
 };
 use crate::transfer::{self, TransferDirection};
 use crate::{ActionResult, Cas, Digest, Error, ErrorKind, Result, TransferBudget};
 
 mod download;
+mod stream_limits;
+
+#[path = "cache_download.rs"]
+mod stream_download;
 
 /// Ceiling on blobs transferred to or from the remote cache at once. The
 /// number of outputs comes from a remote `ActionResult` (untrusted), and
@@ -94,6 +98,8 @@ pub struct TuistCache {
     stream_stall_timeout: Duration,
     capabilities_cache: Arc<Recovering<RemoteCapabilities>>,
     known_remote_blobs: Arc<Mutex<HashMap<Digest, reapi::Digest>>>,
+    publication_flights: Arc<Flights>,
+    download_flights: Arc<Flights>,
     transfer_limit: Arc<Semaphore>,
     budget: TransferBudget,
     auth: TuistAuth,
@@ -145,6 +151,8 @@ impl TuistCache {
             stream_stall_timeout: STREAM_STALL_TIMEOUT,
             capabilities_cache: Arc::default(),
             known_remote_blobs: Arc::new(Mutex::new(HashMap::new())),
+            publication_flights: Arc::new(Flights::default()),
+            download_flights: Arc::new(Flights::default()),
             transfer_limit: Arc::new(Semaphore::new(MAX_PARALLEL_TRANSFERS)),
             budget: TransferBudget::default(),
             auth,
@@ -195,10 +203,15 @@ impl TuistCache {
 
         let remote_digest = self.remote_blob_digest(digest).await?;
         if remote_digest.size_bytes > download::IN_MEMORY_BLOB_LIMIT {
-            // Too large to read into memory from the remote: stream it into
-            // the local tier, verified, and read the caller's copy from there.
             self.ensure_blob_local(digest).await?;
             return self.local.get_blob(digest).await;
+        }
+        let _flight = self.download_flights.acquire(*digest).await;
+        match self.local.get_blob(digest).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(Error::BlobNotFound(_)) => {}
+            Err(error) if error.is_corrupt() => {}
+            Err(error) => return Err(error),
         }
         let started = Instant::now();
         let bytes = self.get_blob_remote(digest, &remote_digest).await?;
@@ -244,6 +257,41 @@ impl TuistCache {
                 "failed to upload blob to remote cache"
             );
         }
+    }
+
+    pub async fn ensure_blob_local(&self, digest: &Digest) -> Result<()> {
+        self.ensure_blob_local_guarded(digest, ()).await
+    }
+
+    pub(crate) async fn ensure_blob_local_guarded<G: Clone + Send + 'static>(
+        &self,
+        digest: &Digest,
+        guard: G,
+    ) -> Result<()> {
+        if self.local.has_blob(digest).await? {
+            return Ok(());
+        }
+        if is_empty_blob(digest) {
+            self.local.mirror_blob(digest, &[]).await?;
+            return Ok(());
+        }
+        let _flight = self.download_flights.acquire(*digest).await;
+        if self.local.has_blob(digest).await? {
+            return Ok(());
+        }
+        let remote_digest = self.remote_blob_digest(digest).await?;
+        let started = Instant::now();
+        retry::grpc("get blob", || {
+            self.stream_remote_blob(digest, &remote_digest, guard.clone())
+        })
+        .await?;
+        transfer::record(
+            TransferDirection::Download,
+            *digest,
+            u64::try_from(remote_digest.size_bytes).unwrap_or_default(),
+            started.elapsed(),
+        );
+        Ok(())
     }
 
     pub async fn put_blob(&self, bytes: &[u8]) -> Result<Digest> {
@@ -345,6 +393,7 @@ impl TuistCache {
                 format!("blob body did not match digest {digest}"),
             ));
         }
+        let _flight = self.publication_flights.acquire(*digest).await;
         if let Some(remote_digest) = self.known_remote_blobs.lock().await.get(digest).cloned() {
             return Ok(remote_digest);
         }
@@ -446,6 +495,7 @@ impl TuistCache {
         let Some(digest) = digest else {
             return Ok(None);
         };
+        let _flight = self.publication_flights.acquire(*digest).await;
         if let Some(remote_digest) = self.known_remote_blobs.lock().await.get(digest).cloned() {
             return Ok(Some(remote_digest));
         }
@@ -461,17 +511,11 @@ impl TuistCache {
             source,
         })?;
         let path = directory.path().join("blob");
-        self.local.copy_blob_to_file(digest, &path).await?;
-        let digest_to_verify = *digest;
-        let hash_path = path.clone();
-        let (once_digest, remote_digest) =
-            tokio::task::spawn_blocking(move || file_digests(&hash_path))
-                .await
-                .map_err(|source| Error::Io {
-                    path: path.clone(),
-                    source: std::io::Error::other(source.to_string()),
-                })??;
-        if once_digest != digest_to_verify {
+        let (once_digest, remote_digest) = self
+            .local
+            .copy_blob_to_file_with(digest, &path, copy_blob_digests)
+            .await?;
+        if once_digest != *digest {
             return Err(status::remote(
                 operation,
                 ErrorKind::Corrupt,
@@ -1657,7 +1701,8 @@ fn grpc_endpoint(endpoint: &str) -> std::result::Result<Endpoint, String> {
     let invalid = || format!("invalid cache endpoint {}", redact::endpoint(endpoint));
     let mut endpoint = Endpoint::from_shared(endpoint_url.clone())
         .map_err(|_| invalid())?
-        .connect_timeout(ENDPOINT_PROBE_TIMEOUT);
+        .connect_timeout(ENDPOINT_PROBE_TIMEOUT)
+        .http2_adaptive_window(true);
     if endpoint_url.starts_with("https://") {
         endpoint = endpoint
             .tls_config(ClientTlsConfig::new().with_enabled_roots())
@@ -1684,31 +1729,27 @@ fn authorized_grpc_request_with_token<T>(
     Ok(request)
 }
 
-fn file_digests(path: &Path) -> Result<(Digest, reapi::Digest)> {
-    let mut file = std::fs::File::open(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn copy_blob_digests(
+    reader: &mut dyn std::io::Read,
+    writer: &mut dyn std::io::Write,
+) -> std::io::Result<(Digest, reapi::Digest)> {
     let mut once = blake3::Hasher::new();
     let mut sha256 = Sha256::new();
     let mut size = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 256 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
+        writer.write_all(&buffer[..read])?;
         once.update(&buffer[..read]);
         sha256.update(&buffer[..read]);
         size = size.saturating_add(read as u64);
     }
     let size_bytes = i64::try_from(size).map_err(|_| {
-        status::remote(
-            "put blob",
-            ErrorKind::Protocol,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             "blob exceeds the remote size range",
         )
     })?;
@@ -1929,6 +1970,9 @@ mod fault_tests;
 
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+#[path = "cache/staged_integrity_tests.rs"]
+mod staged_integrity_tests;
 
 #[cfg(test)]
 mod redaction_tests;
@@ -2274,7 +2318,10 @@ mod tests {
         let bytes = b"streamed remote cache body";
         std::fs::write(&path, bytes).unwrap();
 
-        let (once, remote) = file_digests(&path).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut copied = Vec::new();
+        let (once, remote) = copy_blob_digests(&mut file, &mut copied).unwrap();
+        assert_eq!(copied, bytes);
 
         assert_eq!(once, Digest::of_bytes(bytes));
         assert_eq!(remote, sha256_digest(bytes).unwrap());

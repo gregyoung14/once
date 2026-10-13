@@ -197,6 +197,10 @@ impl ExecutionPermit {
         self.executor
     }
 
+    pub(crate) fn scoped_host(&self) -> ResourcePermit {
+        self.leases.host.clone().with_lifetime_owner(self.clone())
+    }
+
     pub(crate) fn host_request(&self) -> &ResourceRequest {
         self.leases.host.request()
     }
