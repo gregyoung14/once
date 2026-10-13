@@ -75,18 +75,18 @@ jobs:
       - name: Build with Once
         run: target/debug/once build web/application_test
         env:
-          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist-web' || 'local' }}
+          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist' || 'local' }}
 
       - name: Lint with Once
         run: target/debug/once run web/application_test
         env:
-          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist-web' || 'local' }}
+          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist' || 'local' }}
 
       - name: Test with Once
         id: graph-tests
         run: target/debug/once test web/tests
         env:
-          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist-web' || 'local' }}
+          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist' || 'local' }}
 
       - name: Surface native test logs on failure
         if: failure() && steps.graph-tests.outcome == 'failure'
@@ -153,7 +153,7 @@ jobs:
       - name: Assemble the production release with Once
         run: target/debug/once build web/release
         env:
-          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist-web' || 'local' }}
+          ONCE_CACHE_PROVIDER: ${{ steps.once-cache-auth.outcome == 'success' && 'tuist' || 'local' }}
 
       - name: Surface mix release logs on failure
         if: failure()
