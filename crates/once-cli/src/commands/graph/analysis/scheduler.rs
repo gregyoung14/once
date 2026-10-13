@@ -63,39 +63,6 @@ impl<'a> BuildScheduler<'a> {
                 .await
                 .context("build task set ended unexpectedly")?;
             let (target_id, outcome) = joined.context("joining graph build task")??;
-            // Time output materialization so the flame graph shows
-            // where cache-hit builds actually spend the wall clock:
-            // walking the cache manifest and hardlinking blobs into
-            // the workspace per target. Cheap probes make the action
-            // sub-spans tiny; this is the fat block that fills the
-            // otherwise-empty lane.
-            let materialize_worker = self.context.workers.acquire().await;
-            let materialize_started_at_ms = crate::bus_events::now_ms();
-            let materialize_started_at = std::time::Instant::now();
-            crate::bus_events::observe_target_transfers(
-                self.context.event_bus.as_ref(),
-                &target_id,
-                materialize_cached_outputs(
-                    &outcome,
-                    &self.context.workspace,
-                    &self.context.cache,
-                    Some(&self.context.source_digest_cache),
-                    &self.context.resources,
-                ),
-            )
-            .await
-            .with_context(|| format!("materializing outputs for {target_id}"))?;
-            if let Some(bus) = &self.context.event_bus {
-                crate::bus_events::target_phase_completed(
-                    bus,
-                    &target_id,
-                    "materialize_outputs",
-                    materialize_worker.worker_id(),
-                    materialize_started_at_ms,
-                    u64::try_from(materialize_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                );
-            }
-            drop(materialize_worker);
             tracing::trace!(
                 target = %target_id,
                 cache = outcome.cache_tag,
@@ -144,14 +111,51 @@ impl<'a> BuildScheduler<'a> {
                 "spawning graph target build task"
             );
 
-            let bus = self.context.event_bus.clone();
+            let context = self.context.clone();
             let build = build_one(self.context.clone(), target, inputs);
+            // Each target puts its deferred outputs on disk in its own task, so
+            // one target's restore never holds up joining the others or
+            // starting the targets that became ready.
             running.spawn(async move {
-                crate::bus_events::observe_target_transfers(bus.as_ref(), &target_id, build).await
+                let bus = context.event_bus.clone();
+                let finish = Box::pin(async {
+                    let (target_id, outcome) = build.await?;
+                    materialize_completed(&context, &target_id, &outcome).await?;
+                    Ok((target_id, outcome))
+                });
+                crate::bus_events::observe_target_transfers(bus.as_ref(), &target_id, finish).await
             });
         }
         Ok(())
     }
+}
+
+/// Put a finished target's deferred outputs on disk, timed as its own phase
+/// so the flame graph shows where cache-hit builds spend the wall clock.
+async fn materialize_completed(
+    context: &BuildContext,
+    target_id: &str,
+    outcome: &BuildOutcome,
+) -> Result<()> {
+    let started_at_ms = crate::bus_events::now_ms();
+    let started_at = std::time::Instant::now();
+    materialize_cached_outputs(outcome, context.repair())
+        .await
+        .with_context(|| format!("materializing outputs for {target_id}"))?;
+    if let Some(bus) = &context.event_bus {
+        // The lane is only taken to report the finished phase, so restoring
+        // never waits behind actions for one.
+        let worker = context.workers.acquire().await;
+        crate::bus_events::target_phase_completed(
+            bus,
+            target_id,
+            "materialize_outputs",
+            worker.worker_id(),
+            started_at_ms,
+            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+    }
+    Ok(())
 }
 
 pub(super) struct DependencyInputs {

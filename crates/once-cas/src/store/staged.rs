@@ -93,6 +93,9 @@ impl Cas {
             path: parent.to_path_buf(),
             source,
         })?);
+        let expected = *digest;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop = blob::StopOnDrop(Arc::clone(&stop));
         let original = self.blob_path(digest);
         let linked = directory.path().join("stored");
         let pinned = match link(&original, &linked) {
@@ -116,6 +119,35 @@ impl Cas {
                     source: source_error,
                 })?;
             if prefix != blob::ZSTD_BLOB_MAGIC {
+                let path = source.clone();
+                let owner = Arc::clone(&directory);
+                let checked = tokio::task::spawn_blocking(move || {
+                    let _owners = (owner, guard);
+                    let file = std::fs::File::open(&path)?;
+                    let actual = Digest::of_reader(std::io::BufReader::new(file))?;
+                    crate::integrity::verify(&expected, &actual)?;
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "blob staging was cancelled",
+                        ));
+                    }
+                    Ok::<_, io::Error>(())
+                })
+                .await
+                .map_err(|error| Error::Io {
+                    path: source.clone(),
+                    source: io::Error::other(error.to_string()),
+                })?;
+                if let Err(source_error) = checked {
+                    if crate::integrity::CorruptBlob::is(&source_error) {
+                        self.quarantine(digest, &self.blob_path(digest)).await;
+                    }
+                    return Err(Error::Io {
+                        path: source,
+                        source: source_error,
+                    });
+                }
                 return Ok(StagedBlob {
                     directory,
                     path: source,
@@ -129,19 +161,24 @@ impl Cas {
             path: destination.clone(),
         };
         let owner = Arc::clone(&lease.directory);
-        tokio::task::spawn_blocking(move || {
+        let decoded = tokio::task::spawn_blocking(move || {
             let _owners = (owner, guard);
-            blob::decode_file(&source, &destination, copy)
+            blob::decode_file(&source, &destination, &expected, &stop, copy)
         })
         .await
         .map_err(|source| Error::Io {
             path: error_path.clone(),
             source: io::Error::other(source.to_string()),
-        })?
-        .map_err(|source| Error::Io {
-            path: error_path,
-            source,
         })?;
+        if let Err(source) = decoded {
+            if crate::integrity::CorruptBlob::is(&source) {
+                self.quarantine(digest, &self.blob_path(digest)).await;
+            }
+            return Err(Error::Io {
+                path: error_path,
+                source,
+            });
+        }
         Ok(lease)
     }
 }
@@ -150,6 +187,9 @@ fn link_source(source: &Path, destination: &Path) -> io::Result<()> {
     std::fs::hard_link(source, destination)
 }
 
+#[cfg(test)]
+#[path = "staged_integrity_tests.rs"]
+mod integrity_tests;
 #[cfg(test)]
 #[path = "staged_tests.rs"]
 mod tests;

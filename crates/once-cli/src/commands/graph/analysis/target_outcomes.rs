@@ -136,7 +136,25 @@ impl TargetOutcomes {
 
     /// The outcome recorded for `target`, when the build it describes would
     /// arrive at the same place.
-    pub(super) fn reuse(
+    pub(super) fn reuse_with_inputs(
+        &self,
+        target: &GraphTarget,
+        key: &str,
+        changes: &KnownChanges,
+        dependency_inputs: &BTreeMap<String, AvailableInput>,
+        producers: &super::actions::Producers,
+    ) -> Option<BuildOutcome> {
+        if dependency_inputs
+            .iter()
+            .any(|(path, input)| producers.has_fingerprint(path, input.blob_digest))
+        {
+            tracing::debug!(target = %target.label.id, "fingerprint-only dependency prevents target-outcome reuse");
+            return None;
+        }
+        self.reuse(target, key, changes)
+    }
+
+    fn reuse(
         &self,
         target: &GraphTarget,
         key: &str,
@@ -180,7 +198,22 @@ impl TargetOutcomes {
             action_digest: record.action_digest,
             input_digest: record.input_digest,
             input_fingerprint: record.input_fingerprint.clone(),
-            available_inputs: record.available_inputs.clone(),
+            // Whether an output is on disk described the disk of the build
+            // that wrote the record. A reader restores what it needs instead,
+            // which costs nothing for an output that is still in place.
+            available_inputs: record
+                .available_inputs
+                .iter()
+                .map(|(path, input)| {
+                    (
+                        path.clone(),
+                        AvailableInput {
+                            materialized: false,
+                            ..*input
+                        },
+                    )
+                })
+                .collect(),
             outputs: record.outputs.clone(),
             // A reused record means nothing ran, which is a hit however the
             // build that produced it went. Replaying the producing run's state
@@ -348,27 +381,37 @@ fn touches_any_of(changed: &BTreeSet<String>, paths: &[String]) -> bool {
     })
 }
 
-/// Name one target's build.
-///
-/// The analysis name already covers the target definition, the code that
-/// analyses it, the configuration, and the dependencies' provider records.
-/// What it does not cover is which build those providers came from, so the
-/// dependencies' action digests go in too: a dependency that rebuilt gives
-/// everything above it a different name even when its provider is unchanged.
-pub(super) fn key(analysis_key: &str, dependency_action_digests: &[(String, Digest)]) -> String {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(SCHEMA.as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(analysis_key.as_bytes());
-    let mut ordered = dependency_action_digests.to_vec();
-    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+// A producer's action can stay unchanged while its output contents change.
+pub(super) fn key(
+    analysis_key: &str,
+    dependency_action_digests: &[(String, Digest)],
+    dependency_inputs: &BTreeMap<String, AvailableInput>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"once.target.outcomes.key.v2\0");
+    hash_field(&mut hasher, analysis_key.as_bytes());
+    let mut ordered = dependency_action_digests.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+    hasher.update(&(ordered.len() as u64).to_le_bytes());
     for (label, digest) in ordered {
-        bytes.push(0);
-        bytes.extend_from_slice(label.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(digest.to_hex().as_bytes());
+        hash_field(&mut hasher, label.as_bytes());
+        hasher.update(digest.as_bytes());
     }
-    Digest::of_bytes(&bytes).to_hex()
+    hasher.update(&(dependency_inputs.len() as u64).to_le_bytes());
+    for (path, input) in dependency_inputs {
+        hash_field(&mut hasher, path.as_bytes());
+        hasher.update(input.blob_digest.as_bytes());
+    }
+    Digest::from_bytes(*hasher.finalize().as_bytes()).to_hex()
+}
+
+fn hash_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// Turn off reusing recorded outcomes, to confirm a build visited its targets

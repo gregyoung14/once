@@ -15,6 +15,15 @@ pub async fn with_resource_permit<F: Future>(permit: ResourcePermit, future: F) 
     PERMIT.scope(Arc::new(permit), future).await
 }
 
+/// Scope filesystem workers to an existing executor lease without acquiring again.
+/// Owned workers also retain the lease's domain reservations and lifetime owners.
+pub async fn with_execution_permit<F: Future>(
+    permit: crate::ExecutionPermit,
+    future: F,
+) -> F::Output {
+    with_resource_permit(permit.scoped_host(), future).await
+}
+
 pub(crate) fn current() -> Option<Arc<ResourcePermit>> {
     PERMIT.try_with(Arc::clone).ok()
 }
@@ -29,6 +38,9 @@ where
         operation()
     }
 }
+
+#[cfg(test)]
+mod execution_tests;
 
 #[cfg(test)]
 mod tests {

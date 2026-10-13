@@ -2,9 +2,15 @@ mod auth;
 mod cache;
 mod file_body;
 mod flights;
+#[cfg(test)]
+pub(crate) mod log_capture;
 mod projects;
+mod recovery;
+pub(crate) mod redact;
 mod retry;
+mod retry_hint;
 mod stall;
+mod status;
 #[cfg(test)]
 pub(crate) mod test_env;
 

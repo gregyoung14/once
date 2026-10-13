@@ -9,8 +9,9 @@ use schlussel::{
     SessionStorage, Token, TokenRefresher,
 };
 
+use super::classify::auth_error;
 use super::{TuistAuth, TuistAuthPrompt, OIDC_TOKEN_REFRESH_WINDOW_SECONDS, PROVIDER_NAME};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 
 impl TuistAuth {
     pub(super) fn load_valid_token(&self) -> Result<Token> {
@@ -102,19 +103,18 @@ impl TuistAuth {
             ));
         }
         if callback.error_code.is_some() {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "authorize",
-                message: callback
-                    .error_description
-                    .or(callback.error_code)
-                    .unwrap_or_else(|| "authorization denied".to_string()),
-            });
+            return Err(auth_error(
+                "authorize",
+                ErrorKind::Refused,
+                super::classify::callback_error(callback.error_code.as_deref()),
+            ));
         }
-        let code = callback.code.ok_or_else(|| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "authorize",
-            message: "missing authorization code".to_string(),
+        let code = callback.code.ok_or_else(|| {
+            auth_error(
+                "authorize",
+                ErrorKind::Protocol,
+                "missing authorization code",
+            )
         })?;
 
         let key = self.storage_key();

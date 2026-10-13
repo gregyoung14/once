@@ -15,6 +15,7 @@ pub(super) struct Writer {
     defer_raw: bool,
     prefix: Vec<u8>,
     expected: Option<u64>,
+    sha256: Option<(sha2::Sha256, String)>,
 }
 
 impl Writer {
@@ -43,7 +44,14 @@ impl Writer {
             defer_raw: false,
             prefix: Vec::with_capacity(blob::ZSTD_BLOB_MAGIC.len()),
             expected,
+            sha256: None,
         }
+    }
+
+    pub(super) fn with_sha256(mut self, expected: Option<String>) -> Self {
+        use sha2::Digest as _;
+        self.sha256 = expected.map(|expected| (sha2::Sha256::new(), expected));
+        self
     }
 
     pub(super) fn pipeline_hash(&mut self) -> io::Result<()> {
@@ -71,6 +79,10 @@ impl Writer {
             ));
         }
         self.hasher.update(bytes)?;
+        if let Some((hasher, _)) = &mut self.sha256 {
+            use sha2::Digest as _;
+            hasher.update(bytes);
+        }
         if !self.defer_raw {
             self.raw.write_all(bytes)?;
             self.raw_size = self.size;
@@ -90,6 +102,15 @@ impl Writer {
                 io::ErrorKind::UnexpectedEof,
                 "remote blob does not match declared size",
             ));
+        }
+        if let Some((hasher, expected)) = self.sha256.take() {
+            use sha2::Digest as _;
+            if hex::encode(hasher.finalize()) != expected {
+                return Err(crate::integrity::CorruptBlob::io_error(
+                    Digest::of_bytes(&[]),
+                    "remote blob failed SHA-256 verification",
+                ));
+            }
         }
         self.raw.flush()?;
         let mut raw = self

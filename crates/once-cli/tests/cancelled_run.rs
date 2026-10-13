@@ -24,6 +24,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status, Streaming};
 
+#[path = "support/cache_miss.rs"]
+mod cache_miss;
 #[path = "support/reporting.rs"]
 mod reporting;
 #[path = "support/terminal.rs"]
@@ -179,6 +181,8 @@ async fn serve(collector: Collector) -> String {
             .serve_with_incoming(incoming),
     );
 
+    let cache_endpoint = cache_miss::endpoint().await;
+    let cache_body = serde_json::json!({"endpoints": [cache_endpoint]}).to_string();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_port = http.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -186,6 +190,7 @@ async fn serve(collector: Collector) -> String {
             let Ok((mut socket, _)) = http.accept().await else {
                 return;
             };
+            let cache_body = cache_body.clone();
             tokio::spawn(async move {
                 let mut request = vec![0_u8; 4096];
                 let read = socket.read(&mut request).await.unwrap_or(0);
@@ -197,10 +202,10 @@ async fn serve(collector: Collector) -> String {
                         body.len()
                     )
                 } else {
-                    // Unavailable reads as an unreachable cache, which is a
-                    // miss, so the command still runs.
-                    "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        .to_string()
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{cache_body}",
+                        cache_body.len()
+                    )
                 };
                 let _ = socket.write_all(response.as_bytes()).await;
             });

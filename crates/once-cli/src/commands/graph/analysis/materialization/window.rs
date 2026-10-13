@@ -1,16 +1,67 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
-use once_cas::{ActionResult, CacheProvider};
+#[cfg(test)]
+use futures::FutureExt;
+use futures::StreamExt;
+use once_cas::ActionResult;
+#[cfg(test)]
+use once_cas::CacheProvider;
+#[cfg(test)]
 use once_core::{ResourcePermit, ResourcePool, ResourceRequest};
 
-use super::{admission, paths, SourceDigestCache};
+use super::paths;
+#[cfg(test)]
+use super::{admission, SourceDigestCache};
 
+pub(super) async fn restore_recovering(
+    results: &[ActionResult],
+    repair: super::Repair<'_>,
+) -> Result<()> {
+    let limit = repair.resources.max_parallel_actions().max(1);
+    let mut running = FuturesUnordered::new();
+    let mut active = BTreeSet::new();
+    let mut next = 0;
+    let mut failure = None;
+    while !running.is_empty() || (failure.is_none() && next < results.len()) {
+        if active.is_empty() && failure.is_none() {
+            let count = paths::batch_len(&results[next..], repair.workspace, limit);
+            for (index, result) in results.iter().enumerate().skip(next).take(count) {
+                active.insert(index);
+                running.push(indexed(index, repair.restore(result)));
+            }
+            next += count;
+        }
+        if failure.is_none()
+            && next < results.len()
+            && active.len() < limit
+            && paths::disjoint_from_results(
+                repair.workspace,
+                &results[next],
+                active.iter().map(|index| &results[*index]),
+            )
+        {
+            active.insert(next);
+            running.push(indexed(next, repair.restore(&results[next])));
+            next += 1;
+            continue;
+        }
+        let (index, outcome) = running.next().await.expect("scheduled restoration window");
+        active.remove(&index);
+        if let Err(error) = outcome {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
 pub(super) async fn restore(
     results: &[ActionResult],
     workspace: &Path,
@@ -27,6 +78,7 @@ pub(super) async fn restore(
     .await
 }
 
+#[cfg(test)]
 async fn run<F, W>(
     results: &[ActionResult],
     workspace: &Path,

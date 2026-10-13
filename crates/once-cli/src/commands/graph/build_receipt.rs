@@ -34,6 +34,10 @@ pub(super) struct BuildReceipt {
     /// recognises them as ours rather than as someone else's edit.
     #[serde(default)]
     produced: BTreeMap<String, Digest>,
+    /// Outputs the build left in the cache rather than on disk because only
+    /// later actions of the same target read them.
+    #[serde(default)]
+    deferred: BTreeSet<String>,
     executable_fingerprint: PathFingerprint,
     position: ChangePosition,
     record: CapabilityRunRecord,
@@ -44,6 +48,7 @@ pub(super) struct Observations<'a> {
     pub host_paths: &'a BTreeSet<PathBuf>,
     pub source_digests: &'a BTreeMap<String, Digest>,
     pub produced: &'a BTreeMap<String, Digest>,
+    pub deferred: &'a BTreeSet<String>,
 }
 
 pub(super) async fn read(
@@ -109,6 +114,7 @@ pub(super) async fn load(
         .record
         .outputs
         .iter()
+        .filter(|output| !receipt.deferred.contains(*output))
         .all(|output| workspace.join(output).symlink_metadata().is_ok())
     {
         Some("output")
@@ -170,6 +176,7 @@ pub(super) async fn store(
         host_paths: path_fingerprint::capture(observations.host_paths),
         source_digests: observations.source_digests.clone(),
         produced: observations.produced.clone(),
+        deferred: observations.deferred.clone(),
         executable_fingerprint,
         position: snapshot.position.clone(),
         record: record.clone(),
@@ -359,6 +366,77 @@ mod tests {
         }
     }
 
+    /// An intermediate output the build left in the cache is not missing from
+    /// disk in any way that matters, so it must not cost every later
+    /// invocation a full graph visit. A final output still has to be there.
+    #[tokio::test]
+    async fn receipt_does_not_require_deferred_intermediate_outputs_on_disk() {
+        let temporary = TempDir::new().unwrap();
+        let output = temporary.path().join(".once/out/app/app");
+        tokio::fs::create_dir_all(output.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&output, b"binary").await.unwrap();
+        let intermediate = ".once/out/app/objects/main.o".to_string();
+        let mut record = record();
+        record.outputs.push(intermediate.clone());
+        let snapshot = snapshot(3, 5);
+        let environment = BTreeMap::new();
+        let no_host_paths = BTreeSet::new();
+        let source_digests = BTreeMap::new();
+        let stored = |deferred: BTreeSet<String>| {
+            let record = record.clone();
+            let snapshot = snapshot.clone();
+            let environment = environment.clone();
+            let no_host_paths = no_host_paths.clone();
+            let source_digests = source_digests.clone();
+            let workspace = temporary.path().to_path_buf();
+            async move {
+                store(
+                    &workspace,
+                    "app",
+                    SandboxMode::Off,
+                    TEST_CONFIGURATION_PATH_SUFFIX,
+                    test_configuration_digest(),
+                    &snapshot,
+                    Observations {
+                        environment: &environment,
+                        host_paths: &no_host_paths,
+                        source_digests: &source_digests,
+                        produced: &BTreeMap::new(),
+                        deferred: &deferred,
+                    },
+                    &record,
+                )
+                .await;
+                let receipt = read(
+                    &workspace,
+                    "app",
+                    SandboxMode::Off,
+                    TEST_CONFIGURATION_PATH_SUFFIX,
+                )
+                .await;
+                load(
+                    &workspace,
+                    "app",
+                    SandboxMode::Off,
+                    TEST_CONFIGURATION_PATH_SUFFIX,
+                    Some(&snapshot),
+                    receipt,
+                )
+                .await
+            }
+        };
+
+        assert!(stored(BTreeSet::new()).await.is_none());
+        assert!(stored(BTreeSet::from([intermediate.clone()]))
+            .await
+            .is_some());
+
+        tokio::fs::remove_file(&output).await.unwrap();
+        assert!(stored(BTreeSet::from([intermediate])).await.is_none());
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn receipt_requires_the_same_tracker_snapshot_and_outputs() {
@@ -384,6 +462,7 @@ mod tests {
                 host_paths: &no_host_paths,
                 source_digests: &source_digests,
                 produced: &BTreeMap::new(),
+                deferred: &BTreeSet::new(),
             },
             &record(),
         )
@@ -449,6 +528,7 @@ mod tests {
                 host_paths: &host_paths,
                 source_digests: &source_digests,
                 produced: &BTreeMap::new(),
+                deferred: &BTreeSet::new(),
             },
             &record(),
         )
@@ -512,6 +592,7 @@ mod tests {
                 host_paths: &no_host_paths,
                 source_digests: &source_digests,
                 produced: &BTreeMap::new(),
+                deferred: &BTreeSet::new(),
             },
             &empty_output_record,
         )
@@ -568,6 +649,7 @@ mod tests {
                 host_paths: &host_paths,
                 source_digests: &source_digests,
                 produced: &BTreeMap::new(),
+                deferred: &BTreeSet::new(),
             },
             &record(),
         )

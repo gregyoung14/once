@@ -8,6 +8,11 @@ use crate::{Error, RemoteExecution, Result};
     feature = "remote-microsandbox",
     any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
 ))]
+mod guest;
+#[cfg(all(
+    feature = "remote-microsandbox",
+    any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
+))]
 mod input;
 #[cfg(all(
     feature = "remote-microsandbox",
@@ -68,7 +73,10 @@ pub(super) async fn execute_command(
     stream_to_parent: bool,
 ) -> Result<ActionResult> {
     let image = remote.environment.clone().unwrap_or_else(|| {
-        std::env::var("ONCE_MICROSANDBOX_IMAGE").unwrap_or_else(|_| "alpine".to_string())
+        std::env::var("ONCE_MICROSANDBOX_IMAGE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "alpine".to_string())
     });
     let guest_root =
         std::env::var("ONCE_MICROSANDBOX_WORKDIR").unwrap_or_else(|_| "/workspace".to_string());
@@ -80,28 +88,22 @@ pub(super) async fn execute_command(
         |cwd| join_path(&guest_root, cwd.as_str()),
     );
     let sandbox_name = sandbox_name();
-    let cpu_count =
-        u8::try_from(command.resources.cpu_slots.clamp(1, usize::from(u8::MAX))).unwrap_or(u8::MAX);
-    let mut builder = microsandbox::Sandbox::builder(&sandbox_name)
+    let size = guest::GuestSize::for_request(
+        command
+            .lease
+            .as_ref()
+            .map(crate::ExecutionPermit::host_request),
+        command.resources,
+    )?;
+    let sandbox = microsandbox::Sandbox::builder(&sandbox_name)
         .image(image)
         .workdir("/")
-        .cpus(cpu_count);
-    if command.resources.memory_bytes > 0 {
-        let memory_mib = u32::try_from(
-            command
-                .resources
-                .memory_bytes
-                .div_ceil(1024 * 1024)
-                .clamp(1, u64::from(u32::MAX)),
-        )
-        .unwrap_or(u32::MAX);
-        builder = builder.memory(memory_mib);
-    }
-    let sandbox = builder
+        .cpus(size.cpus)
+        .memory(size.memory_mib)
         .create()
         .await
         .map_err(|source| microsandbox_error(&source))?;
-    let cleanup = SandboxCleanup::new(sandbox.clone());
+    let cleanup = SandboxCleanup::new(sandbox.clone(), command.lease.clone());
 
     let result = async {
         input::stage_inputs(&sandbox.fs(), workspace_root, &guest_root, command.inputs).await?;
@@ -164,8 +166,11 @@ pub(super) async fn execute_command(
     feature = "remote-microsandbox",
     any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
 ))]
+/// Stops and removes a micro-VM, holding its host admission lease until the
+/// VM is gone so a cancelled caller cannot free memory the VM still uses.
 struct SandboxCleanup {
     sandbox: Option<microsandbox::Sandbox>,
+    lease: Option<crate::ExecutionPermit>,
 }
 
 #[cfg(all(
@@ -173,15 +178,16 @@ struct SandboxCleanup {
     any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
 ))]
 impl SandboxCleanup {
-    fn new(sandbox: microsandbox::Sandbox) -> Self {
+    fn new(sandbox: microsandbox::Sandbox, lease: Option<crate::ExecutionPermit>) -> Self {
         Self {
             sandbox: Some(sandbox),
+            lease,
         }
     }
 
     async fn run(mut self) -> Result<()> {
         let sandbox = self.sandbox.take().expect("cleanup sandbox is present");
-        spawn_cleanup(sandbox)
+        spawn_cleanup(sandbox, self.lease.take())
             .await
             .map_err(|source| Error::RemoteProviderApi {
                 provider: "microsandbox".to_string(),
@@ -199,9 +205,14 @@ impl Drop for SandboxCleanup {
         let Some(sandbox) = self.sandbox.take() else {
             return;
         };
+        let lease = self.lease.take();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(cleanup_sandbox(sandbox));
+                handle.spawn(async move {
+                    if let Err(error) = cleanup_sandbox(sandbox, lease).await {
+                        tracing::warn!(provider = "microsandbox", %error, "failed to remove remote sandbox");
+                    }
+                });
             }
             Err(error) => {
                 tracing::warn!(
@@ -218,27 +229,67 @@ impl Drop for SandboxCleanup {
     feature = "remote-microsandbox",
     any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
 ))]
-fn spawn_cleanup(sandbox: microsandbox::Sandbox) -> tokio::task::JoinHandle<Result<()>> {
-    tokio::spawn(cleanup_sandbox(sandbox))
+fn spawn_cleanup(
+    sandbox: microsandbox::Sandbox,
+    lease: Option<crate::ExecutionPermit>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(cleanup_sandbox(sandbox, lease))
 }
 
 #[cfg(all(
     feature = "remote-microsandbox",
     any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))
 ))]
-async fn cleanup_sandbox(sandbox: microsandbox::Sandbox) -> Result<()> {
-    let stop_result = sandbox
-        .stop_and_wait()
-        .await
-        .map_err(|source| microsandbox_error(&source));
-    let remove_result = sandbox
-        .remove_persisted()
-        .await
-        .map_err(|source| microsandbox_error(&source));
-    match (stop_result, remove_result) {
-        (Ok(_status), Ok(())) => Ok(()),
-        (Err(error), _) | (_, Err(error)) => Err(error),
-    }
+async fn cleanup_sandbox(
+    sandbox: microsandbox::Sandbox,
+    lease: Option<crate::ExecutionPermit>,
+) -> Result<()> {
+    let name = sandbox.name().to_string();
+    let stopped = guest::stop_or_kill(
+        &name,
+        async {
+            sandbox
+                .stop_and_wait()
+                .await
+                .map(drop)
+                .map_err(|source| microsandbox_error(&source))
+        },
+        || async {
+            sandbox
+                .kill()
+                .await
+                .map_err(|source| microsandbox_error(&source))?;
+            sandbox
+                .wait()
+                .await
+                .map(drop)
+                .map_err(|source| microsandbox_error(&source))
+        },
+        guest::STOP_TIMEOUT,
+        guest::KILL_TIMEOUT,
+    )
+    .await;
+    // Persisted state is only removed once the guest has exited; removing it
+    // under a guest that may still run would hide that guest from later cleanup.
+    let result = match stopped {
+        Ok(()) => {
+            match tokio::time::timeout(guest::REMOVE_TIMEOUT, sandbox.remove_persisted()).await {
+                Ok(removed) => removed.map_err(|source| microsandbox_error(&source)),
+                Err(_) => Err(Error::RemoteProviderApi {
+                    provider: "microsandbox".to_string(),
+                    message: format!(
+                        "removing stopped sandbox {name} timed out after {}s",
+                        guest::REMOVE_TIMEOUT.as_secs()
+                    ),
+                }),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    // Cleanup is bounded, so the host lease returns even when the guest may
+    // still be running; the error above reports that possibility.
+    drop(lease);
+    result
 }
 
 #[allow(clippy::unused_async)]

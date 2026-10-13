@@ -36,9 +36,53 @@ annotated scripts, and test workers. Internal subprocesses inherit an explicit
 limit, so nested test and agent-tool invocations do not reset to the machine
 default.
 
+When a remote cache is selected, Once carves a shared cache-transfer allowance
+out of the configured memory budget. It starts at one eighth of that budget,
+with a minimum of 32 MiB + 64 KiB and a maximum of 256 MiB. The minimum fits a
+streamed response frame and its bounded pipe. Actions use exactly the remainder
+instead of allocating a second full budget for cache requests. A finite total
+must exceed that minimum; otherwise the command fails before starting work.
+
+MCP and runtime sessions reserve the same headroom even when initially using a
+local cache, because their configuration can change during the session. Ordinary
+local-only commands retain the full action allowance. An explicit
+`--memory-limit 0` keeps action admission unbounded while cache buffers retain
+their default allowance.
+
+Cloned cache providers share transfer admission. Scratch downloads have a separate
+bounded disk budget, and oversized requests fail instead of relying on a
+server-provided size to allocate arbitrarily.
+
 Cache capture, command error output, and cached output restoration stream large
 files through bounded buffers and temporary files. Artifact size therefore
 does not become a same-sized memory allocation during these operations.
+
+Graph actions, producer repairs, and legacy capabilities share the invocation's
+budget. Output restoration reserves memory for each attempt and releases it before
+repairing a missing producer. If an observer is cancelled or a repair times out,
+blocking file work keeps its reservation and action lock until it actually stops.
+This prevents newly admitted work from overlapping a reservation that was released
+too early. Cache publication uses the separate carved transfer allowance after
+execution finishes.
+
+## CPU Sharing And Fairness
+
+Set `--cpu-limit COUNT` to override the scheduler's CPU capacity:
+
+```sh
+once --cpu-limit 4 test app
+```
+
+Test batches divide the parent CPU budget instead of each inheriting the full
+host capacity. This is a cooperative scheduling estimate, not a limit on threads
+a tool can start. Configure tool-specific parallelism through that tool's target
+kind when needed.
+
+Host admission queues conflicting requests fairly so a stream of smaller actions
+cannot indefinitely bypass an older large request. Cancelling a queued request
+removes its claim without consuming capacity. Required minimum capacity is
+checked separately from estimate normalization; an impossible minimum fails
+instead of being silently reduced.
 
 ## What The Limit Guarantees
 

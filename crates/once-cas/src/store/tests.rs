@@ -227,6 +227,132 @@ async fn put_stream_compresses_repetitive_payload_at_rest() {
     assert_eq!(cas.get_blob(&d).await.unwrap(), payload);
 }
 
+#[tokio::test]
+async fn copy_blob_to_file_streams_raw_and_compressed_storage() {
+    let tmp = TempDir::new().unwrap();
+    let cas = Cas::open(tmp.path().join("cas"));
+    for (name, payload) in [
+        ("raw", b"small payload".to_vec()),
+        ("compressed", vec![b'x'; STREAM_CHUNK * 4]),
+    ] {
+        let digest = cas.put_stream(payload.as_slice()).await.unwrap();
+        let destination = tmp.path().join(name);
+
+        cas.copy_blob_to_file(&digest, &destination).await.unwrap();
+
+        assert_eq!(fs::read(destination).await.unwrap(), payload);
+    }
+}
+
+#[tokio::test]
+async fn copy_blob_to_file_preserves_destination_when_decode_fails() {
+    let tmp = TempDir::new().unwrap();
+    let cas = Cas::open(tmp.path().join("cas"));
+    let payload = vec![b'x'; STREAM_CHUNK * 4];
+    let digest = cas.put_blob(&payload).await.unwrap();
+    let stored_path = cas.blob_path(&digest);
+    let mut stored = fs::read(&stored_path).await.unwrap();
+    assert!(stored.starts_with(blob::ZSTD_BLOB_MAGIC));
+    stored.truncate(blob::ZSTD_BLOB_HEADER_LEN + 1);
+    fs::write(&stored_path, stored).await.unwrap();
+    let destination = tmp.path().join("existing-output");
+    fs::write(&destination, b"keep this output").await.unwrap();
+
+    let error = cas
+        .copy_blob_to_file(&digest, &destination)
+        .await
+        .unwrap_err();
+    assert!(error.is_corrupt(), "{error}");
+    assert_eq!(fs::read(&destination).await.unwrap(), b"keep this output");
+    assert!(
+        !cas.has_blob(&digest).await.unwrap(),
+        "corrupt blob is removed"
+    );
+}
+
+#[tokio::test]
+async fn restoring_a_tampered_blob_fails_its_hash_check_and_removes_it() {
+    let tmp = TempDir::new().unwrap();
+    let cas = Cas::open(tmp.path().join("cas"));
+    for payload in [b"raw payload".to_vec(), vec![b'x'; STREAM_CHUNK * 4]] {
+        let digest = cas.put_blob(&payload).await.unwrap();
+        let stored_path = cas.blob_path(&digest);
+        let mut stored = fs::read(&stored_path).await.unwrap();
+        if stored.starts_with(blob::ZSTD_BLOB_MAGIC) {
+            // Same length and a valid frame, different content.
+            stored = blob::encode_bytes(&vec![b'y'; payload.len()])
+                .unwrap()
+                .into_owned();
+        } else {
+            stored[0] ^= 0xff;
+        }
+        fs::write(&stored_path, stored).await.unwrap();
+        let destination = tmp.path().join("restored");
+
+        let error = cas
+            .copy_blob_to_file(&digest, &destination)
+            .await
+            .unwrap_err();
+
+        assert!(error.is_corrupt(), "{error}");
+        assert!(!destination.exists());
+        assert!(matches!(
+            cas.copy_blob_to_file(&digest, &destination).await,
+            Err(Error::BlobNotFound(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn reading_a_tampered_blob_fails_its_hash_check_and_removes_it() {
+    let tmp = TempDir::new().unwrap();
+    let cas = Cas::open(tmp.path());
+    let digest = cas.put_blob(b"trusted").await.unwrap();
+    fs::write(cas.blob_path(&digest), b"tampered")
+        .await
+        .unwrap();
+
+    let error = cas.get_blob(&digest).await.unwrap_err();
+
+    assert!(error.is_corrupt(), "{error}");
+    assert!(matches!(
+        cas.get_blob(&digest).await,
+        Err(Error::BlobNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn staged_streams_are_capped_and_invisible_until_committed() {
+    let tmp = TempDir::new().unwrap();
+    let cas = Cas::open(tmp.path());
+    let payload = vec![7_u8; STREAM_CHUNK * 3];
+    let digest = Digest::of_bytes(&payload);
+    let limit = payload.len() as u64;
+
+    let mut oversized = payload.clone();
+    oversized.push(0);
+    let long = cas
+        .stage_stream(oversized.as_slice(), limit)
+        .await
+        .unwrap_err();
+    assert!(long.is_corrupt(), "{long}");
+
+    let staged = cas.stage_stream(payload.as_slice(), limit).await.unwrap();
+    assert_eq!(staged.digest(), digest);
+    assert_eq!(staged.len(), limit);
+    assert!(
+        !cas.has_blob(&digest).await.unwrap(),
+        "staging is not visible"
+    );
+    drop(staged);
+    let mut scratch = fs::read_dir(cas.scratch_dir()).await.unwrap();
+    assert!(scratch.next_entry().await.unwrap().is_none());
+
+    let staged = cas.stage_stream(payload.as_slice(), limit).await.unwrap();
+    assert_eq!(cas.commit_staged(staged).await.unwrap(), digest);
+    assert_eq!(cas.get_blob(&digest).await.unwrap(), payload);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn streamed_blob_preserves_normal_file_creation_permissions() {

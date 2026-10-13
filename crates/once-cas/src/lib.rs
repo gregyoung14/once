@@ -7,14 +7,19 @@
 //! while [`CacheProvider`] composes it with an optional remote cache.
 //!
 //! Locally produced writes synchronize their contents before atomic rename and
-//! then synchronize the parent directory. Remote mirrors retain atomic
-//! visibility but may use weaker durability because they can be fetched again.
+//! then synchronize the parent directory. Remote mirrors synchronize their
+//! contents before an atomic rename but may skip the directory sync because
+//! they can be fetched again. Blobs read back for restoration are hashed while
+//! they are copied, and a blob that fails that check is removed rather than
+//! restored.
 
 mod blob;
+mod budget;
 mod digest;
 mod error;
 mod filesystem;
 mod gc;
+mod integrity;
 mod model;
 mod provider;
 mod stats;
@@ -22,8 +27,12 @@ mod store;
 pub mod transfer;
 mod tuist;
 
+pub use budget::{
+    TransferBudget, DEFAULT_TRANSFER_MEMORY_BYTES, DEFAULT_TRANSFER_STAGING_BYTES,
+    MIN_TRANSFER_MEMORY_BYTES,
+};
 pub use digest::Digest;
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 pub use gc::GcReport;
 pub use model::{ActionResult, Stats};
 pub use provider::CacheProvider;

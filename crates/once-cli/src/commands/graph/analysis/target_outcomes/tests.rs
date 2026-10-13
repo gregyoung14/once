@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+mod content_keys;
+mod fingerprint_inputs;
+
 use once_cas::{ActionResult, Digest};
 use once_core::{EvidenceCacheState, SandboxMode};
 use once_frontend::analysis::{AnalysisObservations, Observation};
@@ -426,4 +429,42 @@ fn a_reused_outcome_reports_a_hit_however_it_was_produced() {
         assert_eq!(action.cache_state, EvidenceCacheState::Hit);
         assert_eq!(action.duration_ms, 0);
     }
+}
+
+/// The build that wrote a record put its outputs on disk, but by the next
+/// invocation any of them may be gone, so a dependent must restore what it
+/// reads rather than trust that they are still there.
+#[test]
+fn a_reused_outcome_does_not_claim_its_outputs_are_on_disk() {
+    let workspace = TempDir::new().unwrap();
+    let target = target("apps/tool", "tool");
+    let output = ".once/out/tool/tool";
+    std::fs::create_dir_all(workspace.path().join(".once/out/tool")).unwrap();
+    std::fs::write(workspace.path().join(output), b"tool").unwrap();
+    let mut produced = outcome(&[output]);
+    produced.available_inputs.insert(
+        output.to_string(),
+        super::super::AvailableInput {
+            blob_digest: Digest::of_bytes(b"tool"),
+            same_target: true,
+            materialized: true,
+        },
+    );
+    let reopened = round_trip(&workspace, |outcomes| {
+        outcomes.record(
+            &target,
+            "key".to_string(),
+            &observations("apps/tool", &["src/*.rs"]),
+            &inputs(&["apps/tool/src/lib.rs"]),
+            &produced,
+        );
+    });
+
+    let reused = reopened
+        .reuse(&target, "key", &changed(&[], &[]))
+        .expect("an untouched target is reused");
+
+    let input = reused.available_inputs[output];
+    assert!(!input.materialized);
+    assert_eq!(input.blob_digest, Digest::of_bytes(b"tool"));
 }

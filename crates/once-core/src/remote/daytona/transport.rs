@@ -2,14 +2,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use futures::StreamExt;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use super::client::{checked, expect_success, http_error, Client, Sandbox};
-use crate::{Error, Result};
+use super::client::{expect_success, http_error, Client, Sandbox};
+use crate::remote::PhasePermit;
+use crate::{Error, ExecutionPermit, Result};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,22 +49,22 @@ impl ExecuteResponse {
 
     /// Splits the response into stdout and stderr byte streams, preferring
     /// the richest representation the toolbox provided.
-    pub(super) fn output_streams(&self) -> (Vec<u8>, Vec<u8>) {
+    pub(super) fn output_streams(&self) -> (&[u8], &[u8]) {
         let stdout = self
             .artifacts
             .as_ref()
-            .and_then(|artifacts| artifacts.stdout.clone())
-            .or_else(|| self.stdout.clone())
-            .or_else(|| self.result.clone())
+            .and_then(|artifacts| artifacts.stdout.as_deref())
+            .or(self.stdout.as_deref())
+            .or(self.result.as_deref())
             .unwrap_or_default()
-            .into_bytes();
+            .as_bytes();
         let stderr = self
             .artifacts
             .as_ref()
-            .and_then(|artifacts| artifacts.stderr.clone())
-            .or_else(|| self.stderr.clone())
+            .and_then(|artifacts| artifacts.stderr.as_deref())
+            .or(self.stderr.as_deref())
             .unwrap_or_default()
-            .into_bytes();
+            .as_bytes();
         (stdout, stderr)
     }
 }
@@ -93,21 +92,25 @@ impl Client {
         let file = tokio::fs::File::open(source)
             .await
             .map_err(|source| file_error("open_remote_input_archive", source))?;
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        let progress = super::super::http::Progress::new();
+        let body = reqwest::Body::wrap_stream(progress.track_bytes(ReaderStream::new(file), len));
         let form = Form::new().part(
             "file",
             Part::stream_with_length(body, len).file_name("once-inputs.tar"),
         );
-        let response = self
-            .http
-            .post(format!("{}/files/upload", self.toolbox_base(sandbox)))
-            .bearer_auth(&self.config.api_key)
-            .query(&[("path", destination)])
-            .multipart(form)
-            .send()
-            .await
-            .map_err(http_error)?;
-        expect_success(response).await
+        let response = progress
+            .watch_upload("daytona", self.limits, async {
+                self.http
+                    .post(format!("{}/files/upload", self.toolbox_base(sandbox)?))
+                    .bearer_auth(&self.config.api_key)
+                    .query(&[("path", destination)])
+                    .multipart(form)
+                    .send()
+                    .await
+                    .map_err(http_error)
+            })
+            .await?;
+        expect_success(response)
     }
 
     pub(super) async fn execute(
@@ -120,19 +123,30 @@ impl Client {
     ) -> Result<ExecuteResponse> {
         let mut request = self
             .http
-            .post(format!("{}/process/execute", self.toolbox_base(sandbox)))
+            .post(format!("{}/process/execute", self.toolbox_base(sandbox)?))
             .bearer_auth(&self.config.api_key)
-            .json(&ExecuteRequest {
-                command,
-                cwd,
-                envs,
-                timeout,
-            });
+            .header("Content-Type", "application/json")
+            .body(super::super::http::encode(
+                &ExecuteRequest {
+                    command,
+                    cwd,
+                    envs,
+                    timeout,
+                },
+                "daytona",
+                self.limits.max_response_bytes,
+            )?);
         if let Some(timeout) = timeout {
             request = request.timeout(Duration::from_secs(timeout.saturating_add(5)));
         }
         let response = request.send().await.map_err(http_error)?;
-        checked(response).await?.json().await.map_err(http_error)
+        super::super::http::decode(
+            response,
+            "daytona",
+            self.limits.max_response_bytes,
+            self.limits,
+        )
+        .await
     }
 
     pub(super) async fn download(
@@ -140,28 +154,27 @@ impl Client {
         sandbox: &Sandbox,
         source: &str,
         destination: &Path,
-    ) -> Result<()> {
-        let response = self
-            .http
-            .get(format!("{}/files/download", self.toolbox_base(sandbox)))
-            .bearer_auth(&self.config.api_key)
-            .query(&[("path", source)])
-            .send()
+        lease: Option<&ExecutionPermit>,
+        copies: u64,
+    ) -> Result<PhasePermit> {
+        let response = super::super::http::Progress::new()
+            .watch(
+                "daytona",
+                "download headers",
+                self.limits.stall_timeout,
+                async {
+                    self.http
+                        .get(format!("{}/files/download", self.toolbox_base(sandbox)?))
+                        .bearer_auth(&self.config.api_key)
+                        .query(&[("path", source)])
+                        .send()
+                        .await
+                        .map_err(http_error)
+                },
+            )
+            .await?;
+        super::super::http::download(response, destination, "daytona", self.limits, lease, copies)
             .await
-            .map_err(http_error)?;
-        let response = checked(response).await?;
-        let mut file = tokio::fs::File::create(destination)
-            .await
-            .map_err(|source| file_error("create_remote_output_archive", source))?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk.map_err(http_error)?)
-                .await
-                .map_err(|source| file_error("write_remote_output_archive", source))?;
-        }
-        file.flush()
-            .await
-            .map_err(|source| file_error("flush_remote_output_archive", source))
     }
 }
 

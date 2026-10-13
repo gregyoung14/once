@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
-use once_cas::{ActionResult, CacheProvider};
+use once_cas::ActionResult;
+#[cfg(test)]
+use once_cas::CacheProvider;
 use once_frontend::analysis::DeclaredAction;
 
 use super::{
-    enclosing_available_output, restore_outputs, AvailableInput, DeclaredActionsState,
-    PendingResults, SourceDigestCache,
+    enclosing_available_output, AvailableInput, DeclaredActionsState, PendingResults, Repair,
 };
 
 #[cfg(test)]
@@ -27,14 +28,62 @@ fn overlaps(left: &str, right: &str) -> bool {
     Path::new(left).starts_with(right) || Path::new(right).starts_with(left)
 }
 
+#[cfg(test)]
 pub(super) async fn restore(
     workspace: &Path,
     cache: &CacheProvider,
     pending: PendingResults<'_>,
     available: &BTreeMap<String, AvailableInput>,
     declared: &DeclaredAction,
-    digests: Option<&SourceDigestCache>,
+    digests: Option<&super::SourceDigestCache>,
 ) -> Result<Restoration> {
+    restore_with(
+        workspace,
+        pending,
+        available,
+        declared,
+        |result| async move {
+            match digests {
+                Some(digests) => digests
+                    .materialize_outputs(&result, workspace, cache, None)
+                    .await
+                    .map_err(anyhow::Error::from),
+                None => once_core::materialize_outputs(&result, workspace, cache)
+                    .await
+                    .map_err(anyhow::Error::from),
+            }
+        },
+    )
+    .await
+}
+
+pub(super) async fn restore_admitted(
+    repair: &Repair<'_>,
+    pending: PendingResults<'_>,
+    available: &BTreeMap<String, AvailableInput>,
+    declared: &DeclaredAction,
+) -> Result<Restoration> {
+    restore_with(
+        repair.workspace,
+        pending,
+        available,
+        declared,
+        |result| async move { repair.restore(&result).await },
+    )
+    .await
+}
+
+async fn restore_with<F, W>(
+    workspace: &Path,
+    pending: PendingResults<'_>,
+    available: &BTreeMap<String, AvailableInput>,
+    declared: &DeclaredAction,
+    restore: F,
+) -> Result<Restoration>
+where
+    F: Fn(ActionResult) -> W,
+    W: std::future::Future<Output = Result<()>>,
+{
     let required = declared
         .inputs
         .iter()
@@ -80,7 +129,7 @@ pub(super) async fn restore(
             stderr: result.stderr,
             outputs,
         };
-        restore_outputs(workspace, cache, &result, digests).await?;
+        restore(result.clone()).await?;
         restored.extend(result.outputs.into_keys());
     }
     let reusable = if all {
@@ -104,7 +153,7 @@ pub(super) async fn restore(
             stderr: None,
             outputs,
         };
-        restore_outputs(workspace, cache, &result, digests).await?;
+        restore(result.clone()).await?;
         restored.retain(|path| {
             !result
                 .outputs

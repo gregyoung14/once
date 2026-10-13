@@ -4,14 +4,17 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::filesystem::{
-    ensure_dir, rename_into_place, write_atomically, write_durably, write_with_durable_contents,
+    ensure_dir, rename_into_place, write_durably, write_with_durable_contents,
 };
+use crate::integrity::{self, CorruptBlob};
 use crate::{blob, ActionResult, Digest, Error, Result};
 
 mod copy;
 mod producer;
 mod staged;
+mod staging;
 mod stream;
+pub(crate) use staging::PendingBlob;
 
 pub use staged::{StagedBlob, StagedBlobReader};
 
@@ -155,17 +158,26 @@ impl Cas {
         stream::window_limit_exceeded(error)
     }
 
-    pub(crate) async fn mirror_remote_stream<R: AsyncRead + Unpin, G: Send + 'static>(
+    pub(crate) async fn mirror_remote_verified<R: AsyncRead + Unpin, G: Send + 'static>(
         &self,
         reader: R,
         expected: u64,
         compressed: bool,
+        expected_digest: Option<Digest>,
+        sha256: Option<String>,
         guard: G,
     ) -> Result<Digest> {
         let scratch = self.scratch_dir();
         ensure_dir(&scratch).await?;
         let (stored, digest) =
-            stream::ingest_remote(&scratch, reader, expected, compressed, guard).await?;
+            stream::ingest_remote_verified(&scratch, reader, expected, compressed, sha256, guard)
+                .await?;
+        if let Some(expected) = expected_digest {
+            integrity::verify(&expected, &digest).map_err(|source| Error::Io {
+                path: stored.to_path_buf(),
+                source,
+            })?;
+        }
         let final_path = self.blob_path(&digest);
         if !fs::try_exists(&final_path).await.unwrap_or(false) {
             rename_into_place(&stored, &final_path).await?;
@@ -173,13 +185,37 @@ impl Cas {
         Ok(digest)
     }
 
-    /// Read a content-addressed blob.
+    /// Read a content-addressed blob, verifying its contents before returning.
     pub async fn get_blob(&self, digest: &Digest) -> Result<Vec<u8>> {
         let path = self.blob_path(digest);
-        match fs::read(&path).await {
-            Ok(bytes) => blob::decode_bytes(bytes).map_err(|source| Error::Io { path, source }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::BlobNotFound(*digest)),
-            Err(source) => Err(Error::Io { path, source }),
+        let stored = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::BlobNotFound(*digest))
+            }
+            Err(source) => return Err(Error::Io { path, source }),
+        };
+        let verified = blob::decode_bytes(stored)
+            .map_err(|error| CorruptBlob::io_error(*digest, &error.to_string()))
+            .and_then(|bytes| {
+                integrity::verify(digest, &Digest::of_bytes(&bytes))?;
+                Ok(bytes)
+            });
+        match verified {
+            Ok(bytes) => Ok(bytes),
+            Err(source) => {
+                self.quarantine(digest, &path).await;
+                Err(Error::Io { path, source })
+            }
+        }
+    }
+
+    pub(crate) async fn quarantine(&self, digest: &Digest, path: &Path) {
+        tracing::warn!(blob_digest = %digest, "removing a local cache blob that failed its integrity check");
+        if let Err(error) = fs::remove_file(path).await {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(blob_digest = %digest, %error, "could not remove corrupt blob");
+            }
         }
     }
 
@@ -207,7 +243,7 @@ impl Cas {
     ) -> Result<()> {
         let path = self.action_path(action);
         let bytes = serde_json::to_vec(result).expect("ActionResult is serializable");
-        write_atomically(&path, &bytes).await
+        write_with_durable_contents(&path, &bytes).await
     }
 
     /// Look up a cached action result. `None` is a miss.

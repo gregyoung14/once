@@ -30,16 +30,32 @@ impl Cas {
         }
         let output_path = destination.to_path_buf();
         let error_path = output_path.clone();
-        tokio::task::spawn_blocking(move || blob::decode_file(&stored_path, &output_path, copy))
-            .await
-            .map_err(|source| Error::Io {
-                path: error_path.clone(),
-                source: io::Error::other(source.to_string()),
-            })?
-            .map_err(|source| Error::Io {
+        let expected = *digest;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop = blob::StopOnDrop(std::sync::Arc::clone(&stop));
+        let source_path = stored_path.clone();
+        let decoded = tokio::task::spawn_blocking(move || {
+            blob::decode_file(&stored_path, &output_path, &expected, &stop, copy)
+        })
+        .await
+        .map_err(|source| Error::Io {
+            path: error_path.clone(),
+            source: io::Error::other(source.to_string()),
+        })?;
+        match decoded {
+            Ok(value) => Ok(value),
+            Err(source) if crate::integrity::CorruptBlob::is(&source) => {
+                self.quarantine(digest, &source_path).await;
+                Err(Error::Io {
+                    path: source_path,
+                    source,
+                })
+            }
+            Err(source) => Err(Error::Io {
                 path: error_path,
                 source,
-            })
+            }),
+        }
     }
 }
 

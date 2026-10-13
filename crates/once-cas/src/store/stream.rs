@@ -53,15 +53,32 @@ pub(super) async fn ingest_remote<R: AsyncRead + Unpin, G: Send + 'static>(
     compressed: bool,
     guard: G,
 ) -> Result<(tempfile::TempPath, Digest)> {
-    let (path, digest, _) =
-        ingest_impl(scratch, reader, Some((expected, compressed)), guard, false).await?;
+    ingest_remote_verified(scratch, reader, expected, compressed, None, guard).await
+}
+
+pub(super) async fn ingest_remote_verified<R: AsyncRead + Unpin, G: Send + 'static>(
+    scratch: &Path,
+    reader: R,
+    expected: u64,
+    compressed: bool,
+    sha256: Option<String>,
+    guard: G,
+) -> Result<(tempfile::TempPath, Digest)> {
+    let (path, digest, _) = ingest_impl(
+        scratch,
+        reader,
+        Some((expected, compressed, sha256)),
+        guard,
+        false,
+    )
+    .await?;
     Ok((path, digest))
 }
 
 async fn ingest_impl<R: AsyncRead + Unpin, G: Send + 'static>(
     scratch: &Path,
     mut reader: R,
-    remote: Option<(u64, bool)>,
+    remote: Option<(u64, bool, Option<String>)>,
     guard: G,
     deferred_sync: bool,
 ) -> Result<(tempfile::TempPath, Digest, std::fs::File)> {
@@ -131,12 +148,16 @@ fn encode(
     raw: std::fs::File,
     encoded: std::fs::File,
     mut receiver: mpsc::Receiver<Option<Vec<u8>>>,
-    remote: Option<(u64, bool)>,
+    remote: Option<(u64, bool, Option<String>)>,
     deferred_sync: bool,
 ) -> io::Result<(bool, Digest, std::fs::File)> {
-    let expected = remote.map(|(size, _)| size);
-    if remote.is_some_and(|(_, compressed)| compressed) {
-        let mut output = output::Writer::raw(raw, expected);
+    let expected = remote.as_ref().map(|(size, _, _)| *size);
+    let compressed = remote
+        .as_ref()
+        .is_some_and(|(_, compressed, _)| *compressed);
+    let sha256 = remote.and_then(|(_, _, sha256)| sha256);
+    if compressed {
+        let mut output = output::Writer::raw(raw, expected).with_sha256(sha256);
         let mut decoder = zstd::stream::read::Decoder::new(input::Chunks::new(receiver, encoded)?)?;
         decoder.window_log_max(window::MAX_WINDOW_LOG)?;
         let mut buffer = vec![0_u8; STREAM_CHUNK * 2];
@@ -159,7 +180,7 @@ fn encode(
         let captured = decoder.finish().into_inner().finish()?;
         finish(output, Some(captured), deferred_sync)
     } else {
-        let mut output = output::Writer::new(raw, encoded, expected)?;
+        let mut output = output::Writer::new(raw, encoded, expected)?.with_sha256(sha256);
         loop {
             let chunk = receiver.blocking_recv().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "blob stream interrupted")

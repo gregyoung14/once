@@ -27,7 +27,6 @@ async fn fixture_bytes(
         .lock()
         .await
         .insert(digest, sha256_digest(bytes).unwrap());
-    *cache.capabilities_cache.lock().await = Some(RemoteCapabilities::default());
     (cache, digest, server, reads)
 }
 

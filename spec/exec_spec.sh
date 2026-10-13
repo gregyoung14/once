@@ -192,6 +192,31 @@ SH
     The path "$WORKSPACE/should-not-exist" should not be exist
   End
 
+  It 'runs a named local executor through the infrastructure binding'
+    printf '[infrastructures.native]\nkind = "local"\n' > "$WORKSPACE/once.toml"
+    When call once exec --remote --compute native -e PATH=/usr/bin:/bin -- /bin/sh -c 'printf native-output'
+    The status should be success
+    The stdout should equal 'native-output'
+    The stderr should include 'cache miss'
+  End
+
+  It 'resolves native tools and inputs for a script using a local executor alias'
+    copy_exec_fixture annotated_script
+    printf '[infrastructures.native]\nkind = "local"\n' > "$WORKSPACE/once.toml"
+    printf 'native-script-input\n' > "$WORKSPACE/input.txt"
+    When call once exec --remote --compute native -- bash scripts/build.sh
+    The status should be success
+    The stdout should equal 'native-script-input'
+    The stderr should include 'cache miss'
+  End
+
+  It 'rejects network denial on an executor that cannot enforce it'
+    When call once exec --remote --compute e2b --network deny -- /bin/sh -c 'printf must-not-run'
+    The status should be failure
+    The stdout should equal ''
+    The stderr should include 'does not support network denial'
+  End
+
   It 'runs a command through the microsandbox compute provider'
     Skip if 'microsandbox specs are opt-in' microsandbox_specs_disabled
     When call "$ONCE_BIN" -C "$WORKSPACE" exec --remote --compute microsandbox -- /bin/sh -c 'printf remote-output'

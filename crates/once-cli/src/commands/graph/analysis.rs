@@ -44,7 +44,10 @@ use once_frontend::GraphTarget;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use self::actions::{run_declared_actions, validate_declared_actions, DeclaredActionValidation};
+use self::actions::{
+    run_declared_actions_with, validate_declared_actions, DeclaredActionValidation, Producers,
+    Repair,
+};
 use self::analysis_memo::AnalysisMemo;
 use self::resolution_cache::ResolutionCache;
 use self::scheduler::{BuildScheduler, DependencyInputs};
@@ -224,6 +227,9 @@ pub(super) struct BuildSession {
     /// walks the dependency closure.
     event_bus: Option<once_core::RunEventBus>,
     suppressed_target_lifecycle: Arc<HashSet<String>>,
+    /// What produced each output this session saw, so a deferred output the
+    /// cache lost can be produced again.
+    producers: Producers,
 }
 
 struct Resolution {
@@ -379,11 +385,27 @@ impl BuildSession {
             output_observer: None,
             event_bus: None,
             suppressed_target_lifecycle: Arc::new(HashSet::new()),
+            producers: Producers::default(),
+        }
+    }
+
+    pub(super) fn executor_resources(&self) -> Result<&once_core::ExecutorResources> {
+        self.producers.executors(&self.resources)
+    }
+
+    fn repair(&self) -> Repair<'_> {
+        Repair {
+            workspace: &self.workspace,
+            cache: &self.cache,
+            source_digest_cache: Some(&self.source_digest_cache),
+            resources: &self.resources,
+            producers: &self.producers,
         }
     }
 
     pub(super) fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resources = Arc::new(ResourcePool::new(limits));
+        self.producers = Producers::default();
         self
     }
 
@@ -498,15 +520,9 @@ impl BuildSession {
             "building graph target through Starlark analysis"
         );
         let outcome = self.build_reachable(&target.label.id, &reachable).await?;
-        materialize_cached_outputs(
-            &outcome,
-            &self.workspace,
-            &self.cache,
-            Some(&self.source_digest_cache),
-            &self.resources,
-        )
-        .await
-        .with_context(|| format!("materializing outputs for {}", target.label.id))?;
+        materialize_cached_outputs(&outcome, self.repair())
+            .await
+            .with_context(|| format!("materializing outputs for {}", target.label.id))?;
         self.persist_graph_tool_cache();
         Ok(Some(outcome))
     }
@@ -552,7 +568,7 @@ impl BuildSession {
                 self.event_bus.as_ref(),
                 &target.label.id,
                 async {
-                    let outcome = run_declared_actions(
+                    let outcome = run_declared_actions_with(
                         Some(&self.analyzer),
                         &self.workspace,
                         &self.cache,
@@ -569,20 +585,15 @@ impl BuildSession {
                         self.output_observer.as_deref(),
                         self.event_bus.as_ref(),
                         &workers,
+                        &self.producers,
                     )
                     .await
                     .with_context(|| format!("executing {capability} for {}", target.label.id))?;
-                    materialize_cached_outputs(
-                        &outcome,
-                        &self.workspace,
-                        &self.cache,
-                        Some(&self.source_digest_cache),
-                        &self.resources,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("materializing {capability} outputs for {}", target.label.id)
-                    })?;
+                    materialize_cached_outputs(&outcome, self.repair())
+                        .await
+                        .with_context(|| {
+                            format!("materializing {capability} outputs for {}", target.label.id)
+                        })?;
                     Ok::<_, anyhow::Error>(outcome)
                 },
             )
@@ -639,17 +650,29 @@ impl BuildSession {
                 (role.clone(), providers)
             })
             .collect::<BTreeMap<_, _>>();
-        let analysis = analyze_with_memo(
-            &self.analyzer,
-            &self.analysis_memo,
-            &self.unchanged,
-            None,
-            target,
-            &self.workspace,
-            &dep_providers,
-            &dependency_providers,
-            capability,
-        )?;
+        // Starlark evaluation is synchronous and can take a while; keep it off
+        // the runtime threads that drive actions and transfers.
+        let analyzer = self.analyzer.clone();
+        let memo = self.analysis_memo.clone();
+        let unchanged = Arc::clone(&self.unchanged);
+        let analysis_target = target.clone();
+        let workspace = self.workspace.clone();
+        let analysis_capability = capability.to_string();
+        let analysis = tokio::task::spawn_blocking(move || {
+            analyze_with_memo(
+                &analyzer,
+                &memo,
+                &unchanged,
+                None,
+                &analysis_target,
+                &workspace,
+                &dep_providers,
+                &dependency_providers,
+                &analysis_capability,
+            )
+        })
+        .await
+        .context("joining graph analysis task")??;
         Ok(AnalyzedCapability {
             analysis,
             dep_action_digests,
@@ -811,6 +834,7 @@ impl BuildSession {
             event_bus: self.event_bus.clone(),
             suppressed_target_lifecycle: Arc::clone(&self.suppressed_target_lifecycle),
             workers,
+            producers: self.producers.clone(),
         }
     }
 
@@ -880,21 +904,13 @@ async fn intermediate_outputs_cached(
     true
 }
 
-async fn materialize_cached_outputs(
-    outcome: &BuildOutcome,
-    workspace: &Path,
-    cache: &CacheProvider,
-    source_digest_cache: Option<&SourceDigestCache>,
-    resources: &Arc<ResourcePool>,
-) -> Result<()> {
-    materialization::restore(
-        &outcome.cached_results,
-        workspace,
-        cache,
-        source_digest_cache,
-        resources,
-    )
-    .await
+/// Put a finished target's deferred outputs on disk.
+///
+/// Results whose paths overlap another's restore in order, since a later one
+/// replaces part of an earlier one. The rest touch disjoint paths and restore
+/// concurrently, bounded by how many actions may run at once.
+async fn materialize_cached_outputs(outcome: &BuildOutcome, repair: Repair<'_>) -> Result<()> {
+    materialization::restore_recovering(&outcome.cached_results, repair).await
 }
 
 /// Resolve the executables declared by the graph's tools to concrete
@@ -1237,6 +1253,19 @@ struct BuildContext {
     /// under-provisions relative to the concurrency the runner
     /// actually allows.
     pub workers: crate::bus_events::WorkerSlots,
+    pub producers: Producers,
+}
+
+impl BuildContext {
+    fn repair(&self) -> Repair<'_> {
+        Repair {
+            workspace: &self.workspace,
+            cache: &self.cache,
+            source_digest_cache: Some(&self.source_digest_cache),
+            resources: &self.resources,
+            producers: &self.producers,
+        }
+    }
 }
 
 /// Analyse one target, reusing a stored analysis when its recorded answers
@@ -1329,6 +1358,7 @@ async fn build_one(
         event_bus,
         suppressed_target_lifecycle,
         workers,
+        producers,
     } = context;
     let DependencyInputs {
         providers,
@@ -1361,9 +1391,15 @@ async fn build_one(
     );
     if let Some(key) = analysis_key
         .as_deref()
-        .map(|key| target_outcomes::key(key, &action_digests))
+        .map(|key| target_outcomes::key(key, &action_digests, &available_inputs))
     {
-        let reused = match target_outcomes.reuse(&target, &key, &changes) {
+        let reused = match target_outcomes.reuse_with_inputs(
+            &target,
+            &key,
+            &changes,
+            &available_inputs,
+            &producers,
+        ) {
             Some(outcome) if intermediate_outputs_cached(&outcome, &workspace, &cache).await => {
                 Some(outcome)
             }
@@ -1457,7 +1493,7 @@ async fn build_one(
         "finished graph target analysis"
     );
 
-    let outcome = run_declared_actions(
+    let outcome = run_declared_actions_with(
         Some(&planner),
         &workspace,
         &cache,
@@ -1474,11 +1510,12 @@ async fn build_one(
         output_observer.as_deref(),
         event_bus.as_ref(),
         &workers,
+        &producers,
     )
     .await?;
     if let Some(key) = analysis_key
         .as_deref()
-        .map(|key| target_outcomes::key(key, &action_digests))
+        .map(|key| target_outcomes::key(key, &action_digests, &available_inputs))
     {
         if !has_deferred_actions {
             target_outcomes.record(&target, key, &observations, &declared_inputs, &outcome);

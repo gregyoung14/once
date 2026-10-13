@@ -10,8 +10,10 @@ use reqwest::{blocking::Client, StatusCode, Url};
 use schlussel::{SessionStorage, Token};
 use serde::{Deserialize, Serialize};
 
+use super::super::redact;
+use super::classify::auth_error;
 use super::{env_token, TuistAuth, OIDC_TOKEN_REFRESH_WINDOW_SECONDS, PROVIDER_NAME};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 
 const OIDC_AUDIENCE: &str = "tuist";
 const OIDC_REQUEST_TIMEOUT_SECONDS: u64 = 30;
@@ -24,14 +26,13 @@ impl TuistAuth {
     }
 
     pub(super) fn exchange_and_store_ci_oidc_token(&self) -> Result<Token> {
-        let _guard = self
-            .ci_exchange_lock
-            .lock()
-            .map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "lock Continuous Integration auth token exchange",
-                message: source.to_string(),
-            })?;
+        let _guard = self.ci_exchange_lock.lock().map_err(|source| {
+            auth_error(
+                "lock Continuous Integration auth token exchange",
+                ErrorKind::Other,
+                source.to_string(),
+            )
+        })?;
         if let Some(token) = self.cached_ci_token()? {
             return Ok(token);
         }
@@ -98,38 +99,43 @@ impl TuistAuth {
             .get(url)
             .bearer_auth(request_token)
             .send()
-            .map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "fetch GitHub Actions OpenID Connect token",
-                message: source.to_string(),
+            .map_err(|source| {
+                auth_error(
+                    "fetch GitHub Actions OpenID Connect token",
+                    ErrorKind::Unavailable,
+                    redact::transport(&source),
+                )
             })?;
         let status = response.status();
-        let body = response.text().map_err(|source| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "fetch GitHub Actions OpenID Connect token",
-            message: source.to_string(),
+        let body = response.text().map_err(|source| {
+            auth_error(
+                "fetch GitHub Actions OpenID Connect token",
+                ErrorKind::Unavailable,
+                redact::transport(&source),
+            )
         })?;
         if !status.is_success() {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "fetch GitHub Actions OpenID Connect token",
-                message: status_body_message(status, &body),
-            });
+            return Err(auth_error(
+                "fetch GitHub Actions OpenID Connect token",
+                super::super::status::http_kind(status),
+                redact::http_status(status),
+            ));
         }
 
-        let token_response: OidcTokenResponse =
-            serde_json::from_str(&body).map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "decode GitHub Actions OpenID Connect token",
-                message: source.to_string(),
-            })?;
+        let token_response: OidcTokenResponse = serde_json::from_str(&body).map_err(|source| {
+            auth_error(
+                "decode GitHub Actions OpenID Connect token",
+                ErrorKind::Protocol,
+                malformed(&source),
+            )
+        })?;
         let token = token_response.value.trim();
         if token.is_empty() {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "decode GitHub Actions OpenID Connect token",
-                message: "response did not include a token".to_string(),
-            });
+            return Err(auth_error(
+                "decode GitHub Actions OpenID Connect token",
+                ErrorKind::Protocol,
+                "response did not include a token".to_string(),
+            ));
         }
         Ok(token.to_string())
     }
@@ -141,7 +147,7 @@ impl TuistAuth {
         for retry in 0..=OIDC_EXCHANGE_MAX_RETRIES {
             match Self::exchange_oidc_token_once(&client, endpoint.clone(), oidc_token) {
                 Ok(token) => return Ok(token),
-                Err(error) if retry < OIDC_EXCHANGE_MAX_RETRIES && error.retryable => {
+                Err(error) if retry < OIDC_EXCHANGE_MAX_RETRIES && error.retryable() => {
                     thread::sleep(oidc_exchange_retry_delay(retry));
                 }
                 Err(error) => return Err(error.into_remote_error()),
@@ -161,31 +167,31 @@ impl TuistAuth {
             .json(&OidcExchangeRequest { token: oidc_token })
             .send()
             .map_err(|source| OidcExchangeAttemptError {
-                message: source.to_string(),
-                retryable: true,
+                message: redact::transport(&source),
+                kind: ErrorKind::Unavailable,
             })?;
         let status = response.status();
         let body = response.text().map_err(|source| OidcExchangeAttemptError {
-            message: source.to_string(),
-            retryable: oidc_status_is_retryable(status),
+            message: redact::transport(&source),
+            kind: ErrorKind::Unavailable,
         })?;
         if !status.is_success() {
             return Err(OidcExchangeAttemptError {
-                message: status_body_message(status, &body),
-                retryable: oidc_status_is_retryable(status),
+                message: redact::http_status(status),
+                kind: oidc_status_kind(status),
             });
         }
 
         let response: OidcExchangeResponse =
             serde_json::from_str(&body).map_err(|source| OidcExchangeAttemptError {
-                message: source.to_string(),
-                retryable: false,
+                message: malformed(&source),
+                kind: ErrorKind::Protocol,
             })?;
         let access_token = response.access_token.trim();
         if access_token.is_empty() {
             return Err(OidcExchangeAttemptError {
                 message: "response did not include an access token".to_string(),
-                retryable: false,
+                kind: ErrorKind::Protocol,
             });
         }
 
@@ -197,14 +203,13 @@ impl TuistAuth {
     }
 
     fn cached_ci_token(&self) -> Result<Option<Token>> {
-        let mut cached = self
-            .cached_ci_token
-            .lock()
-            .map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "load cached Continuous Integration auth token",
-                message: source.to_string(),
-            })?;
+        let mut cached = self.cached_ci_token.lock().map_err(|source| {
+            auth_error(
+                "load cached Continuous Integration auth token",
+                ErrorKind::Other,
+                source.to_string(),
+            )
+        })?;
         let Some(token) = cached.as_ref() else {
             return Ok(None);
         };
@@ -216,14 +221,13 @@ impl TuistAuth {
     }
 
     fn remember_ci_token(&self, token: &Token) -> Result<()> {
-        let mut cached = self
-            .cached_ci_token
-            .lock()
-            .map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "store cached Continuous Integration auth token",
-                message: source.to_string(),
-            })?;
+        let mut cached = self.cached_ci_token.lock().map_err(|source| {
+            auth_error(
+                "store cached Continuous Integration auth token",
+                ErrorKind::Other,
+                source.to_string(),
+            )
+        })?;
         *cached = Some(token.clone());
         Ok(())
     }
@@ -238,10 +242,12 @@ impl TuistAuth {
         Client::builder()
             .timeout(Duration::from_secs(OIDC_REQUEST_TIMEOUT_SECONDS))
             .build()
-            .map_err(|source| Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "configure OpenID Connect client",
-                message: source.to_string(),
+            .map_err(|source| {
+                auth_error(
+                    "configure OpenID Connect client",
+                    ErrorKind::Misconfigured,
+                    source.to_string(),
+                )
             })
     }
 }
@@ -266,16 +272,16 @@ struct OidcExchangeResponse {
 #[derive(Debug)]
 struct OidcExchangeAttemptError {
     message: String,
-    retryable: bool,
+    kind: ErrorKind,
 }
 
 impl OidcExchangeAttemptError {
+    fn retryable(&self) -> bool {
+        self.kind == ErrorKind::Unavailable
+    }
+
     fn into_remote_error(self) -> Error {
-        Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "exchange OpenID Connect token",
-            message: self.message,
-        }
+        auth_error("exchange OpenID Connect token", self.kind, self.message)
     }
 }
 
@@ -286,19 +292,18 @@ fn env_is_truthy(name: &str) -> bool {
     )
 }
 
-fn status_body_message(status: StatusCode, body: &str) -> String {
-    let body = body.trim();
-    if body.is_empty() {
-        format!("HTTP {}", status.as_u16())
-    } else {
-        format!("HTTP {}: {body}", status.as_u16())
-    }
+/// A decoding failure described by position only: its text can quote the
+/// response, which may contain a token.
+fn malformed(error: &serde_json::Error) -> String {
+    format!(
+        "malformed response at line {} column {}",
+        error.line(),
+        error.column()
+    )
 }
 
-fn oidc_status_is_retryable(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
+fn oidc_status_kind(status: StatusCode) -> ErrorKind {
+    super::super::status::http_kind(status)
 }
 
 fn oidc_exchange_retry_delay(retry: usize) -> Duration {

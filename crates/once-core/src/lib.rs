@@ -18,6 +18,7 @@ pub use once_presentation::{ActionContext, ActionPackage, ActionPlatform, Action
 mod evidence;
 mod execute;
 mod execution_path;
+mod executor;
 mod file_blob;
 mod input_digest;
 mod lint_results;
@@ -66,6 +67,7 @@ pub use evidence::{
 pub use execution_path::{
     resolve_execution_argv, resolve_execution_env, resolve_execution_value, EXECUTION_ROOT_MARKER,
 };
+pub use executor::{ExecutionPermit, Executor, ExecutorResources, RemoteIoLimits, ResourceDomain};
 pub use input_digest::{
     digest_source_path, InputDigestBuilder, InputFingerprintComponent, InputFingerprintManifest,
     INPUT_FINGERPRINT_SCHEMA,
@@ -74,6 +76,9 @@ pub use lint_results::{
     read_sarif_results, LintArtifacts, LintFinding, LintLocation, LintResults, LintSeverity,
     LintSummary, LINT_RESULTS_SCHEMA,
 };
+#[cfg(unix)]
+pub use local::process_group::signal_action_process_groups;
+pub use local::process_group::GroupChild as ActionProcessGroup;
 /// Describe a directory tree by the metadata of everything in it, so a caller
 /// can tell whether the tree is still the one it hashed without reading it
 /// again. See the module documentation for what the description does and does
@@ -82,11 +87,12 @@ pub use once_host_tree::tree_stat_fingerprint;
 pub use path::{WorkspacePath, WorkspacePathError};
 pub use plan::{BuiltPlan, NodeInfo, Plan, PlanError, PlanNode, PlanOutcome};
 pub use reproducibility::{verify_reproducible, ReproducibilityDifference, ReproducibilityReport};
-pub use resource_scope::with_resource_permit;
+pub use resource_scope::{with_execution_permit, with_resource_permit};
 pub use resources::{ResourceLimits, ResourcePermit, ResourcePool, ResourceRequest};
 pub use runner::{
-    materialize_outputs, run, run_uncached, run_uncached_contract, run_uncached_observed,
-    run_with_cache, run_with_cache_streaming, CacheState, Outcome, RunOpts, Runner,
+    materialize_outputs, materialize_outputs_admitted, run, run_uncached, run_uncached_admitted,
+    run_uncached_contract, run_uncached_observed, run_with_cache, run_with_cache_streaming,
+    CacheState, Outcome, RunOpts, Runner,
 };
 pub use store::WorkspaceStore;
 pub use stream::{ActionOutputObserver, ActionOutputStream};

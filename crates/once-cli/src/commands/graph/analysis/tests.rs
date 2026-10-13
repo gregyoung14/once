@@ -286,6 +286,65 @@ fn reachable_analysis_deps_walks_only_analysis_backed_direct_deps() {
 }
 
 #[tokio::test]
+async fn legacy_capability_uses_the_sessions_invocation_budget() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache = CacheProvider::open_local(workspace.path().join(".once/cache"));
+    let graph = vec![target_of_kind(
+        "metadata_kind",
+        "Root",
+        &[],
+        &[],
+        &["build"],
+        [],
+    )];
+    let analyzer = AnalysisEngine::from_source(GRAPH_TEST_PRELUDE).unwrap();
+    let session = BuildSession::new_with_analyzer(
+        workspace.path(),
+        &cache,
+        graph.clone(),
+        analyzer,
+        SandboxMode::Off,
+    )
+    .with_resource_limits(ResourceLimits::new(1, 64 * 1024 * 1024));
+    assert!(Arc::ptr_eq(
+        &session.resources,
+        session.executor_resources().unwrap().host()
+    ));
+    assert_eq!(
+        session
+            .executor_resources()
+            .unwrap()
+            .host()
+            .limits()
+            .memory_bytes,
+        64 * 1024 * 1024
+    );
+    let reservation = session
+        .resources
+        .acquire(once_core::ResourceRequest::default())
+        .await;
+    let mut run = Box::pin(super::super::capability::run_target_capability(
+        workspace.path(),
+        &cache,
+        &graph[0],
+        "build",
+        SandboxMode::Off,
+        &session,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut run)
+            .await
+            .is_err(),
+        "legacy capability bypassed shared admission"
+    );
+    drop(reservation);
+    tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn run_with_analysis_returns_none_for_target_kinds_without_implementation() {
     let workspace = tempfile::tempdir().unwrap();
     let cache = CacheProvider::open_local(workspace.path().join(".once/cache"));

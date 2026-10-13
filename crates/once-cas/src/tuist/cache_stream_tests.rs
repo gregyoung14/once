@@ -150,6 +150,10 @@ async fn cache_for_configured_stream(
     Arc<std::sync::atomic::AtomicUsize>,
     Arc<std::sync::atomic::AtomicU64>,
 ) {
+    let mut remote_hasher = Sha256::new();
+    for chunk in chunks.iter().filter_map(|chunk| chunk.as_ref().ok()) {
+        remote_hasher.update(&chunk.data);
+    }
     let size_bytes = chunks
         .iter()
         .filter_map(|chunk| chunk.as_ref().ok())
@@ -199,22 +203,19 @@ async fn cache_for_configured_stream(
         .connect()
         .await
         .unwrap();
-    cache
-        .grpc_channel_cache
-        .set(Ok(GrpcChannels {
-            requests: channel.clone(),
-            uploads: channel,
-        }))
-        .unwrap();
-    cache.auth_token_cache.set(Ok("test-token".into())).unwrap();
+    cache.grpc_channel_cache.set(GrpcChannels {
+        requests: channel.clone(),
+        uploads: channel,
+    });
+    cache.auth_token_cache.set("test-token".into());
     cache.known_remote_blobs.lock().await.insert(
         digest,
         reapi::Digest {
             size_bytes,
-            ..sha256_digest(b"test mapping").unwrap()
+            hash: hex::encode(remote_hasher.finalize()),
         },
     );
-    *cache.capabilities_cache.lock().await = Some(capabilities);
+    cache.capabilities_cache.set(capabilities);
     (cache, server, reads, wire_bytes)
 }
 
@@ -385,11 +386,15 @@ async fn stalled_streams_fail_at_the_stall_timeout_without_retrying() {
     let remote_digest = sha256_digest(&bytes).unwrap();
     let read = tokio::time::timeout(
         Duration::from_secs(5),
-        cache.read_reapi_blob_stream(&remote_digest, "get blob"),
+        cache.stage_remote_blob(&remote_digest, "get blob"),
     )
     .await
     .expect("a stalled read must fail at its stall timeout")
     .unwrap_err();
+    let read = match read {
+        retry::Failure::Rpc(error) => status::grpc_error("get blob", &error),
+        retry::Failure::Local(error) => error,
+    };
     assert!(read.to_string().contains("made no progress"), "{read}");
     server.abort();
 }

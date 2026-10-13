@@ -4,7 +4,7 @@
 //! resolve, execute, and render it. Split out of the graph command
 //! dispatch so `mod.rs` stays a table of contents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -64,6 +64,20 @@ pub(super) async fn build_target(
     session: &analysis::BuildSession,
     sandbox: SandboxMode,
 ) -> Result<CapabilityRunRecord> {
+    build_target_deferring(workspace, cache, target, session, sandbox)
+        .await
+        .map(|(record, _)| record)
+}
+
+/// Build a target, also answering which of its outputs the build left in the
+/// cache rather than on disk.
+pub(super) async fn build_target_deferring(
+    workspace: &Path,
+    cache: &CacheProvider,
+    target: &GraphTarget,
+    session: &analysis::BuildSession,
+    sandbox: SandboxMode,
+) -> Result<(CapabilityRunRecord, BTreeSet<String>)> {
     let capability = ensure_capability(target, "build")?;
     if let Some(outcome) = session.build_with_analysis(target).await? {
         // Destructure the outcome so `outputs` moves into the record
@@ -78,9 +92,10 @@ pub(super) async fn build_target(
             cache_state,
             result,
             cache_tag,
+            intermediate_outputs,
             ..
         } = outcome;
-        Ok(CapabilityRunRecord {
+        let record = CapabilityRunRecord {
             target: target.label.id.clone(),
             kind: target.kind.clone(),
             capability: capability.name.clone(),
@@ -95,9 +110,12 @@ pub(super) async fn build_target(
             input_fingerprint,
             cache_state,
             result,
-        })
+        };
+        Ok((record, intermediate_outputs))
     } else {
-        run_target_capability(workspace, cache, target, "build", sandbox).await
+        run_target_capability(workspace, cache, target, "build", sandbox, session)
+            .await
+            .map(|record| (record, BTreeSet::new()))
     }
 }
 
@@ -131,12 +149,15 @@ pub(super) async fn run_target_capability(
     target: &GraphTarget,
     capability_name: &str,
     sandbox: SandboxMode,
+    session: &analysis::BuildSession,
 ) -> Result<CapabilityRunRecord> {
     let capability = ensure_capability(target, capability_name)?;
     let outputs = action::output_paths(target, capability_name)?;
     let mut action = action::action_for(target, capability_name, &outputs)?;
     set_sandbox(&mut action, sandbox);
-    let outcome = once_core::run_with_cache(&action, workspace, cache, RunOpts::default())
+    let outcome = once_core::Runner::with_cache(cache.clone(), workspace, RunOpts::default())
+        .with_executor_resources(session.executor_resources()?.clone())
+        .run(&action)
         .await
         .with_context(|| format!("executing {capability_name} for {}", target.label.id))?;
     if outcome.result.exit_code != 0 {

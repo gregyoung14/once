@@ -18,12 +18,47 @@ pub(crate) enum ResolvedCacheProviderConfig {
 
 const DEFAULT_EXECUTION_PROVIDER: &str = "microsandbox";
 const ONCE_CACHE_PROVIDER_ENV: &str = "ONCE_CACHE_PROVIDER";
+static TRANSFER_BUDGET: std::sync::OnceLock<once_cas::TransferBudget> = std::sync::OnceLock::new();
+
+pub(crate) fn configure_transfer_budget(budget: once_cas::TransferBudget) {
+    let _ = TRANSFER_BUDGET.set(budget);
+}
 
 pub fn resolve(workspace: &Path, xdg: &Xdg) -> Result<CacheProvider> {
-    build_provider(xdg, resolve_config(workspace, xdg)?)
+    let provider = build_provider(xdg, resolve_config(workspace, xdg)?)?;
+    Ok(match TRANSFER_BUDGET.get() {
+        Some(budget) => provider.with_transfer_budget(budget.clone()),
+        None => provider,
+    })
 }
 
 pub(crate) fn resolve_execution(
+    workspace: &Path,
+    xdg: &Xdg,
+    explicit_provider: Option<&str>,
+) -> Result<RemoteExecution> {
+    let binding = resolve_execution_unresolved(workspace, xdg, explicit_provider)?;
+    Ok(bind_environment_override(binding, |name| {
+        std::env::var(name).ok()
+    }))
+}
+
+fn bind_environment_override(
+    mut binding: RemoteExecution,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> RemoteExecution {
+    if binding.environment.is_none() {
+        let variable = match binding.executor.as_deref().unwrap_or(&binding.provider) {
+            "e2b" => Some("ONCE_E2B_TEMPLATE"),
+            "microsandbox" => Some("ONCE_MICROSANDBOX_IMAGE"),
+            _ => None,
+        };
+        binding.environment = variable.and_then(lookup).filter(|value| !value.is_empty());
+    }
+    binding
+}
+
+fn resolve_execution_unresolved(
     workspace: &Path,
     xdg: &Xdg,
     explicit_provider: Option<&str>,
@@ -509,6 +544,52 @@ pub fn project(workspace: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn provider_environment_overrides_are_bound_before_cache_identity() {
+        for (adapter, variable) in [
+            ("e2b", "ONCE_E2B_TEMPLATE"),
+            ("microsandbox", "ONCE_MICROSANDBOX_IMAGE"),
+        ] {
+            let mut binding = RemoteExecution::provider("named-fleet");
+            binding.executor = Some(adapter.into());
+            let first = bind_environment_override(binding.clone(), |name| {
+                assert_eq!(name, variable);
+                Some("environment-v1".into())
+            });
+            let second = bind_environment_override(binding, |_| Some("environment-v2".into()));
+            assert_ne!(first, second);
+            assert_eq!(first.environment.as_deref(), Some("environment-v1"));
+        }
+    }
+
+    #[test]
+    fn empty_provider_environment_override_is_unset() {
+        for provider in ["e2b", "microsandbox"] {
+            let binding = RemoteExecution::provider(provider);
+            assert_eq!(
+                bind_environment_override(binding.clone(), |_| Some(String::new())),
+                binding
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_environment_and_native_bindings_ignore_provider_defaults() {
+        let mut binding = RemoteExecution::provider("e2b");
+        binding.environment = Some("explicit-environment".into());
+        assert_eq!(
+            bind_environment_override(binding.clone(), |_| panic!("must not read defaults")),
+            binding
+        );
+        let local = RemoteExecution::provider("local");
+        assert_eq!(
+            bind_environment_override(local.clone(), |_| panic!(
+                "native execution has no template"
+            )),
+            local
+        );
+    }
 
     fn xdg_under(root: &Path) -> Xdg {
         Xdg {

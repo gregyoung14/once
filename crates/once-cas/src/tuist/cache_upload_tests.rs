@@ -253,15 +253,12 @@ async fn fixture_with_timeout(
     if let Some(timeout) = timeout {
         requests = requests.timeout(timeout);
     }
-    cache
-        .grpc_channel_cache
-        .set(Ok(GrpcChannels {
-            requests: requests.connect().await.unwrap(),
-            uploads: endpoint.connect().await.unwrap(),
-        }))
-        .unwrap();
-    cache.auth_token_cache.set(Ok("test-token".into())).unwrap();
-    *cache.capabilities_cache.lock().await = Some(RemoteCapabilities::default());
+    cache.grpc_channel_cache.set(GrpcChannels {
+        requests: requests.connect().await.unwrap(),
+        uploads: endpoint.connect().await.unwrap(),
+    });
+    cache.auth_token_cache.set("test-token".into());
+    cache.capabilities_cache.set(RemoteCapabilities::default());
     (cache, service, server)
 }
 
@@ -389,9 +386,7 @@ async fn batch_upload_retries_individual_transient_status_but_not_permission_den
             .await;
         assert_eq!(result.is_ok(), succeeds);
         if let Err(error) = result {
-            assert!(error
-                .to_string()
-                .contains("REAPI status 7: injected blob status"));
+            assert!(error.to_string().ends_with("REAPI status 7"));
         }
         assert_eq!(service.0.lock().await.blobs.len(), calls);
         server.abort();
@@ -402,14 +397,12 @@ async fn batch_upload_retries_individual_transient_status_but_not_permission_den
 async fn streamed_upload_reopens_file_and_restarts_memory_body_with_fresh_resource() {
     for (from_file, compressed) in [(false, false), (false, true), (true, false), (true, true)] {
         let temp = tempfile::TempDir::new().unwrap();
-        let (cache, service, server) = fixture(&temp).await;
-        cache
-            .capabilities_cache
-            .lock()
-            .await
-            .as_mut()
-            .unwrap()
-            .zstd_streams = compressed;
+        let (mut cache, service, server) = fixture(&temp).await;
+        cache.capabilities_cache = Arc::default();
+        cache.capabilities_cache.set(RemoteCapabilities {
+            zstd_streams: compressed,
+            ..RemoteCapabilities::default()
+        });
         service.0.lock().await.failures.insert(
             "write",
             VecDeque::from([Status::internal("h2 protocol error: http2 error")]),
@@ -474,7 +467,10 @@ async fn request_timeouts_are_not_retried() {
     .await
     .expect("a timed out request must not be retried until the test deadline")
     .unwrap_err();
-    assert!(error.to_string().contains("Timeout expired"), "{error}");
+    assert!(
+        error.to_string().contains("the request timed out"),
+        "{error}"
+    );
     assert_eq!(service.0.lock().await.actions.len(), 1);
     server.abort();
 }
@@ -578,7 +574,7 @@ fn batch_upload_outcome_classifies_per_blob_statuses() {
         ));
     }
     for (status, message) in [
-        (Some(Code::InvalidArgument), "REAPI status 3: blob status"),
+        (Some(Code::InvalidArgument), "REAPI status 3"),
         (None, "Kura returned no status for blob upload"),
     ] {
         assert!(matches!(

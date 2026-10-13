@@ -70,6 +70,26 @@ fn memory_budget_is_partitioned_across_workers() {
     assert_eq!(worker_memory_limit(0, 8), 0);
 }
 
+#[test]
+fn cpu_budget_is_partitioned_across_workers() {
+    assert_eq!(worker_cpu_limit(8, 2), 4);
+    assert_eq!(worker_cpu_limit(8, 3), 2);
+    assert_eq!(worker_cpu_limit(2, 2), 1);
+    assert_eq!(worker_cpu_limit(1, 4), 1);
+    assert_eq!(worker_cpu_limit(8, 0), 8);
+}
+
+#[test]
+fn concurrent_batches_never_admit_more_cpu_than_the_schedule() {
+    for cpu_slots in 1..=16 {
+        let limits = ResourceLimits::new(cpu_slots, 0);
+        for requested in 1..=20 {
+            let workers = worker_count(Some(bounded_worker_request(Some(requested), &limits)), 64);
+            assert!(workers * worker_cpu_limit(cpu_slots, workers) <= cpu_slots);
+        }
+    }
+}
+
 fn plan(targets: &[&str]) -> TestPlan {
     TestPlan::for_selected_targets(TestSelectionReport {
         schema: TEST_SELECTION_SCHEMA.to_string(),

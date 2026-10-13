@@ -33,23 +33,35 @@ impl TuistCache {
         compressed: bool,
         guard: G,
     ) -> std::result::Result<(), retry::Failure> {
+        let expected = u64::try_from(remote_digest.size_bytes).map_err(|_| {
+            status::remote(
+                "get blob",
+                ErrorKind::Protocol,
+                "remote blob has invalid declared size",
+            )
+        })?;
+        let message_limit = stream_limits::message_bytes(expected, self.budget.memory_bytes());
+        let staging = self
+            .budget
+            .reserve_staging(stream_limits::staging_bytes(expected))
+            .await?;
+        let memory = self
+            .budget
+            .reserve_memory(stream_limits::memory_bytes(message_limit))
+            .await?;
         let permit = Arc::clone(&self.transfer_limit)
             .acquire_owned()
             .await
             .expect("transfer semaphore remains open");
-        let expected = u64::try_from(remote_digest.size_bytes).map_err(|_| Error::Remote {
-            provider: PROVIDER_NAME,
-            operation: "get blob",
-            message: "remote blob has invalid declared size".into(),
-        })?;
         let compressor = if compressed {
             reapi::compressor::Value::Zstd
         } else {
             reapi::compressor::Value::Identity
         };
         let channel = self.grpc_channel().await?;
-        let mut client =
-            ByteStreamClient::new(channel).max_decoding_message_size(BYTE_STREAM_MESSAGE_LIMIT);
+        let mut client = ByteStreamClient::new(channel).max_decoding_message_size(
+            usize::try_from(message_limit).unwrap_or(BYTE_STREAM_MESSAGE_LIMIT),
+        );
         let request = bytestream::ReadRequest {
             resource_name: byte_stream_read_resource(
                 &self.instance_name(),
@@ -75,15 +87,16 @@ impl TuistCache {
             self.stream_stall_timeout,
             expected,
             compressed,
-            (permit, guard),
+            (*digest, remote_digest.hash.clone()),
+            (permit, memory, staging, guard),
         )
         .await?;
         if mirrored != *digest {
-            return Err(Error::Remote {
-                provider: PROVIDER_NAME,
-                operation: "get blob",
-                message: format!("remote blob {digest} did not match requested digest"),
-            }
+            return Err(status::remote(
+                "get blob",
+                ErrorKind::Corrupt,
+                format!("remote blob {digest} did not match requested digest"),
+            )
             .into());
         }
         Ok(())

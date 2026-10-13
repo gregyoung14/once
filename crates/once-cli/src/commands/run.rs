@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use once_cas::CacheProvider;
 use once_core::{
-    Action, CacheState, EvidenceSubject, RemoteExecution, ResourceLimits, RunOpts, SandboxMode,
+    Action, CacheState, EvidenceSubject, RemoteExecution, ResourceLimits, RunOpts, SandboxMode, Xdg,
 };
 
 use self::action::action_for;
@@ -20,6 +20,7 @@ use crate::cli::{exit_from, Output};
 use crate::commands::util::{cache_tag, find_target};
 
 pub struct RunArgs {
+    pub xdg: Xdg,
     pub output: Output,
     pub runtime_rpc: bool,
     pub runtime_rpc_socket: Option<PathBuf>,
@@ -37,7 +38,7 @@ pub async fn run(
     let (targets, idx) = find_target(workspace, target_id)?;
     let target = &targets[idx];
 
-    let mut plan = action_for(workspace, target).await?;
+    let mut plan = action_for(workspace, target, &args.xdg).await?;
     if let Some(remote) = args.remote.clone() {
         set_remote(&mut plan.action, remote);
     }
@@ -100,6 +101,7 @@ async fn finish_run(
     streams_live: bool,
 ) -> Result<()> {
     let RunArgs {
+        xdg: _,
         output,
         runtime_rpc,
         runtime_rpc_socket,

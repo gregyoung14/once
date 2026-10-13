@@ -1,8 +1,11 @@
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ResourceRequest, Result};
+use super::super::lifecycle::{self, Lookup, Marker, MARKER_KEY};
+use crate::{Error, RemoteIoLimits, ResourceRequest, Result};
 
 #[derive(Clone)]
 pub(super) struct Config {
@@ -42,6 +45,7 @@ impl Config {
 pub(super) struct Client {
     pub(super) http: reqwest::Client,
     pub(super) config: Config,
+    pub(super) limits: RemoteIoLimits,
 }
 
 #[derive(Clone, Deserialize)]
@@ -64,6 +68,17 @@ struct CreateRequest {
     memory: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     build_info: Option<BuildInfo>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<&'static str, String>,
+}
+
+#[derive(Deserialize)]
+struct ListedSandbox {
+    id: String,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -76,22 +91,39 @@ impl Client {
     pub(super) fn new(config: Config) -> Result<Self> {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(http_error)?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            limits: RemoteIoLimits::default(),
+        })
     }
 
-    pub(super) async fn create(
+    /// Creates a sandbox tagged with the lifecycle marker in its labels.
+    pub(super) async fn create_marked(
         &self,
         image: Option<&str>,
         resources: &ResourceRequest,
         timeout_ms: Option<u64>,
+        marker: Option<&Marker>,
     ) -> Result<Sandbox> {
-        let auto_stop_interval = timeout_ms
-            .map_or(15, |value| value.div_ceil(60_000).saturating_add(5))
-            .max(1);
+        let auto_stop_interval = auto_stop_minutes(timeout_ms);
+        let labels = marker
+            .map(|marker| BTreeMap::from([(MARKER_KEY, marker.nonce.clone())]))
+            .unwrap_or_default();
         let memory = (resources.memory_bytes > 0)
             .then(|| resources.memory_bytes.div_ceil(1024 * 1024 * 1024));
+        if let Some(image) = image {
+            super::super::http::check_size(
+                u64::try_from(image.len()).unwrap_or(u64::MAX),
+                self.limits.control_bytes(),
+                "daytona",
+                "request metadata bytes",
+            )?;
+        }
         let build_info = image.map(|image| BuildInfo {
             dockerfile_content: format!("FROM {image}"),
         });
@@ -103,18 +135,40 @@ impl Client {
             ))
             .bearer_auth(&self.config.api_key)
             .timeout(Duration::from_mins(1))
-            .json(&CreateRequest {
-                auto_delete_interval: 0,
-                auto_stop_interval,
-                cpu: resources.cpu_slots.max(1),
-                memory,
-                build_info,
-            })
+            .header("Content-Type", "application/json")
+            .body(super::super::http::encode(
+                &CreateRequest {
+                    auto_delete_interval: 0,
+                    auto_stop_interval,
+                    cpu: resources.cpu_slots.max(1),
+                    memory,
+                    build_info,
+                    labels,
+                },
+                "daytona",
+                self.limits.control_bytes(),
+            )?)
             .send()
             .await
             .map_err(http_error)?;
-        let mut sandbox: Sandbox = decode(response).await?;
+        let sandbox: Sandbox = super::super::http::decode(
+            response,
+            "daytona",
+            self.limits.control_bytes(),
+            self.limits,
+        )
+        .await?;
         tracing::debug!(provider = "daytona", sandbox = %sandbox.id, "created remote sandbox");
+        Ok(sandbox)
+    }
+
+    /// Polls a created sandbox until it starts. Callers register cleanup
+    /// before waiting so a failed or cancelled startup still deletes it.
+    pub(super) async fn wait_started(
+        &self,
+        mut sandbox: Sandbox,
+        timeout_ms: Option<u64>,
+    ) -> Result<Sandbox> {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs(timeout_ms));
         while sandbox.state.as_deref() != Some("started") {
             if matches!(
@@ -150,7 +204,61 @@ impl Client {
             .send()
             .await
             .map_err(http_error)?;
-        decode(response).await
+        super::super::http::decode(
+            response,
+            "daytona",
+            self.limits.control_bytes(),
+            self.limits,
+        )
+        .await
+    }
+
+    /// Lists sandboxes whose labels carry `nonce`. Destroyed sandboxes count
+    /// as gone.
+    pub(super) async fn find_marked(&self, nonce: &str) -> Result<Lookup> {
+        let labels = serde_json::json!({ MARKER_KEY: nonce }).to_string();
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/sandbox",
+            self.config.control_url.trim_end_matches('/')
+        ))
+        .map_err(|_| api_error("invalid control URL".to_string()))?;
+        url.query_pairs_mut().append_pair("labels", &labels);
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.config.api_key)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(http_error)?;
+        let listed: Vec<ListedSandbox> = super::super::http::decode(
+            response,
+            "daytona",
+            self.limits.control_bytes(),
+            self.limits,
+        )
+        .await?;
+        Ok(lifecycle::classify(
+            listed.iter().map(|sandbox| {
+                let marker = sandbox
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(MARKER_KEY))
+                    .map(String::as_str);
+                let live = sandbox.state.as_deref() != Some("destroyed");
+                (sandbox.id.as_str(), marker, live)
+            }),
+            nonce,
+            false,
+        ))
+    }
+
+    pub(super) fn scope(&self) -> String {
+        lifecycle::scope("daytona", &self.config.control_url)
+    }
+
+    pub(super) fn credential(&self) -> String {
+        lifecycle::credential("daytona", &self.config.api_key)
     }
 
     pub(super) async fn delete(&self, id: &str) -> Result<()> {
@@ -165,18 +273,55 @@ impl Client {
             .send()
             .await
             .map_err(http_error)?;
-        expect_success(response).await?;
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            expect_success(response)?;
+        }
         tracing::debug!(provider = "daytona", sandbox = id, "deleted remote sandbox");
         Ok(())
     }
 
-    pub(super) fn toolbox_base(&self, sandbox: &Sandbox) -> String {
+    pub(super) fn toolbox_base(&self, sandbox: &Sandbox) -> Result<String> {
         let root = sandbox
             .toolbox_proxy_url
             .as_deref()
             .unwrap_or(&self.config.toolbox_url);
-        format!("{}/{}", root.trim_end_matches('/'), sandbox.id)
+        let candidate = reqwest::Url::parse(root).map_err(|_| Self::untrusted_toolbox())?;
+        let trusted = [&self.config.control_url, &self.config.toolbox_url]
+            .iter()
+            .any(|url| {
+                reqwest::Url::parse(url).is_ok_and(|trusted| trusted.origin() == candidate.origin())
+            });
+        if !trusted
+            || !candidate.username().is_empty()
+            || candidate.password().is_some()
+            || candidate.query().is_some()
+            || candidate.fragment().is_some()
+        {
+            return Err(Self::untrusted_toolbox());
+        }
+        Ok(format!("{}/{}", root.trim_end_matches('/'), sandbox.id))
     }
+
+    fn untrusted_toolbox() -> Error {
+        Error::RemoteProviderConfig {
+            provider: "daytona".to_string(),
+            message: "toolbox proxy must use a configured control or toolbox origin without user-info, query, or fragment".to_string(),
+        }
+    }
+}
+
+fn auto_stop_minutes(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms
+        .map_or(15, |value| value.div_ceil(60_000).saturating_add(5))
+        .max(1)
+}
+
+/// How long a created sandbox may take to start and then idle until the
+/// provider stops and, with a zero auto-delete interval, deletes it.
+pub(super) fn lifetime(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_secs(
+        timeout_secs(timeout_ms).saturating_add(auto_stop_minutes(timeout_ms).saturating_mul(60)),
+    )
 }
 
 fn timeout_secs(timeout_ms: Option<u64>) -> u64 {
@@ -185,28 +330,16 @@ fn timeout_secs(timeout_ms: Option<u64>) -> u64 {
         .max(1)
 }
 
-async fn decode<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> Result<T> {
-    checked(response).await?.json().await.map_err(http_error)
+pub(super) fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
+    super::super::http::checked(response, "daytona")
 }
 
-pub(super) async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(api_error(format!("HTTP {status}: {body}")))
-}
-
-pub(super) async fn expect_success(response: reqwest::Response) -> Result<()> {
-    checked(response).await.map(|_| ())
+pub(super) fn expect_success(response: reqwest::Response) -> Result<()> {
+    checked(response).map(|_| ())
 }
 
 pub(super) fn http_error(source: reqwest::Error) -> Error {
-    Error::RemoteProviderHttp {
-        provider: "daytona".to_string(),
-        source,
-    }
+    super::super::http::http_error("daytona", source)
 }
 
 fn api_error(message: String) -> Error {

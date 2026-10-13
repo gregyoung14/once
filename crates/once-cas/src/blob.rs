@@ -3,7 +3,15 @@ use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::Path;
 
-use zstd::stream::{decode_all, encode_all};
+use crate::{
+    integrity::{self, CorruptBlob, HashingWriter},
+    Digest,
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use zstd::stream::encode_all;
 
 pub(crate) const ZSTD_BLOB_MAGIC: &[u8] = b"once.cas.zstd.v1\0";
 pub(crate) const ZSTD_BLOB_HEADER_LEN: usize = ZSTD_BLOB_MAGIC.len() + RAW_SIZE_LEN;
@@ -40,7 +48,12 @@ pub(crate) fn decode_bytes(stored: Vec<u8>) -> io::Result<Vec<u8>> {
     let compressed = stored
         .get(ZSTD_BLOB_HEADER_LEN..)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated zstd blob body"))?;
-    let decoded = decode_all(compressed)?;
+    let mut inflater = zstd::stream::read::Decoder::new(compressed)?;
+    inflater.window_log_max(23)?;
+    let mut decoded = Vec::new();
+    inflater
+        .take(raw_len.saturating_add(1))
+        .read_to_end(&mut decoded)?;
     if decoded.len() as u64 != raw_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -64,6 +77,8 @@ pub(crate) fn raw_size_from_header(header: &[u8]) -> Option<u64> {
 pub(crate) fn decode_file<T>(
     stored_path: &Path,
     output_path: &Path,
+    expected: &Digest,
+    stop: &AtomicBool,
     copy: impl FnOnce(&mut dyn Read, &mut dyn io::Write) -> io::Result<T>,
 ) -> io::Result<T> {
     let mut input = File::open(stored_path)?;
@@ -78,27 +93,73 @@ pub(crate) fn decode_file<T>(
     }
     input.rewind()?;
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut output = tempfile::NamedTempFile::new_in(parent)?;
-    let result = if header_len == ZSTD_BLOB_HEADER_LEN && header.starts_with(ZSTD_BLOB_MAGIC) {
-        let raw_size = raw_size_from_header(&header).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "truncated zstd blob header")
-        })?;
+    let mut output = HashingWriter::new(tempfile::NamedTempFile::new_in(parent)?);
+    let raw_size = (header_len == ZSTD_BLOB_HEADER_LEN && header.starts_with(ZSTD_BLOB_MAGIC))
+        .then(|| raw_size_from_header(&header))
+        .flatten();
+    let result = if let Some(raw_size) = raw_size {
         input.seek(io::SeekFrom::Start(ZSTD_BLOB_HEADER_LEN as u64))?;
-        let mut decoded = zstd::stream::read::Decoder::new(input)?;
-        let result = copy(&mut decoded, &mut output)?;
-        if output.as_file().metadata()?.len() != raw_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "zstd blob decoded size mismatch",
-            ));
-        }
-        result
+        let mut decoded = zstd::stream::read::Decoder::new(input)
+            .map_err(|error| CorruptBlob::io_error(*expected, &error.to_string()))?;
+        decoded
+            .window_log_max(23)
+            .map_err(|error| CorruptBlob::io_error(*expected, &error.to_string()))?;
+        let mut reader = Stoppable {
+            input: decoded.take(raw_size.saturating_add(1)),
+            stop,
+        };
+        copy(&mut reader, &mut output).map_err(|error| {
+            if error.raw_os_error().is_none() && error.kind() != io::ErrorKind::Interrupted {
+                CorruptBlob::io_error(*expected, &error.to_string())
+            } else {
+                error
+            }
+        })?
     } else {
-        copy(&mut input, &mut output)?
+        let mut reader = Stoppable { input, stop };
+        copy(&mut reader, &mut output)?
     };
+    integrity::verify(expected, &output.digest())?;
+    let output = output.into_inner();
+    if raw_size.is_some_and(|size| {
+        output
+            .as_file()
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() != size)
+    }) {
+        return Err(CorruptBlob::io_error(
+            *expected,
+            "zstd blob decoded size mismatch",
+        ));
+    }
     output.as_file().sync_all()?;
+    if stop.load(Ordering::Acquire) {
+        return Err(cancelled());
+    }
     output.persist(output_path).map_err(|error| error.error)?;
     Ok(result)
+}
+
+struct Stoppable<'a, R> {
+    input: R,
+    stop: &'a AtomicBool,
+}
+impl<R: Read> Read for Stoppable<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(cancelled());
+        }
+        self.input.read(bytes)
+    }
+}
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "blob restore was cancelled")
+}
+pub(crate) struct StopOnDrop(pub(crate) Arc<AtomicBool>);
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 fn read_raw_size(bytes: &[u8]) -> u64 {

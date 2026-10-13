@@ -20,13 +20,15 @@ use crate::commands::util::relative_path;
 pub(super) async fn script_action(
     workspace: &std::path::Path,
     target: &once_frontend::Target,
+    xdg: &once_core::Xdg,
 ) -> Result<ActionPlan> {
-    script_action_with_env(workspace, target, &|name| env::var(name).ok()).await
+    script_action_with_env(workspace, target, xdg, &|name| env::var(name).ok()).await
 }
 
 async fn script_action_with_env(
     workspace: &std::path::Path,
     target: &once_frontend::Target,
+    xdg: &once_core::Xdg,
     host_env_value: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ActionPlan> {
     let cache = target
@@ -45,7 +47,7 @@ async fn script_action_with_env(
     let inputs = input_paths(target)?;
     let cwd = cwd(target)?;
     let resources = resources(target)?;
-    let remote = remote(target);
+    let remote = remote(workspace, target, xdg)?;
     let output_symlink_mode = output_symlink_mode(target)?;
 
     if !target.attrs.contains_key("script_path") {
@@ -121,11 +123,16 @@ async fn file_script_action(
     })
 }
 
-fn remote(target: &once_frontend::Target) -> Option<RemoteExecution> {
+fn remote(
+    workspace: &std::path::Path,
+    target: &once_frontend::Target,
+    xdg: &once_core::Xdg,
+) -> Result<Option<RemoteExecution>> {
     target
         .attrs
         .get("remote_provider")
-        .map(RemoteExecution::provider)
+        .map(|provider| crate::cache_provider::resolve_execution(workspace, xdg, Some(provider)))
+        .transpose()
 }
 
 fn runtime_args(target: &once_frontend::Target) -> Result<Vec<String>> {
@@ -286,6 +293,32 @@ mod tests {
         u128::from_le_bytes(bytes)
     }
 
+    #[test]
+    fn remote_provider_uses_the_dispatch_configuration_directory() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = once_core::Xdg {
+            cache_home: tmp.path().join("cache"),
+            state_home: tmp.path().join("state"),
+            data_home: tmp.path().join("data"),
+            config_home: tmp.path().join("isolated-config"),
+            runtime_dir: tmp.path().join("runtime"),
+        };
+        let config = xdg.config_home.join("once");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[infrastructures.dispatch_only]\nkind = \"tuist\"\naccount = \"selected-account\"\n",
+        )
+        .unwrap();
+        let mut target = script_target("");
+        target
+            .attrs
+            .insert("remote_provider".into(), "dispatch_only".into());
+        let binding = remote(tmp.path(), &target, &xdg).unwrap().unwrap();
+        assert_eq!(binding.provider, "dispatch_only");
+        assert_eq!(binding.account.as_deref(), Some("selected-account"));
+    }
+
     #[tokio::test]
     async fn host_script_action_uses_cwd_relative_script_path() {
         let tmp = TempDir::new().unwrap();
@@ -309,11 +342,12 @@ mod tests {
             "script_env_json".into(),
             "[\"ONCE_TEST_HOST_SCRIPT_ENV\"]".into(),
         );
-        let plan = script_action_with_env(tmp.path(), &target, &|name| {
-            (name == "ONCE_TEST_HOST_SCRIPT_ENV").then(|| "present".to_string())
-        })
-        .await
-        .unwrap();
+        let plan =
+            script_action_with_env(tmp.path(), &target, &once_core::Xdg::from_env(), &|name| {
+                (name == "ONCE_TEST_HOST_SCRIPT_ENV").then(|| "present".to_string())
+            })
+            .await
+            .unwrap();
         let Action::RunCommand {
             argv,
             env,

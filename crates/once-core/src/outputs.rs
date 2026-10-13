@@ -37,6 +37,27 @@ pub(crate) async fn restore(
     workspace_root: &Path,
     cache: &CacheProvider,
 ) -> Result<()> {
+    restore_admitted(result, workspace_root, cache, None).await
+}
+
+pub(crate) async fn restore_admitted(
+    result: &ActionResult,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    lease: Option<crate::ExecutionPermit>,
+) -> Result<()> {
+    let work = Box::pin(restore_scoped(result, workspace_root, cache));
+    match lease {
+        Some(lease) => crate::with_execution_permit(lease, work).await,
+        None => work.await,
+    }
+}
+
+async fn restore_scoped(
+    result: &ActionResult,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+) -> Result<()> {
     let outputs = outputs_needing_restore(result, workspace_root).await?;
     if outputs.outputs.is_empty() {
         return Ok(());
@@ -56,23 +77,45 @@ pub(crate) async fn restore(
         .await;
     }
     commit::run(|| {
-        let mut lock = output_restore_lock(workspace_root)?;
-        let _guard = lock.write().map_err(|source| Error::RestoreOutput {
-            path: output_restore_lock_path(workspace_root)
-                .display()
-                .to_string(),
-            source,
-        })?;
-        for output in prefetched {
-            let PrefetchedOutput { rel, digest, blob } = output;
-            let abs = workspace_root.join(&rel);
-            if existing_output_matches_digest(&abs, digest) {
-                continue;
+        with_output_lock(workspace_root, || {
+            for output in prefetched {
+                let PrefetchedOutput { rel, digest, blob } = output;
+                let abs = workspace_root.join(&rel);
+                if existing_output_matches_digest(&abs, digest) {
+                    continue;
+                }
+                restore_prefetched_output(&rel, &abs, blob.into_reader()?)?;
             }
-            restore_prefetched_output(&rel, &abs, blob.into_reader()?)?;
-        }
-        Ok(())
+            Ok(())
+        })
     })
+}
+
+pub(crate) fn with_output_lock<T>(
+    workspace_root: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let mut lock = output_restore_lock(workspace_root)?;
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_write() {
+            Ok(_guard) => return operation(),
+            Err(source)
+                if source.kind() == std::io::ErrorKind::WouldBlock
+                    && started.elapsed() < std::time::Duration::from_secs(30) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(source) => {
+                return Err(Error::RestoreOutput {
+                    path: output_restore_lock_path(workspace_root)
+                        .display()
+                        .to_string(),
+                    source,
+                })
+            }
+        }
+    }
 }
 
 fn output_restore_lock(workspace_root: &Path) -> Result<RwLock<std::fs::File>> {
@@ -136,7 +179,12 @@ async fn outputs_needing_restore(
         .iter()
         .map(|(path, digest)| (path.clone(), *digest))
         .collect::<VecDeque<_>>();
-    let mut slots = WorkerSlots::new(pending.len().min(RESTORE_PREFETCH_CONCURRENCY));
+    let limit = crate::resource_scope::current().map_or(RESTORE_PREFETCH_CONCURRENCY, |owner| {
+        usize::try_from(owner.request().memory_bytes / (1024 * 1024))
+            .unwrap_or(usize::MAX)
+            .clamp(1, RESTORE_PREFETCH_CONCURRENCY)
+    });
+    let mut slots = WorkerSlots::new(pending.len().min(limit));
     let mut tasks = JoinSet::new();
     while let Some(slot) = slots.take() {
         let (path, digest) = pending.pop_front().expect("available validation slot");
@@ -328,7 +376,31 @@ fn restore_legacy_file(rel: &str, abs: &Path, blob: impl Read) -> Result<()> {
 
 /// Hash and store every declared output in the CAS, returning the
 /// (path -> digest) map that goes into the cached `ActionResult`.
+#[cfg(test)]
 pub(crate) async fn capture(
+    outputs: &[WorkspacePath],
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    symlink_mode: OutputSymlinkMode,
+) -> Result<BTreeMap<String, Digest>> {
+    capture_admitted(outputs, workspace_root, cache, symlink_mode, None).await
+}
+
+pub(crate) async fn capture_admitted(
+    outputs: &[WorkspacePath],
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    symlink_mode: OutputSymlinkMode,
+    lease: Option<&crate::ExecutionPermit>,
+) -> Result<BTreeMap<String, Digest>> {
+    let work = Box::pin(capture_scoped(outputs, workspace_root, cache, symlink_mode));
+    match lease {
+        Some(lease) => crate::with_execution_permit(lease.clone(), work).await,
+        None => work.await,
+    }
+}
+
+async fn capture_scoped(
     outputs: &[WorkspacePath],
     workspace_root: &Path,
     cache: &CacheProvider,

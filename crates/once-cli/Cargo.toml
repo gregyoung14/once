@@ -52,6 +52,11 @@ signal-hook = "0.3"
 [target.'cfg(windows)'.dependencies]
 anstyle-query = "1.1"
 
+[dev-dependencies]
+sha2.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+bazel-remote-apis.workspace = true
+
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.30", features = ["term", "signal"] }
 rustix = { version = "1", features = ["process"] }

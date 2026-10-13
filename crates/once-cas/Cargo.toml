@@ -12,6 +12,8 @@ bazel-remote-apis.workspace = true
 blake3.workspace = true
 futures.workspace = true
 hex.workspace = true
+# Decodes `google.rpc` error details; the version bazel-remote-apis already uses.
+prost = "0.14"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

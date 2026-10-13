@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use once_cas::Digest;
 
+use super::actions::TouchedPath;
+use super::AvailableInput;
+
 pub(super) fn prune_replaced_descendants<T>(
     previous: &mut BTreeMap<String, T>,
     replacements: &BTreeMap<String, Digest>,
@@ -18,9 +21,78 @@ pub(super) fn prune_replaced_descendants<T>(
     });
 }
 
+/// Stop treating an output as on disk once an action that ran replaced it
+/// without producing it again.
+///
+/// Cleaning, removing, or overwriting a path takes away whatever another
+/// action left there, so a later reader has to restore it rather than trust
+/// a flag that described the disk before the action ran.
+pub(super) fn forget_replaced_materializations(
+    inputs: &mut BTreeMap<String, AvailableInput>,
+    touched: &[TouchedPath],
+    produced: &BTreeMap<String, Digest>,
+) {
+    for (path, input) in inputs.iter_mut() {
+        if !input.materialized || within_any(path, produced.keys()) {
+            continue;
+        }
+        if touched.iter().any(|touched| match touched {
+            TouchedPath::Replaced(replaced) => is_within(path, replaced),
+            TouchedPath::Created(_) => false,
+        }) {
+            input.materialized = false;
+        }
+    }
+}
+
+fn within_any<'a>(path: &str, roots: impl IntoIterator<Item = &'a String>) -> bool {
+    roots.into_iter().any(|root| is_within(path, root))
+}
+
+fn is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn available(materialized: bool) -> AvailableInput {
+        AvailableInput {
+            blob_digest: Digest::of_bytes(b"input"),
+            same_target: true,
+            materialized,
+        }
+    }
+
+    #[test]
+    fn replacing_a_path_forgets_outputs_at_or_under_it_but_not_its_own() {
+        let mut inputs = BTreeMap::from([
+            ("out/a".to_string(), available(true)),
+            ("out/tree/child".to_string(), available(true)),
+            ("out/tree-sibling".to_string(), available(true)),
+            ("out/created/kept".to_string(), available(true)),
+            ("out/new".to_string(), available(true)),
+        ]);
+        let touched = vec![
+            TouchedPath::Replaced("out/a".to_string()),
+            TouchedPath::Replaced("out/tree".to_string()),
+            TouchedPath::Replaced("out/new".to_string()),
+            TouchedPath::Created("out/created".to_string()),
+        ];
+        let produced = BTreeMap::from([("out/new".to_string(), Digest::of_bytes(b"new"))]);
+
+        forget_replaced_materializations(&mut inputs, &touched, &produced);
+
+        assert!(!inputs["out/a"].materialized);
+        assert!(!inputs["out/tree/child"].materialized);
+        assert!(inputs["out/tree-sibling"].materialized);
+        assert!(inputs["out/created/kept"].materialized);
+        assert!(inputs["out/new"].materialized);
+    }
 
     #[test]
     fn a_new_tree_supersedes_deleted_and_modified_child_records() {

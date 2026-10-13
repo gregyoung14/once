@@ -11,19 +11,14 @@ use once_frontend::analysis::{AnalysisResult, DeclaredActionOperation};
 use once_frontend::GraphTarget;
 
 use super::{
-    expose_target_tools, materialize_available_inputs, pending_outputs, run_declared_action,
-    scheduling, AvailableInput, BuildOutcome, DeclaredActionRun, DeclaredActionsState,
-    SourceDigestCache, EVIDENCE_FLUSH_BATCH_SIZE,
+    expose_target_tools, pending_outputs, run_declared_action, scheduling, AvailableInput,
+    BuildOutcome, DeclaredActionRun, DeclaredActionsState, Producers, Repair, SourceDigestCache,
+    WorkerLease, EVIDENCE_FLUSH_BATCH_SIZE,
 };
 
-/// Materialise each declared action through the action cache, then
-/// fold the analysis provider directly into the build outcome.
-///
-/// Returns a boxed future intentionally because the concrete future
-/// captures declared action state and cache execution state. Boxing at
-/// this boundary keeps parent graph futures small enough for
-/// `clippy::large_futures` and centralizes the allocation.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// [`run_declared_actions_with`] with producers known only to this target.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
     analyzer: Option<&'a once_frontend::analysis::AnalysisEngine>,
     workspace: &'a Path,
@@ -43,6 +38,66 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
     workers: &'a crate::bus_events::WorkerSlots,
 ) -> Pin<Box<dyn Future<Output = Result<BuildOutcome>> + Send + 'a>> {
     Box::pin(async move {
+        let producers = Producers::default();
+        run_declared_actions_with(
+            analyzer,
+            workspace,
+            cache,
+            module_source_digest,
+            target,
+            capability,
+            analysis,
+            dep_action_digests,
+            dependency_inputs,
+            tool_paths,
+            source_digest_cache,
+            sandbox,
+            resources,
+            output_observer,
+            event_bus,
+            workers,
+            &producers,
+        )
+        .await
+    })
+}
+
+/// Materialise each declared action through the action cache, then
+/// fold the analysis provider directly into the build outcome.
+///
+/// Returns a boxed future intentionally because the concrete future
+/// captures declared action state and cache execution state. Boxing at
+/// this boundary keeps parent graph futures small enough for
+/// `clippy::large_futures` and centralizes the allocation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(in crate::commands::graph::analysis) fn run_declared_actions_with<'a>(
+    analyzer: Option<&'a once_frontend::analysis::AnalysisEngine>,
+    workspace: &'a Path,
+    cache: &'a CacheProvider,
+    module_source_digest: Digest,
+    target: &'a GraphTarget,
+    capability: &'a str,
+    analysis: AnalysisResult,
+    dep_action_digests: &'a [(String, Digest)],
+    dependency_inputs: &'a BTreeMap<String, AvailableInput>,
+    tool_paths: &'a BTreeMap<String, String>,
+    source_digest_cache: Option<&'a SourceDigestCache>,
+    sandbox: SandboxMode,
+    resources: &'a Arc<ResourcePool>,
+    output_observer: Option<&'a dyn ActionOutputObserver>,
+    event_bus: Option<&'a once_core::RunEventBus>,
+    workers: &'a crate::bus_events::WorkerSlots,
+    producers: &'a Producers,
+) -> Pin<Box<dyn Future<Output = Result<BuildOutcome>> + Send + 'a>> {
+    Box::pin(async move {
+        producers.report_to(event_bus, workers);
+        let repair = Repair {
+            workspace,
+            cache,
+            source_digest_cache,
+            resources,
+            producers,
+        };
         let AnalysisResult {
             mut actions,
             provider,
@@ -75,15 +130,12 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                 declared.operation,
                 Some(DeclaredActionOperation::ExpandActions { .. })
             ) {
+                if let Some(inputs) =
+                    super::unmaterialized_inputs_for(&declared, &state.available_inputs)
+                {
+                    repair.restore(&inputs).await?;
+                }
                 let permit = resources.acquire(ResourceRequest::default()).await;
-                materialize_available_inputs(
-                    workspace,
-                    cache,
-                    &declared,
-                    &state.available_inputs,
-                    source_digest_cache,
-                )
-                .await?;
                 if planner.is_none() {
                     anyhow::bail!("deferred actions require the target's analysis engine");
                 }
@@ -116,23 +168,18 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                 .map(|action| state.input_action_digests(action, dep_action_digests))
                 .collect::<Vec<_>>();
             if batch.len() > 1 {
-                let permit = resources.acquire(ResourceRequest::default()).await;
-                once_core::with_resource_permit(permit, async {
-                    for action in &batch {
-                        let restored = pending_outputs::restore(
-                            workspace,
-                            cache,
-                            state.pending(),
-                            &state.available_inputs,
-                            action,
-                            source_digest_cache,
-                        )
-                        .await?;
-                        pending_outputs::mark_restored(&mut state, &restored);
-                    }
-                    Ok::<(), anyhow::Error>(())
-                })
-                .await?;
+                // Restored without a permit: a lost input may need its
+                // producer to run again, which needs capacity of its own.
+                for action in &batch {
+                    let restored = pending_outputs::restore_admitted(
+                        &repair,
+                        state.pending(),
+                        &state.available_inputs,
+                        action,
+                    )
+                    .await?;
+                    pending_outputs::mark_restored(&mut state, &restored);
+                }
             }
             for action in &batch {
                 state.outputs.extend(action.outputs.iter().cloned());
@@ -143,13 +190,11 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
             } else {
                 super::PendingResults::default()
             };
-            let batch_inputs = &state.available_inputs;
             let outcomes =
                 futures::future::join_all(batch.into_iter().zip(&input_digests).enumerate().map(
                     |(offset, (declared, input_action_digests))| {
-                        let available_inputs = batch_inputs;
+                        let available_inputs = &state.available_inputs;
                         Box::pin(async move {
-                            let worker = workers.acquire().await;
                             let start_at = crate::bus_events::now_ms();
                             let started = std::time::Instant::now();
                             // Once's own file plumbing still runs, but isn't
@@ -166,15 +211,17 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                             let presentation = declared.presentation.clone();
                             let history = declared.history.clone();
                             let action_index = u32::try_from(index + offset).unwrap_or(u32::MAX);
-                            if let Some(bus) = event_bus.filter(|_| reported) {
-                                crate::bus_events::action_attempt_started(
-                                    bus,
-                                    &target.label.id,
-                                    capability,
-                                    action_index,
-                                    worker.worker_id(),
-                                );
-                            }
+                            let worker = WorkerLease::new(workers, |worker_id| {
+                                if let Some(bus) = event_bus.filter(|_| reported) {
+                                    crate::bus_events::action_attempt_started(
+                                        bus,
+                                        &target.label.id,
+                                        capability,
+                                        action_index,
+                                        worker_id,
+                                    );
+                                }
+                            });
                             let outcome = run_declared_action(DeclaredActionRun {
                                 workspace,
                                 cache,
@@ -191,8 +238,11 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                                 sandbox,
                                 resources,
                                 output_observer,
+                                producers,
+                                worker: Some(&worker),
                             })
                             .await;
+                            let worker_id = worker.claim().await.to_string();
                             let duration_ms =
                                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                             let (exit_code, was_cached, prepare_ms, execute_ms, cache_key) =
@@ -218,13 +268,15 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                                 };
                             let failed = outcome.is_err() || exit_code != 0;
                             if let Some(bus) = event_bus.filter(|_| reported || failed) {
+                                // A reported action announced its start when
+                                // it took its lane.
                                 if !reported {
                                     crate::bus_events::action_attempt_started(
                                         bus,
                                         &target.label.id,
                                         capability,
                                         action_index,
-                                        worker.worker_id(),
+                                        &worker_id,
                                     );
                                 }
                                 crate::bus_events::action_attempt_completed(
@@ -250,7 +302,7 @@ pub(in crate::commands::graph::analysis) fn run_declared_actions<'a>(
                                     was_cached,
                                     exit_code,
                                     start_at,
-                                    worker.worker_id(),
+                                    &worker_id,
                                     prepare_ms,
                                     execute_ms,
                                     &cache_key,

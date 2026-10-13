@@ -6,13 +6,17 @@
 //! back to the configured cache.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use once_cas::{ActionResult, CacheProvider, Cas, Digest};
 use tracing::{debug, instrument, warn};
 
 use crate::stream::ActionOutputObserver;
-use crate::{execute, outputs, Action, ResourceLimits, ResourcePool, Result};
+use crate::{
+    execute, outputs, Action, Executor, ExecutorResources, ResourceLimits, ResourcePool, Result,
+};
+
+static DEFAULT_LIMITS: LazyLock<ResourceLimits> = LazyLock::new(ResourceLimits::default);
 
 /// Whether a result came from cache or fresh execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,27 +46,21 @@ pub struct RunOpts {
 
 /// Bounded async executor.
 ///
-/// A `Runner` caps in-flight actions with a [`ResourcePool`] so callers
-/// driving large graphs cannot exhaust file descriptors, memory, or
-/// process slots. The default CPU budget is the host's available
-/// parallelism; override with [`Runner::with_max_concurrency`] or
-/// [`Runner::with_resource_limits`].
+/// A `Runner` admits local compute and remote client work through shared
+/// [`ExecutorResources`]. Local processes and micro-VMs use the same host
+/// budget. Hosted requests use a separate concurrency quota and reserve host
+/// client memory, not their guest CPU or memory estimates. Clones share budgets.
 #[derive(Clone)]
 pub struct Runner {
     cache: CacheProvider,
     workspace_root: PathBuf,
     opts: RunOpts,
-    resources: Arc<ResourcePool>,
+    resources: ExecutorResources,
 }
 
 impl Runner {
     pub fn new(cas: Cas, workspace_root: impl Into<PathBuf>, opts: RunOpts) -> Self {
-        Self {
-            cache: CacheProvider::Local(cas),
-            workspace_root: workspace_root.into(),
-            opts,
-            resources: Arc::new(ResourcePool::new(ResourceLimits::default())),
-        }
+        Self::with_cache(CacheProvider::Local(cas), workspace_root, opts)
     }
 
     pub fn with_cache(
@@ -74,23 +72,36 @@ impl Runner {
             cache,
             workspace_root: workspace_root.into(),
             opts,
-            resources: Arc::new(ResourcePool::new(ResourceLimits::default())),
+            resources: ExecutorResources::new(Arc::new(ResourcePool::new(DEFAULT_LIMITS.clone()))),
         }
     }
 
-    /// Override the concurrency cap. Useful for tests and constrained
-    /// environments. A value of 0 is silently raised to 1.
+    /// Override host CPU slots, preserving explicit remote admission settings.
+    /// A value of 0 is silently raised to 1.
     #[must_use]
     pub fn with_max_concurrency(mut self, n: usize) -> Self {
-        let mut limits = self.resources.limits();
+        let mut limits = self.resources.host().limits();
         limits.cpu_slots = n.max(1);
-        self.resources = Arc::new(ResourcePool::new(limits));
+        self.resources = self
+            .resources
+            .with_host(Arc::new(ResourcePool::new(limits)));
         self
     }
 
+    /// Replace the host budget, preserving explicit remote admission settings.
     #[must_use]
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
-        self.resources = Arc::new(ResourcePool::new(limits));
+        self.resources = self
+            .resources
+            .with_host(Arc::new(ResourcePool::new(limits)));
+        self
+    }
+
+    /// Supply shared domains, including a custom remote concurrency quota.
+    /// Configure budgets before cloning runners or admitting work.
+    #[must_use]
+    pub fn with_executor_resources(mut self, resources: ExecutorResources) -> Self {
+        self.resources = resources;
         self
     }
 
@@ -103,79 +114,72 @@ impl Runner {
     }
 
     pub async fn run(&self, action: &Action) -> Result<Outcome> {
-        let key = action.digest();
-        if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
-            return Ok(hit);
-        }
-        let permit = self
-            .resources
-            .acquire(action.resource_request().clone())
-            .await;
-        if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
-            return Ok(hit);
-        }
-        crate::with_resource_permit(
-            permit,
-            Box::pin(produce(
-                action,
-                &self.workspace_root,
-                &self.cache,
-                self.opts,
-                key,
-            )),
-        )
-        .await
+        self.run_inner(action, false).await
     }
 
     pub async fn run_streaming(&self, action: &Action) -> Result<Outcome> {
+        self.run_inner(action, true).await
+    }
+
+    /// Execute without reading or writing the action cache, with shared admission.
+    pub async fn run_fresh(&self, action: &Action, stream_to_parent: bool) -> Result<ActionResult> {
+        let executor = Executor::resolve(action)?;
+        let permit = self
+            .resources
+            .acquire(executor, action.resource_request())
+            .await;
+        Box::pin(execute::run_admitted(
+            action,
+            &self.workspace_root,
+            &self.cache,
+            stream_to_parent,
+            false,
+            None,
+            Some(permit.clone()),
+        ))
+        .await
+    }
+
+    async fn run_inner(&self, action: &Action, stream_to_parent: bool) -> Result<Outcome> {
+        let executor = Executor::resolve(action)?;
         let key = action.digest();
-        if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
+        if let Some(hit) = lookup_cached(
+            action,
+            &self.cache,
+            &self.workspace_root,
+            &key,
+            Some(&self.resources),
+        )
+        .await?
+        {
             return Ok(hit);
         }
         let permit = self
             .resources
-            .acquire(action.resource_request().clone())
+            .acquire(executor, action.resource_request())
             .await;
-        if let Some(hit) = lookup_cached(action, &self.cache, &self.workspace_root, &key).await? {
+        if let Some(hit) =
+            lookup_cached(action, &self.cache, &self.workspace_root, &key, None).await?
+        {
             return Ok(hit);
         }
-        crate::with_resource_permit(
-            permit,
-            Box::pin(async {
-                let result = Box::pin(execute::run(
-                    action,
-                    &self.workspace_root,
-                    &self.cache,
-                    true,
-                    false,
-                ))
-                .await?;
-                let uses_cache = action_uses_cache(action);
-                let cacheable = uses_cache && (result.exit_code == 0 || self.opts.cache_failures);
-                if cacheable {
-                    self.cache.put_action_result(&key, &result).await?;
-                } else if !uses_cache {
-                    debug!("skipping action cache for non-cacheable action");
-                } else {
-                    debug!(
-                        exit_code = result.exit_code,
-                        "skipping cache write for failure"
-                    );
-                }
-                Ok(Outcome {
-                    action: key,
-                    result,
-                    cache: CacheState::Miss,
-                })
-            }),
-        )
-        .await
+        let result = Box::pin(execute::run_admitted(
+            action,
+            &self.workspace_root,
+            &self.cache,
+            stream_to_parent,
+            false,
+            None,
+            Some(permit.clone()),
+        ))
+        .await?;
+        store_result(action, &self.cache, self.opts, key, result).await
     }
 }
 
 /// Convenience: run a single action without constructing a [`Runner`].
-/// Production callers (schedulers) should use [`Runner`] instead so the
-/// concurrency cap applies.
+/// This creates per-call budgets. Concurrent schedulers must reuse a [`Runner`]
+/// or supply shared [`ExecutorResources`] for aggregate admission.
 pub async fn run(
     action: &Action,
     workspace_root: &Path,
@@ -197,11 +201,9 @@ pub async fn run_with_cache(
     cache: &CacheProvider,
     opts: RunOpts,
 ) -> Result<Outcome> {
-    let key = action.digest();
-    if let Some(hit) = lookup_cached(action, cache, workspace_root, &key).await? {
-        return Ok(hit);
-    }
-    Box::pin(produce(action, workspace_root, cache, opts, key)).await
+    Runner::with_cache(cache.clone(), workspace_root, opts)
+        .run(action)
+        .await
 }
 
 pub async fn run_with_cache_streaming(
@@ -210,33 +212,44 @@ pub async fn run_with_cache_streaming(
     cache: &CacheProvider,
     opts: RunOpts,
 ) -> Result<Outcome> {
-    let key = action.digest();
-    if let Some(hit) = lookup_cached(action, cache, workspace_root, &key).await? {
-        return Ok(hit);
+    Runner::with_cache(cache.clone(), workspace_root, opts)
+        .run_streaming(action)
+        .await
+}
+
+/// Execute local graph work with caller-owned admission and optional output observation.
+/// Blocking filesystem work and cleanup retain clones of the supplied lease.
+/// Use [`Runner::run_fresh`] for hosted work.
+pub async fn run_uncached_admitted(
+    action: &Action,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    stream_to_parent: bool,
+    observer: Option<&dyn ActionOutputObserver>,
+    lease: crate::ExecutionPermit,
+) -> Result<ActionResult> {
+    let executor = Executor::resolve(action)?;
+    if lease.executor() != Some(executor) {
+        return Err(executor.unsupported("execution permit does not match the resolved executor"));
     }
-    let result = Box::pin(execute::run(action, workspace_root, cache, true, false)).await?;
-    let uses_cache = action_uses_cache(action);
-    let cacheable = uses_cache && (result.exit_code == 0 || opts.cache_failures);
-    if cacheable {
-        cache.put_action_result(&key, &result).await?;
-    } else if !uses_cache {
-        debug!("skipping action cache for non-cacheable action");
-    } else {
-        debug!(
-            exit_code = result.exit_code,
-            "skipping cache write for failure"
-        );
+    if executor != Executor::Local {
+        return Err(executor.unsupported("caller-admitted non-native graph execution"));
     }
-    Ok(Outcome {
-        action: key,
-        result,
-        cache: CacheState::Miss,
-    })
+    execute::run_admitted(
+        action,
+        workspace_root,
+        cache,
+        stream_to_parent,
+        false,
+        observer,
+        Some(lease),
+    )
+    .await
 }
 
 /// Execute one action without reading or writing the action cache.
-/// Callers that need cache-aware execution should use [`Runner`] or
-/// [`run_with_cache`] instead.
+/// This is a caller-admitted primitive for local graph work. Use
+/// [`Runner::run_fresh`] for hosted work so admission follows sandbox cleanup.
 pub async fn run_uncached(
     action: &Action,
     workspace_root: &Path,
@@ -291,6 +304,16 @@ pub async fn run_uncached_contract(
     .await
 }
 
+/// Restore outputs with caller-owned memory admission retained by physical work.
+pub async fn materialize_outputs_admitted(
+    result: &ActionResult,
+    workspace_root: &Path,
+    cache: &CacheProvider,
+    lease: crate::ExecutionPermit,
+) -> Result<()> {
+    outputs::restore_admitted(result, workspace_root, cache, Some(lease)).await
+}
+
 pub async fn materialize_outputs(
     result: &ActionResult,
     workspace_root: &Path,
@@ -299,12 +322,13 @@ pub async fn materialize_outputs(
     outputs::restore(result, workspace_root, cache).await
 }
 
-#[instrument(skip(cache), fields(action_digest = %key))]
+#[instrument(skip(action, cache, resources), fields(action_digest = %key))]
 async fn lookup_cached(
     action: &Action,
     cache: &CacheProvider,
     workspace_root: &Path,
     key: &Digest,
+    resources: Option<&ExecutorResources>,
 ) -> Result<Option<Outcome>> {
     if !action_uses_cache(action) {
         return Ok(None);
@@ -321,7 +345,13 @@ async fn lookup_cached(
             warn!("cached action is missing a captured stdout/stderr blob; re-executing");
             return Ok(None);
         }
-        match outputs::restore(&result, workspace_root, cache).await {
+        let permit = match resources {
+            Some(resources) if !result.outputs.is_empty() => {
+                Some(resources.acquire_materialization().await)
+            }
+            _ => None,
+        };
+        match outputs::restore_admitted(&result, workspace_root, cache, permit).await {
             Ok(()) => {
                 debug!("cache hit");
                 return Ok(Some(Outcome {
@@ -368,14 +398,13 @@ fn is_incomplete_cache_entry(err: &crate::Error) -> bool {
 }
 
 #[instrument(skip(action, cache), fields(action_digest = %key))]
-async fn produce(
+async fn store_result(
     action: &Action,
-    workspace_root: &Path,
     cache: &CacheProvider,
     opts: RunOpts,
     key: Digest,
+    result: ActionResult,
 ) -> Result<Outcome> {
-    let result = Box::pin(execute::run(action, workspace_root, cache, false, false)).await?;
     let uses_cache = action_uses_cache(action);
     let cacheable = uses_cache && (result.exit_code == 0 || opts.cache_failures);
     if cacheable {
@@ -423,6 +452,64 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cas = Cas::open(tmp.path());
         (tmp, cas)
+    }
+
+    #[tokio::test]
+    async fn caller_admitted_execution_refuses_a_mismatched_executor() {
+        let workspace = TempDir::new().unwrap();
+        let (_storage, cas) = fresh_cas();
+        let cache = CacheProvider::Local(cas);
+        let resources =
+            ExecutorResources::new(Arc::new(ResourcePool::new(ResourceLimits::new(1, 1 << 30))));
+        let action = Action::WriteFile {
+            path: WorkspacePath::try_from("out.txt").unwrap(),
+            bytes: b"data".to_vec(),
+            input_digest: None,
+        };
+        let permit = resources
+            .acquire(Executor::Microsandbox, action.resource_request())
+            .await;
+        let error = run_uncached_admitted(&action, workspace.path(), &cache, false, None, permit)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnsupportedExecutorRequirement { .. }
+        ));
+        assert!(!workspace.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn caller_owned_admission_and_lock_do_not_change_cache_identity() {
+        let workspace = TempDir::new().unwrap();
+        let (_storage, cas) = fresh_cas();
+        let cache = CacheProvider::Local(cas);
+        let resources =
+            ExecutorResources::new(Arc::new(ResourcePool::new(ResourceLimits::new(1, 1 << 30))));
+        let action = Action::WriteFile {
+            path: WorkspacePath::try_from("out.txt").unwrap(),
+            bytes: b"same".to_vec(),
+            input_digest: None,
+        };
+        let digest = action.digest();
+        let permit = resources
+            .acquire(Executor::Local, action.resource_request())
+            .await
+            .with_lifetime_owner(workspace.path().to_path_buf());
+        let result = run_uncached_admitted(&action, workspace.path(), &cache, false, None, permit)
+            .await
+            .unwrap();
+        cache.put_action_result(&digest, &result).await.unwrap();
+        std::fs::remove_file(workspace.path().join("out.txt")).unwrap();
+        let runner = Runner::with_cache(cache, workspace.path(), RunOpts::default())
+            .with_executor_resources(resources);
+        let outcome = runner.run(&action).await.unwrap();
+        assert_eq!(outcome.action, digest);
+        assert_eq!(outcome.cache, CacheState::Hit);
+        assert_eq!(
+            std::fs::read(workspace.path().join("out.txt")).unwrap(),
+            b"same"
+        );
     }
 
     fn echo_action(msg: &str) -> Action {
@@ -2168,7 +2255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_hits_do_not_queue_on_the_permit_pool() {
+    async fn cache_hits_do_not_queue_on_host_cpu_slots() {
         let (tmp, cas) = fresh_cas();
         let action = echo_action("warm");
         run(&action, tmp.path(), &cas, RunOpts::default())
@@ -2178,11 +2265,13 @@ mod tests {
         let runner =
             Runner::new(cas, tmp.path().to_path_buf(), RunOpts::default()).with_max_concurrency(1);
 
-        // Exhaust the single permit and hold it for the whole test. If cache
-        // hits queued on the pool they would block forever here, so the
-        // timeout below fires; correct behavior short-circuits before the
-        // permit is ever requested and completes immediately.
-        let _held = runner.resources.acquire(ResourceRequest::default()).await;
+        // Cache restoration reserves memory but must not wait for a host CPU.
+        // The held action leaves memory available while exhausting CPU slots.
+        let _held = runner
+            .resources
+            .host()
+            .acquire(ResourceRequest::default())
+            .await;
 
         let mut handles = Vec::new();
         for _ in 0..32 {

@@ -1,12 +1,19 @@
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
 use anyhow::Result;
-use once_cas::{ActionResult, CacheProvider};
+use once_cas::ActionResult;
+#[cfg(test)]
+use once_cas::CacheProvider;
+#[cfg(test)]
 use once_core::ResourcePool;
 
+use super::Repair;
+#[cfg(test)]
 use super::SourceDigestCache;
 
+#[cfg(test)]
 mod admission;
 mod paths;
 mod window;
@@ -43,6 +50,11 @@ pub(super) fn creation_conflicts(
     paths::creation_conflicts(workspace, created, pending)
 }
 
+pub(super) async fn restore_recovering(results: &[ActionResult], repair: Repair<'_>) -> Result<()> {
+    window::restore_recovering(results, repair).await
+}
+
+#[cfg(test)]
 pub(super) async fn restore(
     results: &[ActionResult],
     workspace: &Path,
@@ -53,6 +65,7 @@ pub(super) async fn restore(
     window::restore(results, workspace, cache, source_digest_cache, resources).await
 }
 
+#[cfg(test)]
 async fn restore_one(
     result: &ActionResult,
     workspace: &Path,
@@ -61,7 +74,7 @@ async fn restore_one(
 ) -> Result<()> {
     match source_digest_cache {
         Some(digests) => digests
-            .materialize_outputs(result, workspace, cache)
+            .materialize_outputs(result, workspace, cache, None)
             .await
             .map_err(anyhow::Error::from),
         None => once_core::materialize_outputs(result, workspace, cache)

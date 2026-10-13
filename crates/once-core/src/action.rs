@@ -105,9 +105,9 @@ impl FromStr for SandboxMode {
 /// The default leaves the host network available, matching the behavior
 /// scripts have always had, so adding the field never breaks an existing
 /// action. `Deny` declares that the action must not use the network, and the
-/// executor enforces it where the platform allows (an empty network
-/// namespace on Linux). The eventual goal is default-deny; the staged
-/// default keeps the change non-breaking while the plumbing lands.
+/// executor refuses execution when enforcement is unavailable. Internet
+/// sockets, including loopback, are denied; local Unix-domain IPC remains
+/// available. The default stays unrestricted for compatibility.
 pub enum NetworkPolicy {
     #[default]
     Unrestricted,
@@ -377,15 +377,18 @@ impl Action {
     /// domain partitions old and new cache entries cleanly instead of
     /// silently colliding.
     pub fn digest(&self) -> Digest {
-        let body = serde_json::to_vec(self).expect("Action is serializable");
         let domain = match self {
             Action::CopyPath { .. } => b"once.action.copy_path.v2\0".as_slice(),
             _ => ACTION_DIGEST_DOMAIN,
         };
-        let mut buf = Vec::with_capacity(domain.len() + body.len());
-        buf.extend_from_slice(domain);
-        buf.extend_from_slice(&body);
-        Digest::of_bytes(&buf)
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(domain);
+        {
+            let mut writer = std::io::BufWriter::with_capacity(16 * 1024, &mut hasher);
+            serde_json::to_writer(&mut writer, self).expect("Action is serializable");
+            std::io::Write::flush(&mut writer).expect("hash writes cannot fail");
+        }
+        Digest::from_bytes(*hasher.finalize().as_bytes())
     }
 
     pub fn resource_request(&self) -> &ResourceRequest {
@@ -428,7 +431,8 @@ pub struct RemoteExecution {
     /// Executor adapter. When absent, the provider name identifies the adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
-    /// Immutable toolchain image, snapshot, or template used for this action.
+    /// Provider environment reference requested for this action. A mutable
+    /// image name or template label does not establish immutable identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
     /// Account the remote work is billed and scoped to.

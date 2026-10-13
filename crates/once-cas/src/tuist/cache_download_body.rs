@@ -15,23 +15,79 @@ pub(super) async fn store<G: Send + 'static>(
     timeout: Duration,
     expected: u64,
     compressed: bool,
+    verification: (Digest, String),
     guard: G,
 ) -> std::result::Result<Digest, retry::Failure> {
-    let chunks = stream::try_unfold(stream, move |mut stream| async move {
+    let (digest, sha256) = verification;
+    let limit = if compressed {
+        super::stream_limits::encoded_bytes(expected)
+    } else {
+        expected
+    };
+    let chunks = stream::try_unfold((stream, 0_u64), move |(mut stream, received)| async move {
         let message = stall::next_message(&mut stream, timeout)
             .await
             .map_err(io::Error::other)?;
-        Ok::<_, io::Error>(message.map(|response| (Cursor::new(response.data), stream)))
+        match message {
+            Some(response) => {
+                let received = received.saturating_add(response.data.len() as u64);
+                if received > limit {
+                    return Err(io::Error::other(EncodedLimit { compressed }));
+                }
+                Ok(Some((Cursor::new(response.data), (stream, received))))
+            }
+            None => Ok::<_, io::Error>(None),
+        }
     });
     let reader = StreamReader::new(Box::pin(chunks));
     cache
-        .mirror_remote_stream(reader, expected, compressed, guard)
+        .mirror_remote_verified(
+            reader,
+            expected,
+            compressed,
+            Some(digest),
+            Some(sha256),
+            guard,
+        )
         .await
         .map_err(read_error)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("remote blob body exceeds its admitted byte allowance")]
+struct EncodedLimit {
+    compressed: bool,
+}
+
 fn read_error(error: Error) -> retry::Failure {
-    if let Error::Io { source, .. } = &error {
+    if Cas::remote_window_limit_exceeded(&error) {
+        return error.into();
+    }
+    if let Error::Io { source, path } = &error {
+        if let Some(limit) = source
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<EncodedLimit>())
+        {
+            let kind = if limit.compressed {
+                crate::ErrorKind::Exhausted
+            } else {
+                crate::ErrorKind::Corrupt
+            };
+            return super::status::remote(
+                "get blob",
+                kind,
+                "remote blob body exceeds its admitted byte allowance",
+            )
+            .into();
+        }
+        if matches!(
+            source.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+        ) && !error.is_corrupt()
+        {
+            return Error::corrupt_blob(path.clone(), Digest::of_bytes(&[]), &source.to_string())
+                .into();
+        }
         if let Some(status) = source
             .get_ref()
             .and_then(|source| source.downcast_ref::<Status>())
