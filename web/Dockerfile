@@ -19,13 +19,14 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS once-builder
 # libasound2-dev is required to link the ALSA backend of cpal, which rodio
 # uses for the optional --sound flag; pkg-config resolves alsa-sys's link
 # flags and is not present in the slim Rust base image by default.
-RUN apt-get update -y && apt-get install -y libcap-ng-dev libasound2-dev pkg-config \
+RUN apt-get update -y && apt-get install -y libcap-ng-dev libasound2-dev pkg-config ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-RUN cargo build --release -p once-cli
+RUN cargo build --locked --release -p once-cli
 
 # ---- Elixir builder ----
 FROM ${BUILDER_IMAGE} AS builder
@@ -34,10 +35,15 @@ FROM ${BUILDER_IMAGE} AS builder
 # library the `once` binary (used to generate the CLI reference) links against.
 # libasound2 is required at load time by the same binary because cpal
 # dynamically links against ALSA on Linux, even when --sound is not used.
-RUN apt-get update -y && apt-get install -y build-essential git chromium libcap-ng0 libasound2 \
+RUN apt-get update -y && apt-get install -y build-essential git chromium libcap-ng0 libasound2 ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
 WORKDIR /app
+
+# Mix downloads dependencies; Rebar only compiles the fetched sources.
+ENV HEX_CACERTS_PATH=/etc/ssl/certs/ca-certificates.crt
+ENV REBAR_OFFLINE=1
 
 RUN mix local.hex --force && \
     mix local.rebar --force
@@ -72,6 +78,7 @@ FROM ${RUNNER_IMAGE}
 
 RUN apt-get update -y && \
   apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
+  && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
