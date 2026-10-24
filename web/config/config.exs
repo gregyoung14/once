@@ -46,6 +46,9 @@ config :logger, :default_formatter,
 # precompiled `--lumis` NIF variant (no Rust toolchain needed).
 config :mdex_native, syntax_highlighter: :lumis
 
+# GitHub release headers exceed OTP's default limit; the mirror uses the same checksums.
+config :lumis, artifact_source: :cloudflare
+
 # Configure the endpoint
 config :once_site, OnceSiteWeb.Endpoint,
   url: [host: "localhost"],
