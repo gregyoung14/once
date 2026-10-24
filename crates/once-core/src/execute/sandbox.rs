@@ -19,7 +19,10 @@ use super::{
     copy_sandbox_output_blocking, create_symlink_blocking, remove_path_blocking, spawn_admitted,
 };
 use crate::stream::ActionOutputObserver;
-use crate::{contract, local, Action, Error, ExecutionPermit, Result, WorkspacePath};
+use crate::{
+    contract, local, outputs, Action, Error, ExecutionPermit, OutputSymlinkMode, Result,
+    WorkspacePath,
+};
 
 /// The filesystem contract a sandboxed run is held to.
 ///
@@ -32,6 +35,7 @@ pub(super) struct SandboxPolicy<'a> {
     pub inputs: &'a [WorkspacePath],
     /// Paths the action declared it writes.
     pub outputs: &'a [WorkspacePath],
+    pub output_symlink_mode: OutputSymlinkMode,
     /// Copy inputs into the execroot instead of linking them.
     pub copy_inputs: bool,
     /// Audit the execroot against the declaration once the child exits.
@@ -60,7 +64,7 @@ pub(super) async fn execute_sandboxed_command(
         local::execute_command(invocation, &execroot, cache).await
     };
 
-    let result = result?;
+    let mut result = result?;
     if policy.validate_contract {
         let violations = contract::audit_filesystem(
             &execroot,
@@ -84,7 +88,39 @@ pub(super) async fn execute_sandboxed_command(
         return Ok(result);
     }
     if action.accepts_exit_code(result.exit_code) {
-        copy_sandbox_outputs(policy.outputs, sandbox.dir, workspace_root, policy.lease).await?;
+        let output_paths = policy.outputs.to_vec();
+        let output_symlink_mode = policy.output_symlink_mode;
+        let capture_root = execroot.clone();
+        let cache = cache.clone();
+        let lease = policy.lease.cloned();
+        let permit = crate::resource_scope::current();
+        // Capture workers may outlive a cancelled caller. Keep their execroot
+        // and admission alive until capture finishes, before publishing anything.
+        let capture = async move {
+            let captured = outputs::capture_admitted(
+                &output_paths,
+                &capture_root,
+                &cache,
+                output_symlink_mode,
+                lease.as_ref(),
+            )
+            .await;
+            (sandbox.dir, captured)
+        };
+        let (dir, captured) = tokio::spawn(async move {
+            match permit {
+                Some(permit) => crate::with_resource_permit((*permit).clone(), capture).await,
+                None => capture.await,
+            }
+        })
+        .await
+        .map_err(|source| Error::FileAction {
+            action: "capture_sandbox_outputs",
+            path: execroot.display().to_string(),
+            source: std::io::Error::other(source.to_string()),
+        })?;
+        result.outputs = captured?;
+        copy_sandbox_outputs(policy.outputs, dir, workspace_root, policy.lease).await?;
     }
     Ok(result)
 }
@@ -199,6 +235,7 @@ async fn prepare_input_sandbox(
         copy_inputs,
         validate_contract,
         lease,
+        ..
     } = *policy;
     let sandboxes = workspace_root.join(".once").join("sandboxes");
     let digest = action.digest().to_string();
@@ -356,9 +393,6 @@ async fn copy_sandbox_outputs(
     spawn_admitted(lease, move || {
         let copied = output_paths.iter().try_for_each(|output| {
             let source = output.resolve(&execroot);
-            if !source.try_exists()? {
-                return Ok(());
-            }
             copy_sandbox_output_blocking(&source, &output.resolve(&workspace))
         });
         sandbox.remove_now();

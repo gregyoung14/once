@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 
 mod script;
 mod tools;
+mod verification;
 pub(crate) use tools::tool_catalog;
 use tools::{tool_definitions, tool_requires_allow_run};
 
@@ -336,6 +337,7 @@ impl Server {
             "once_query_test_manifest" => self.tool_query_test_manifest(&call.arguments),
             "once_query_test_attempts" => self.tool_query_test_attempts(&call.arguments),
             "once_query_evidence" => self.tool_query_evidence(&call.arguments),
+            "once_query_verification" => self.tool_query_verification(&call.arguments),
             "once_query_graph_fingerprint" => self.tool_query_graph_fingerprint(&call.arguments),
             "once_query_module_contract" => crate::commands::query::module_contract_value(),
             "once_fetch_external_source" => Self::tool_fetch_external_source(&call.arguments),
@@ -565,8 +567,23 @@ impl Server {
         })
     }
 
+    fn tool_query_verification(&self, args: &Value) -> Result<Value> {
+        let args: VerificationQueryArgs = serde_json::from_value(tool_args(args))?;
+        Ok(serde_json::to_value(crate::commands::verification::load(
+            &self.workspace,
+            &args.id,
+        )?)?)
+    }
+
     fn tool_build_target(&self, args: &Value) -> Result<Value> {
-        let args: TargetExecutionArgs = serde_json::from_value(tool_args(args))?;
+        let args: BuildTargetArgs = serde_json::from_value(tool_args(args))?;
+        if args.verify_reproducible {
+            return verification::execute(
+                &self.workspace,
+                &self.resource_limits,
+                &["build".into(), "--verify-reproducible".into(), args.target],
+            );
+        }
         run_graph_target(
             &self.workspace,
             "build",
@@ -955,6 +972,20 @@ fn tool_args(args: &Value) -> Value {
 #[serde(deny_unknown_fields)]
 struct TargetExecutionArgs {
     target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildTargetArgs {
+    target: String,
+    #[serde(default)]
+    verify_reproducible: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationQueryArgs {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -1732,6 +1763,7 @@ demo_kind = target_kind(
                 "once_query_test_results".to_string(),
                 "once_query_test_manifest".to_string(),
                 "once_query_test_attempts".to_string(),
+                "once_query_verification".to_string(),
                 "once_query_evidence".to_string(),
                 "once_query_graph_fingerprint".to_string(),
                 "once_validate_script".to_string(),

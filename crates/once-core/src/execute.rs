@@ -100,7 +100,7 @@ async fn run_scoped(
         ..
     } = action
     {
-        let mut result = Box::pin(execute_command(
+        let (mut result, outputs_captured) = Box::pin(execute_command(
             action,
             workspace_root,
             cache,
@@ -112,7 +112,7 @@ async fn run_scoped(
         .await?;
         action.normalize_result(&mut result)?;
         let completed = result.exit_code == 0;
-        if completed && !validate_contract {
+        if completed && !validate_contract && !outputs_captured {
             result.outputs = outputs::capture_admitted(
                 outputs,
                 workspace_root,
@@ -845,13 +845,14 @@ async fn execute_command(
     validate_contract: bool,
     observer: Option<&dyn ActionOutputObserver>,
     lease: Option<ExecutionPermit>,
-) -> Result<ActionResult> {
+) -> Result<(ActionResult, bool)> {
     let Action::RunCommand {
         argv,
         env,
         cwd,
         inputs,
         outputs,
+        output_symlink_mode,
         resources,
         timeout_ms,
         success_exit_codes,
@@ -879,15 +880,13 @@ async fn execute_command(
     };
 
     let executor = Executor::resolve(action)?;
-    if executor != Executor::Local {
-        if validate_contract {
-            return Err(executor.unsupported("filesystem contract auditing"));
-        }
-        if observer.is_some() {
-            return Err(executor.unsupported("live output observers"));
-        }
+    if executor != Executor::Local && validate_contract {
+        return Err(executor.unsupported("filesystem contract auditing"));
     }
-    match (executor, stream_to_parent, sandbox) {
+    if executor != Executor::Local && observer.is_some() {
+        return Err(executor.unsupported("live output observers"));
+    }
+    let result = match (executor, stream_to_parent, sandbox) {
         (Executor::Microsandbox | Executor::E2b | Executor::Daytona, _, _) => {
             Box::pin(remote::execute_command(
                 executor,
@@ -910,12 +909,13 @@ async fn execute_command(
             .await
         }
         (Executor::Local, _, SandboxMode::Inputs | SandboxMode::CopiedInputs) => {
-            sandbox::execute_sandboxed_command(
+            return sandbox::execute_sandboxed_command(
                 action,
                 invocation,
                 sandbox::SandboxPolicy {
                     inputs,
                     outputs,
+                    output_symlink_mode: *output_symlink_mode,
                     copy_inputs: *sandbox == SandboxMode::CopiedInputs,
                     validate_contract,
                     lease: lease.as_ref(),
@@ -926,6 +926,7 @@ async fn execute_command(
                 observer,
             )
             .await
+            .map(|result| (result, true));
         }
         (Executor::Local, _, SandboxMode::Off) => match observer {
             Some(observer) => {
@@ -943,7 +944,8 @@ async fn execute_command(
             }
             None => local::execute_command(invocation, workspace_root, cache).await,
         },
-    }
+    }?;
+    Ok((result, false))
 }
 
 fn copy_sandbox_output_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {

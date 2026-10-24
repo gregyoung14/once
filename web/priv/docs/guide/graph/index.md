@@ -90,6 +90,46 @@ Outputs are materialized under `.once/out/<target>/`. The
 [target kind reference](/reference/prelude/) lists the exact output groups for
 each kind.
 
+## Compare Two Fresh Builds
+
+Use `--verify-reproducible` when you want to compare repeated execution instead
+of checking whether a normal build can reuse its cached result:
+
+```sh
+once build --verify-reproducible apps/service/Service
+```
+
+Once snapshots the workspace and builds the target, including its dependency
+closure, in each of two private trials. Each trial starts from that same
+snapshot at the same private path with a separate, initially empty local Once
+cache. Once retains both results and their declared artifacts rather than
+replacing outputs in your original workspace.
+
+Both trials must succeed. Declared artifact differences fail the check;
+differences only in captured logs are advisory when artifacts match. If no
+artifacts are declared, captured logs determine the comparison instead. The
+result prints a verification UUID and a command to inspect the retained trials:
+
+```sh
+once query verification <ID>
+once query verification <ID> --format json
+```
+
+A passing check means agreement under that artifact/log policy, not proof of
+reproducibility. These are not hermetic builds: host toolchains and tool caches,
+absolute paths, network services, and external side effects remain outside the
+check's isolation. Clocks, randomness, and scheduling are not perturbed or
+controlled. Pre-existing generated files outside `.once` remain in the
+workspace snapshot. Only use this option when repeated execution of the whole
+build is authorized.
+
+Reports and trial artifacts remain under `.once/verifications/<ID>/` and are
+not published automatically. See
+[Inspect Retained Trials](/guide/scripted/caching#inspect-retained-trials) for
+the directory layout and inspection workflow, or the
+[verification report reference](/reference/mcp/#verification-reports) for
+machine-readable fields.
+
 ## Connect Targets With Dependencies
 
 A dependency says that one target consumes the typed output of another. The

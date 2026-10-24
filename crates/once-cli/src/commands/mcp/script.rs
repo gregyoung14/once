@@ -19,6 +19,8 @@ struct ExecuteScriptArgs {
     path: String,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    verify_reproducible: bool,
 }
 
 pub(super) fn validate(workspace: &Path, args: &Value) -> Result<Value> {
@@ -32,6 +34,24 @@ pub(super) fn execute(
     resource_limits: &ResourceLimits,
 ) -> Result<Value> {
     let args: ExecuteScriptArgs = serde_json::from_value(tool_args(args))?;
+    if args.verify_reproducible {
+        let path = WorkspacePath::try_from(args.path.as_str())?;
+        let annotations =
+            once_frontend::parse_script_annotations(&path.resolve(workspace), &args.path)?;
+        let arguments = [
+            "exec".into(),
+            "--verify-reproducible".into(),
+            "--script".into(),
+            "--".into(),
+            annotations.runtime,
+        ]
+        .into_iter()
+        .chain(annotations.runtime_args)
+        .chain(std::iter::once(args.path))
+        .chain(args.args)
+        .collect::<Vec<_>>();
+        return super::verification::execute(workspace, resource_limits, &arguments);
+    }
     let executable = std::env::current_exe().context("resolving current once executable")?;
     execute_with_executable(&executable, workspace, &args, resource_limits.memory_bytes)
 }

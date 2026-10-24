@@ -775,6 +775,42 @@ Returns actual schedule attempts recorded by `once_run_tests` or `once test --ch
 ]
 ```
 
+## `once_query_verification`
+
+Inspect a retained reproducibility check without executing commands.
+
+Returns the same once.verification.v1 record as `once query verification <id> --format json`. Start a check with verify_reproducible on once_build_target or once_exec_script. The record separates execution status, artifact equality, and log equality, retains trial results and decoded artifact paths, and includes bounded file-level differences and explicit scope limitations. No divergence observed is not proof of reproducibility. Reports and artifacts are local workspace runtime state and are never published automatically.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Verification UUID returned by a completed check."
+    }
+  },
+  "required": [
+    "id"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{
+  "schema": "once.verification.v1",
+  "id": "019a0000-0000-7000-8000-000000000001",
+  "success": true,
+  "execution_succeeded": true,
+  "artifacts_match": true,
+  "logs_match": false
+}
+```
+
 ## `once_query_evidence`
 
 List durable evidence records, optionally filtered by subject.
@@ -931,7 +967,7 @@ Reads a workspace-relative script, validates its shebang and `once` directives, 
 
 Execute a validated annotated script through Once's action cache.
 
-Opt-in tool exposed only when the Model Context Protocol server starts with `once mcp --allow-run`. Validates the script contract before running the same path as `once exec --script`, materializes declared outputs, and returns captured streams, exit status, action digest, cache hit or miss state, and matching evidence. Invoke it twice with unchanged declared inputs to verify cache reuse.
+Opt-in tool exposed only when the Model Context Protocol server starts with `once mcp --allow-run`. Validates the script contract before running the same path as `once exec --script`, materializes declared outputs, and returns captured streams, exit status, action digest, cache hit or miss state, and matching evidence. Invoke it twice with unchanged declared inputs to verify cache reuse. Set verify_reproducible to run `once exec --verify-reproducible --script` instead: two private workspace trials rerun script dependencies and fingerprints with initially empty local Once caches and return once.verification.v1 directly. The check retains both trials, compares artifacts separately from logs, and does not replace workspace outputs. Host tool caches, absolute paths, network services, and external side effects are not isolated; authorize repeated execution before using it.
 
 **Input schema**
 
@@ -949,6 +985,11 @@ Opt-in tool exposed only when the Model Context Protocol server starts with `onc
         "type": "string"
       },
       "description": "Arguments passed to the script after its path."
+    },
+    "verify_reproducible": {
+      "type": "boolean",
+      "default": false,
+      "description": "Run and retain two private trials instead of normal cached execution. Returns once.verification.v1."
     }
   },
   "required": [
@@ -980,7 +1021,7 @@ Opt-in tool exposed only when the Model Context Protocol server starts with `onc
 
 Build a target by running its generic `build` capability.
 
-This tool is available only when the server starts with `once mcp --allow-run`. It behaves like `once build <target> --format json`, including dependency traversal, target actions, cache policy, and output groups. Because cache identity follows declared content rather than workspace history, a first build in a new workspace can reuse an equivalent action produced elsewhere. The result includes the exit status, command diagnostics under `stderr`, and bounded declared action logs under `captured_stdout` and `captured_stderr`. A captured field is null when the target did not declare that log. A failed build is returned as normal tool content with `success: false` so agents can inspect diagnostics.
+This tool is available only when the server starts with `once mcp --allow-run`. It behaves like `once build <target> --format json`, including dependency traversal, target actions, cache policy, and output groups. Because cache identity follows declared content rather than workspace history, a first build in a new workspace can reuse an equivalent action produced elsewhere. The result includes the exit status, command diagnostics under `stderr`, and bounded declared action logs under `captured_stdout` and `captured_stderr`. A captured field is null when the target did not declare that log. A failed build is returned as normal tool content with `success: false` so agents can inspect diagnostics. Set verify_reproducible to run `once build --verify-reproducible <target>` instead and return once.verification.v1 directly. It runs the dependency closure in each of two private workspace trials with initially empty local Once caches, retains both results, compares artifacts separately from logs, and leaves workspace outputs untouched. Host tool caches, absolute paths, network services, and external side effects are not isolated.
 
 **Input schema**
 
@@ -991,6 +1032,11 @@ This tool is available only when the server starts with `once mcp --allow-run`. 
     "target": {
       "type": "string",
       "description": "Target id to build, such as `apps/service/Service` or `./Service`."
+    },
+    "verify_reproducible": {
+      "type": "boolean",
+      "default": false,
+      "description": "Run and retain two private trials instead of normal cached execution. Returns once.verification.v1."
     }
   },
   "required": [

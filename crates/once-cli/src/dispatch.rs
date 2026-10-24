@@ -164,10 +164,29 @@ async fn run_command(
         Cmd::Build {
             target,
             sandbox,
+            verify_reproducible,
             config,
             all,
         } => {
             let resolved = resolve_configuration(&config)?;
+            if verify_reproducible {
+                let targets = resolve_build_targets(workspace, target, all)?;
+                for target in targets {
+                    let status = commands::graph::verify_build(
+                        workspace,
+                        &target,
+                        sandbox,
+                        resource_limits.clone(),
+                        &resolved,
+                        output,
+                    )
+                    .await?;
+                    if status != ExitCode::SUCCESS {
+                        return Ok(status);
+                    }
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             dispatch_build(
                 workspace,
                 xdg,
@@ -637,6 +656,11 @@ async fn run_query_command(
             commands::query::evidence(workspace, output, subject.as_deref(), limit)
                 .await
                 .map(|()| ExitCode::SUCCESS)
+        }
+        Some(cli::QueryCmd::Verification { id }) => {
+            let report = commands::verification::load(workspace, &id)?;
+            commands::verification::write(&report, output).await?;
+            Ok(ExitCode::SUCCESS)
         }
         Some(cli::QueryCmd::ValidateTarget { file }) => {
             commands::query::validate_target(workspace, output, file)

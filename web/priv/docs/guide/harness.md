@@ -272,6 +272,50 @@ a typed multi-target graph:
 This route executes the same annotated script contract as `once exec --script`.
 It also materializes declared outputs when a prior action result is reused.
 
+## Compare Fresh Executions
+
+Cache reuse and repeated execution answer different questions. To check for
+observed divergence, set `verify_reproducible: true` on `once_build_target` or
+`once_exec_script`. Both require `once mcp --allow-run` and authorization to
+execute the selected work twice, including its dependencies. For example:
+
+```json
+{
+  "name": "once_exec_script",
+  "arguments": {
+    "path": "scripts/build.sh",
+    "verify_reproducible": true
+  }
+}
+```
+
+This returns a `once.verification.v1` report instead of the normal cached
+execution response. Each trial starts from the same whole-workspace snapshot
+at the same private path, with a separate, initially empty local Once cache.
+Script dependencies and fingerprints run in each trial. Trial artifacts are
+retained without replacing outputs in the original workspace.
+
+Read `success` for the check's pass/fail decision, then inspect
+`execution_succeeded`, `artifacts_match`, and `logs_match` separately. Identical
+failures never pass. With declared artifacts, log-only drift is advisory;
+without artifacts, logs determine the comparison. Do not substitute the stricter
+`reproducible` field for `success`, because it also requires matching logs.
+
+Call `once_query_verification` with the returned `id` to read the same retained
+report without executing anything again. This inspection tool is also available
+on a read-only server. It matches `once query verification <ID> --format json`.
+Use `trial_directories` and `artifact_differences` to inspect the retained files
+instead of guessing from log differences. These local reports are not published
+as durable project evidence automatically.
+
+Report a passing result as “no divergence observed in two trials,” not proof of
+reproducibility. Host toolchains, host tool caches, absolute paths, network
+services, and external side effects are not isolated. Clock, randomness, and
+scheduling behavior are not perturbed or controlled. See the
+[report reference](/reference/mcp/#verification-reports) for the JSON contract
+and [script guide](/guide/scripted/caching#check-repeated-execution) for snapshot
+limits, retained files, local-only execution, and network policy.
+
 ## Use Project Memory Safely
 
 Once evidence is durable provenance for completed actions. It records the

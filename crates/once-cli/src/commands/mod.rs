@@ -24,4 +24,5 @@ pub mod swift;
 pub mod test_schedule;
 pub mod toolchain;
 pub mod util;
+pub mod verification;
 pub mod xcodebuild;

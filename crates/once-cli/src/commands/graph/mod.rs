@@ -12,8 +12,10 @@ mod capability;
 mod configuration;
 mod contract;
 mod lint;
+mod verification;
 
 pub use contract::{validate_action_contracts, ActionContractValidation};
+pub use verification::verify_build;
 
 use std::path::Path;
 use std::process::ExitCode;

@@ -411,6 +411,10 @@ impl BuildSession {
         self
     }
 
+    pub(super) fn log_paths(&self) -> Vec<String> {
+        self.producers.log_paths()
+    }
+
     pub(super) fn with_output_observer(
         mut self,
         output_observer: Arc<dyn ActionOutputObserver>,

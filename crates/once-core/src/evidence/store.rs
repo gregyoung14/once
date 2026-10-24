@@ -83,6 +83,29 @@ impl EvidenceStore {
             .collect()
     }
 
+    /// Close a private workspace store after all its users have finished,
+    /// before replacing or removing its workspace.
+    pub async fn close(self) -> Result<()> {
+        let lock = evidence_database_lock(self.path());
+        let _guard = lock.lock().await;
+        if let Some(database) = self.database.get() {
+            database
+                .close_by_ref()
+                .await
+                .context("closing evidence database")?;
+        }
+        let mut databases = EVIDENCE_DATABASES
+            .lock()
+            .expect("evidence database map lock poisoned");
+        if databases
+            .get(self.path())
+            .is_some_and(|database| Arc::ptr_eq(database, &self.database))
+        {
+            databases.remove(self.path());
+        }
+        Ok(())
+    }
+
     async fn database(&self) -> Result<&DatabaseConnection> {
         self.database.get_or_try_init(|| self.store.connect()).await
     }
@@ -221,8 +244,14 @@ mod tests {
         store.append(&record).await.unwrap();
 
         let loaded = store.load().await.unwrap();
-        assert_eq!(loaded, vec![record]);
+        assert_eq!(loaded, vec![record.clone()]);
         assert!(store.path().is_file());
+
+        store.close().await.unwrap();
+        std::fs::remove_dir_all(tmp.path().join(".once")).unwrap();
+        let store = EvidenceStore::open_workspace(tmp.path());
+        store.append(&record).await.unwrap();
+        assert_eq!(store.load().await.unwrap(), vec![record]);
     }
 
     #[tokio::test]
