@@ -41,13 +41,13 @@ config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
+config :lumis, artifact_source: :cloudflare
+
 # Use the Lumis-enabled MDEx native highlighter so documentation code blocks are
 # syntax highlighted with the github_light / github_dark themes. This pulls the
 # precompiled `--lumis` NIF variant (no Rust toolchain needed).
-config :mdex_native, syntax_highlighter: :lumis
-
-# GitHub release headers exceed OTP's default limit; the mirror uses the same checksums.
-config :lumis, artifact_source: :cloudflare
+# GitHub release headers exceed OTP's default limit; vendor mirrors retain checksums.
+config :mdex_native, syntax_highlighter: :lumis, artifact_source: :cloudflare
 
 # Configure the endpoint
 config :once_site, OnceSiteWeb.Endpoint,
@@ -60,9 +60,9 @@ config :once_site, OnceSiteWeb.Endpoint,
   pubsub_server: OnceSite.PubSub,
   live_view: [signing_salt: "TloqJLzK"]
 
+# Import environment specific config. This must remain at the bottom
+# of this file so it overrides the configuration defined above.
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
-# Import environment specific config. This must remain at the bottom
-# of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"
