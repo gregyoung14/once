@@ -166,6 +166,12 @@ pub enum QueryCmd {
         limit: Option<usize>,
     },
 
+    /// Inspect a retained reproducibility check without executing it again.
+    Verification {
+        /// Verification UUID printed by a build or script check.
+        id: String,
+    },
+
     /// Validate a proposed `[[target]]` table against its target kind schema.
     ///
     /// Reads `{ "target": { ... } }` from `--file` or, if omitted,
@@ -224,6 +230,7 @@ impl QueryCmd {
             Self::TestManifest { .. } => vec!["test-manifest"],
             Self::TestAttempts { .. } => vec!["test-attempts"],
             Self::Evidence { .. } => vec!["evidence"],
+            Self::Verification { .. } => vec!["verification"],
             Self::ValidateTarget { .. } => vec!["validate-target"],
             Self::Script { .. } => vec!["script"],
             Self::ValidateWorkspace => vec!["validate-workspace"],

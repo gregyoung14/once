@@ -143,6 +143,59 @@ EOF
     The contents of file "$WORKSPACE/.once/out/tools/demo/Task/test.txt" should equal 'hello:test'
   End
 
+  It 'verifies build artifacts independently of declared logs nested in directory outputs'
+    create_declared_action_workspace
+    cat > "$WORKSPACE/modules/demo.star" <<'EOF'
+def _demo_impl(ctx):
+    out = declare_output("bundle")
+    run_action(
+        argv = [host_which("sh"), "-c", "printf stable > \"$1/artifact\"; printf '%s' \"$$\"", "sh", out],
+        outputs = [out],
+        stdout = out + "/log.txt",
+        create_dirs = [out],
+    )
+    second = declare_output("second.txt")
+    run_action(
+        argv = [host_which("sh"), "-c", "printf stable > \"$1\"", "sh", second],
+        outputs = [second],
+    )
+    return {}
+
+demo_action = target_kind(
+    attrs = [attr("message", "string")],
+    capabilities = [capability("build", ["default"])],
+    impl = _demo_impl,
+)
+EOF
+    When call once --format json build --verify-reproducible tools/demo/Task
+    The status should be success
+    The stdout should include '"artifacts_match":true'
+    The stdout should include '"logs_match":false'
+    The stdout should include '"log":true'
+    The path "$WORKSPACE/.once/out/tools/demo/Task/bundle" should not be exist
+  End
+
+  It 'uses declared logs as the verdict when a build declares no other artifacts'
+    create_declared_action_workspace
+    cat > "$WORKSPACE/modules/demo.star" <<'EOF'
+def _demo_impl(ctx):
+    log = declare_output("log.txt")
+    run_action(argv = [host_which("sh"), "-c", "printf '%s' \"$$\""], outputs = [log], stdout = log)
+    return {}
+
+demo_action = target_kind(
+    attrs = [attr("message", "string")],
+    capabilities = [capability("build", ["default"])],
+    impl = _demo_impl,
+)
+EOF
+    When call once --format json build --verify-reproducible tools/demo/Task
+    The status should be failure
+    The stdout should include '"artifacts_match":null'
+    The stdout should include '"logs_match":false'
+    The stdout should include '"success":false'
+  End
+
   It 'keeps later graph actions cached when they skip prior action digests'
     create_split_action_workspace
     once --format json build tools/split/Task >/dev/null

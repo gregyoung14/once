@@ -24,8 +24,7 @@ use once_cas::{ActionResult, CacheProvider, Digest};
 use once_core::{
     tool_env, workspace_tool_command, workspace_tool_env, Action, CacheState, EvidenceSubject,
     Executor, InputDigestBuilder, NetworkPolicy, OutputSymlinkMode, RemoteExecution,
-    ReproducibilityReport, ResourceLimits, ResourceRequest, RunEventBus, RunOpts, SandboxMode,
-    WorkspacePath, Xdg,
+    ResourceLimits, ResourceRequest, RunEventBus, RunOpts, SandboxMode, WorkspacePath, Xdg,
 };
 use once_frontend::{parse_script_annotations, ScriptAnnotations};
 use serde::Serialize;
@@ -37,6 +36,8 @@ use crate::commands::util::{
     CHILD_OUTPUT_LIMIT,
 };
 use crate::render;
+
+mod verification;
 
 const MAX_SCRIPT_GLOB_MATCHES: usize = 1_000;
 
@@ -56,6 +57,7 @@ struct ExecTrailer<'a> {
     clippy::struct_excessive_bools,
     reason = "the command-line flags model independent operation settings"
 )]
+#[derive(Clone)]
 pub struct ExecArgs {
     pub sandbox: SandboxMode,
     pub script: bool,
@@ -89,6 +91,7 @@ struct ScriptInvocation {
     timeout_ms: Option<u64>,
     remote: Option<RemoteExecution>,
     sandbox: SandboxMode,
+    network: NetworkPolicy,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,7 @@ struct ScriptGraphOptions<'a> {
     timeout_ms_override: Option<u64>,
     remote_override: Option<RemoteExecution>,
     sandbox: SandboxMode,
+    network: NetworkPolicy,
     resource_limits: ResourceLimits,
     xdg: Option<&'a Xdg>,
 }
@@ -107,6 +111,7 @@ struct ScriptExecutionOptions<'a> {
     timeout_ms_override: Option<u64>,
     remote_override: Option<RemoteExecution>,
     sandbox: SandboxMode,
+    network: NetworkPolicy,
     resource_limits: ResourceLimits,
     xdg: Option<&'a Xdg>,
 }
@@ -136,7 +141,9 @@ pub async fn exec(
     args: ExecArgs,
     output: Output,
 ) -> Result<ExitCode> {
-    let verify_reproducible = args.verify_reproducible;
+    if args.verify_reproducible {
+        return verification::exec(workspace, xdg, args, output).await;
+    }
     let opts = RunOpts {
         cache_failures: args.cache_failures,
     };
@@ -147,11 +154,8 @@ pub async fn exec(
     // reporter via `commands::graph::mod.rs`; exec runs join the stream
     // too so the Tuist dashboard carries a complete picture of what
     // actually ran in a workspace, not only its typed-graph work.
-    // Opening the bus before any work means `RunStarted` publishes
-    // before the first action lifecycle event — the dashboard treats a
-    // run as present the moment its RunStarted arrives, including on
-    // `--verify-reproducible` and on failures that bail before an action
-    // completes.
+    // Opening the bus before execution publishes `RunStarted` before
+    // the first action lifecycle event.
     let bus = RunEventBus::new(EVENT_BUS_CAPACITY);
     let live_reporter = crate::live_run_reporter::spawn(
         &bus,
@@ -166,26 +170,17 @@ pub async fn exec(
     crate::bus_events::run_started(&bus, EXEC_TARGET_ID, run_started_epoch_ms);
 
     // Perform the body of the exec, capturing its exit code so we can
-    // emit `run_completed` and drain the reporter on every path — Ok,
-    // Err, or `verify_reproducible`. Without this guard the `?` on
-    // `run_exec_action` would detach the reporter mid-run and leave the
-    // server's run row unfinalized.
-    let body_result = if verify_reproducible {
-        verify_and_report(&workspace, cache, &action, resource_limits, output)
-            .await
-            .map(|exit_code| ExecOutcome::Verify { exit_code })
-    } else {
-        exec_body(
-            &bus,
-            cache,
-            &workspace,
-            opts,
-            resource_limits,
-            &action,
-            output,
-        )
-        .await
-    };
+    // emit `run_completed` and drain the reporter on success or failure.
+    let body_result = exec_body(
+        &bus,
+        cache,
+        &workspace,
+        opts,
+        resource_limits,
+        &action,
+        output,
+    )
+    .await;
 
     // Always finalize. On error we don't know the exit code the user
     // process would have returned; `-1` is the convention the server
@@ -201,42 +196,18 @@ pub async fn exec(
     body_result.map(ExecOutcome::into_exit_code)
 }
 
-/// What the exec body produced on a successful path. Either the normal
-/// run (with sound + evidence + output already applied) or a
-/// reproducibility verification result. Both carry the exit code the
-/// run finalized at so the outer `exec` can emit `run_completed` with
-/// the same number.
-enum ExecOutcome {
-    Normal { exit_code: i32 },
-    Verify { exit_code: ExitCode },
+struct ExecOutcome {
+    exit_code: i32,
 }
 
 impl ExecOutcome {
     fn exit_code(&self) -> i32 {
-        match self {
-            // Verify_and_report only ever returns SUCCESS or FAILURE
-            // (reproducible vs. not); fold both to the i32 contract the
-            // bus event uses.
-            Self::Verify { exit_code } => i32::from(!is_success(*exit_code)),
-            Self::Normal { exit_code } => *exit_code,
-        }
+        self.exit_code
     }
 
     fn into_exit_code(self) -> ExitCode {
-        match self {
-            Self::Verify { exit_code } => exit_code,
-            Self::Normal { exit_code } => exit_from(exit_code),
-        }
+        exit_from(self.exit_code)
     }
-}
-
-// `std::process::ExitCode` is opaque — the only way to distinguish
-// SUCCESS from FAILURE is to format them and compare. The two
-// constants have well-known Debug shapes we match against; anything
-// else is treated as not-success (matches the verify command's
-// current internal contract).
-fn is_success(exit_code: ExitCode) -> bool {
-    format!("{exit_code:?}") == format!("{:?}", ExitCode::SUCCESS)
 }
 
 /// Normal (non-verify) exec body. Runs the action, emits its
@@ -299,7 +270,7 @@ async fn exec_body(
     )
     .await;
     write_exec_output(cache, output, streams_live, &outcome).await?;
-    Ok(ExecOutcome::Normal {
+    Ok(ExecOutcome {
         exit_code: outcome.result.exit_code,
     })
 }
@@ -325,66 +296,6 @@ const EXEC_WORKER_ID: &str = "exec";
 // small ring is sufficient; the constant matches the shape used by
 // the graph scheduler for a single-target run.
 const EVENT_BUS_CAPACITY: usize = 1024;
-
-async fn verify_and_report(
-    workspace: &Path,
-    cache: &CacheProvider,
-    action: &Action,
-    resource_limits: ResourceLimits,
-    output: Output,
-) -> Result<ExitCode> {
-    let report = once_core::Runner::with_cache(cache.clone(), workspace, RunOpts::default())
-        .with_resource_limits(resource_limits)
-        .verify_reproducible(action)
-        .await
-        .context("verifying reproducibility")?;
-    print_reproducibility_report(&report, output).await?;
-    Ok(if report.reproducible {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
-}
-
-async fn print_reproducibility_report(
-    report: &ReproducibilityReport,
-    output: Output,
-) -> Result<()> {
-    if output.format == Format::Human {
-        let mut out = tokio::io::stdout();
-        if report.reproducible {
-            out.write_all(
-                format!("reproducible: {} trials, no divergence\n", report.trials).as_bytes(),
-            )
-            .await?;
-        } else {
-            let noun = if report.differences.len() == 1 {
-                "difference"
-            } else {
-                "differences"
-            };
-            out.write_all(
-                format!(
-                    "not reproducible: {} {} across {} trials\n",
-                    report.differences.len(),
-                    noun,
-                    report.trials
-                )
-                .as_bytes(),
-            )
-            .await?;
-            for difference in &report.differences {
-                out.write_all(format!("  - {}\n", difference.summary()).as_bytes())
-                    .await?;
-            }
-        }
-        out.flush().await?;
-    } else {
-        let body = render::structured(output.format, report)?;
-        println!("{body}");
-    }
-    Ok(())
-}
 
 async fn plan_exec_action(
     workspace: &Path,
@@ -412,6 +323,7 @@ async fn plan_exec_action(
         timeout_ms_override: timeout_ms,
         remote_override: remote,
         sandbox,
+        network,
         resource_limits,
         xdg: Some(xdg),
     };
@@ -562,10 +474,11 @@ async fn script_action_with_dependencies(
         timeout_ms_override: options.timeout_ms_override,
         remote_override: options.remote_override.clone(),
         sandbox: options.sandbox,
+        network: options.network,
         resource_limits: options.resource_limits.clone(),
         xdg: options.xdg,
     };
-    let invocation = script_invocation(
+    let mut invocation = script_invocation(
         workspace,
         graph_options.explicit_env.clone(),
         options.cwd_override.clone(),
@@ -576,6 +489,7 @@ async fn script_action_with_dependencies(
         argv,
     )
     .await?;
+    invocation.network = options.network;
     if graph_options.remote_override.is_none() {
         graph_options.remote_override = invocation.remote.clone();
     }
@@ -620,7 +534,7 @@ async fn action_from_script_invocation(
         output_symlink_mode: invocation.output_symlink_mode,
         resources: ResourceRequest::default(),
         sandbox: invocation.sandbox,
-        network: NetworkPolicy::default(),
+        network: invocation.network,
         timeout_ms: invocation.timeout_ms,
         success_exit_codes: vec![0],
         remote: invocation.remote.clone().map(Box::new),
@@ -782,7 +696,7 @@ async fn dependency_script_invocation(
     let script_abs = resolve_script_abs(workspace, script_arg)?;
     let annotations = parse_script_annotations(&script_abs, script_arg)
         .with_context(|| format!("parsing once headers for dependency `{script_arg}`"))?;
-    script_invocation_from_annotations(
+    let mut invocation = script_invocation_from_annotations(
         workspace,
         &script_abs,
         annotations,
@@ -795,7 +709,9 @@ async fn dependency_script_invocation(
         graph_options.sandbox,
         graph_options.xdg,
     )
-    .await
+    .await?;
+    invocation.network = graph_options.network;
+    Ok(invocation)
 }
 
 async fn run_script_graph_dependencies(
@@ -952,6 +868,9 @@ async fn cached_blob_text(cache: &CacheProvider, digest: Option<Digest>) -> Resu
 }
 
 async fn run_fingerprint_commands(invocation: &ScriptInvocation) -> Result<Vec<FingerprintResult>> {
+    if invocation.network.is_denied() && !invocation.fingerprints.is_empty() {
+        anyhow::bail!("fingerprint commands cannot enforce --network deny; replace the fingerprint with declared inputs or omit the fingerprint before running offline");
+    }
     let mut out = Vec::with_capacity(invocation.fingerprints.len());
     for command in &invocation.fingerprints {
         out.push(run_fingerprint_command(invocation, command).await?);
@@ -1181,6 +1100,7 @@ async fn script_invocation_from_annotations(
         timeout_ms,
         remote,
         sandbox,
+        network: NetworkPolicy::default(),
     })
 }
 
@@ -1687,6 +1607,7 @@ mod tests {
                 timeout_ms_override: None,
                 remote_override: None,
                 sandbox: SandboxMode::default(),
+                network: NetworkPolicy::default(),
                 resource_limits: ResourceLimits::default(),
                 xdg: None,
             },
@@ -1907,6 +1828,7 @@ image = "node:22.18.0-alpine"
             timeout_ms: Some(10),
             remote: None,
             sandbox: SandboxMode::default(),
+            network: NetworkPolicy::default(),
         };
 
         let err = run_fingerprint_commands(&invocation).await.unwrap_err();
@@ -1932,6 +1854,7 @@ image = "node:22.18.0-alpine"
                 timeout_ms_override: None,
                 remote_override: None,
                 sandbox: SandboxMode::default(),
+                network: NetworkPolicy::default(),
                 resource_limits: ResourceLimits::default(),
                 xdg: None,
             },
@@ -1960,6 +1883,7 @@ image = "node:22.18.0-alpine"
                 timeout_ms_override: None,
                 remote_override: None,
                 sandbox: SandboxMode::default(),
+                network: NetworkPolicy::default(),
                 resource_limits: ResourceLimits::default(),
                 xdg: None,
             },

@@ -134,3 +134,32 @@ async fn a_successful_run_copies_outputs_then_removes_its_sandbox() {
     );
     assert!(sandboxes(workspace.path()).is_empty());
 }
+
+#[tokio::test]
+async fn a_missing_sandbox_output_cannot_reuse_a_stale_workspace_output() {
+    for mode in [SandboxMode::Inputs, SandboxMode::CopiedInputs] {
+        let (workspace, cache) = setup();
+        std::fs::write(workspace.path().join("out.txt"), "stale").unwrap();
+        let mut action = sandboxed("test ! -e out.txt && cat in.txt > fresh.txt", None);
+        if let Action::RunCommand {
+            sandbox, outputs, ..
+        } = &mut action
+        {
+            *sandbox = mode;
+            outputs.insert(0, WorkspacePath::try_from("fresh.txt").unwrap());
+        }
+
+        let result = run_uncached(&action, workspace.path(), &cache, false).await;
+
+        assert!(
+            matches!(&result, Err(Error::MissingOutput { path }) if path == "out.txt"),
+            "{mode:?}: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("out.txt")).unwrap(),
+            "stale"
+        );
+        assert!(!workspace.path().join("fresh.txt").exists());
+        wait_for_no_sandboxes(workspace.path()).await;
+    }
+}

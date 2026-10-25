@@ -86,7 +86,9 @@ pub use local::process_group::GroupChild as ActionProcessGroup;
 pub use once_host_tree::tree_stat_fingerprint;
 pub use path::{WorkspacePath, WorkspacePathError};
 pub use plan::{BuiltPlan, NodeInfo, Plan, PlanError, PlanNode, PlanOutcome};
-pub use reproducibility::{verify_reproducible, ReproducibilityDifference, ReproducibilityReport};
+pub use reproducibility::{
+    verify_reproducible, ReproducibilityDifference, ReproducibilityReport, ReproducibilityTrial,
+};
 pub use resource_scope::{with_execution_permit, with_resource_permit};
 pub use resources::{ResourceLimits, ResourcePermit, ResourcePool, ResourceRequest};
 pub use runner::{

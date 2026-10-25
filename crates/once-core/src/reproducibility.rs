@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use once_cas::{ActionResult, CacheProvider, Digest};
@@ -6,11 +5,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Action, Result, RunOpts, Runner};
 
-/// How many times an action is re-run to test reproducibility. Two is the
-/// minimum that can observe nondeterminism: one baseline run and one
-/// confirmation run. More trials raise confidence that an intermittent
-/// nondeterminism is real rather than a one-off, at the cost of more work.
-const TRIALS: usize = 2;
+mod trials;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReproducibilityTrial {
+    pub action_digest: Option<Digest>,
+    pub result: Option<ActionResult>,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub log_paths: Vec<String>,
+}
 
 /// Outcome of checking whether an action reproduces its outputs.
 ///
@@ -26,6 +30,68 @@ pub struct ReproducibilityReport {
     pub trials: usize,
     /// Each divergence found, in a stable order.
     pub differences: Vec<ReproducibilityDifference>,
+    pub execution_succeeded: bool,
+    /// None when execution failed or no artifacts were declared.
+    pub artifacts_match: Option<bool>,
+    pub logs_match: Option<bool>,
+    pub results: Vec<ReproducibilityTrial>,
+}
+
+impl ReproducibilityReport {
+    #[must_use]
+    pub fn from_trials(results: Vec<ReproducibilityTrial>) -> Self {
+        let complete = results.len() >= 2 && results.iter().all(|trial| trial.result.is_some());
+        let execution_succeeded = complete
+            && results.iter().all(|trial| {
+                trial
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.exit_code == 0)
+                    && trial.error.is_none()
+            });
+        let mut differences = Vec::new();
+        for pair in results.windows(2) {
+            if let (Some(first), Some(second)) = (&pair[0].result, &pair[1].result) {
+                differences.extend(compare(first, second));
+            }
+        }
+        let artifacts_match = (execution_succeeded
+            && results.iter().any(|trial| {
+                trial
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.outputs.is_empty())
+            }))
+        .then(|| {
+            !differences
+                .iter()
+                .any(|difference| matches!(difference, ReproducibilityDifference::Output { .. }))
+        });
+        let logs_match = complete.then(|| {
+            !differences.iter().any(|difference| {
+                matches!(
+                    difference,
+                    ReproducibilityDifference::Stdout { .. }
+                        | ReproducibilityDifference::Stderr { .. }
+                )
+            })
+        });
+        Self {
+            reproducible: execution_succeeded && differences.is_empty(),
+            trials: results.len(),
+            differences,
+            execution_succeeded,
+            artifacts_match,
+            logs_match,
+            results,
+        }
+    }
+
+    /// Log differences are advisory when declared artifacts can be compared.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.execution_succeeded && self.artifacts_match.or(self.logs_match) == Some(true)
+    }
 }
 
 /// One observed divergence between two trials of the same action.
@@ -101,13 +167,8 @@ fn fmt_opt(digest: Option<&Digest>) -> String {
 /// Run an action twice while bypassing the action cache and report whether
 /// the two trials produced identical results.
 ///
-/// Each trial runs from a clean execution of the action, never a replay, so
-/// the comparison tests whether the outputs are a pure function of the inputs.
-/// The action executes `TRIALS` times; callers should expect that cost. The
-/// workspace is shared across trials, so for an action that writes declared
-/// outputs without a sandbox the second trial overwrites the first trial's
-/// outputs. That is fine here because each trial records its own output
-/// digests as it produces them, before any later trial runs.
+/// Trials restore the same declared input snapshot into a private workspace.
+/// Host files, network services, clocks, and external side effects are not isolated.
 pub async fn verify_reproducible(
     action: &Action,
     workspace_root: &Path,
@@ -121,20 +182,7 @@ pub async fn verify_reproducible(
 impl Runner {
     /// Re-run under this runner's admission budgets while bypassing action cache.
     pub async fn verify_reproducible(&self, action: &Action) -> Result<ReproducibilityReport> {
-        let mut results = Vec::with_capacity(TRIALS);
-        for _ in 0..TRIALS {
-            results.push(self.run_fresh(action, false).await?);
-        }
-        let mut differences = Vec::new();
-        for window in results.windows(2) {
-            differences.extend(compare(&window[0], &window[1]));
-        }
-        differences.dedup();
-        Ok(ReproducibilityReport {
-            reproducible: differences.is_empty(),
-            trials: TRIALS,
-            differences,
-        })
+        trials::verify(self, action).await
     }
 }
 
@@ -158,7 +206,7 @@ fn compare(first: &ActionResult, second: &ActionResult) -> Vec<ReproducibilityDi
             second: second.stderr,
         });
     }
-    let mut paths: BTreeSet<&String> = first.outputs.keys().collect();
+    let mut paths: std::collections::BTreeSet<&String> = first.outputs.keys().collect();
     paths.extend(second.outputs.keys());
     for path in paths {
         let a = first.outputs.get(path).copied();

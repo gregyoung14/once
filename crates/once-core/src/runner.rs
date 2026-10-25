@@ -55,7 +55,7 @@ pub struct Runner {
     cache: CacheProvider,
     workspace_root: PathBuf,
     opts: RunOpts,
-    resources: ExecutorResources,
+    pub(crate) resources: ExecutorResources,
 }
 
 impl Runner {

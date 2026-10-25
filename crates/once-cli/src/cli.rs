@@ -270,6 +270,12 @@ pub enum Cmd {
         #[usage(long, default = "off")]
         sandbox: SandboxMode,
 
+        /// Run two private workspace trials with fresh local Once caches,
+        /// compare artifacts and logs, and retain an inspectable report.
+        /// Host services and external side effects are not isolated.
+        #[usage(long)]
+        verify_reproducible: bool,
+
         /// Override the workspace build configuration. Recognized keys are
         /// `os`, `arch`, and `token` (repeatable), supplied as `KEY=VALUE`.
         /// Targets configured with `select` resolve against the merged
@@ -477,11 +483,10 @@ pub enum Cmd {
         #[usage(long)]
         cache_failures: bool,
 
-        /// Run the action twice while bypassing the cache and report whether
-        /// the two trials produced identical results, instead of executing
-        /// normally. Exits non-zero when any divergence is found. Useful for
-        /// catching nondeterministic tools and undeclared inputs that leak
-        /// through the cache key.
+        /// Run two private workspace trials with fresh local Once caches,
+        /// including script dependencies and fingerprints. Retain both results
+        /// and compare declared artifacts separately from logs. Host services
+        /// and external side effects are not isolated.
         #[usage(long)]
         verify_reproducible: bool,
 

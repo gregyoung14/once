@@ -212,6 +212,26 @@ impl Producers {
         }
     }
 
+    pub(in crate::commands::graph::analysis) fn log_paths(&self) -> Vec<String> {
+        lock(&self.inner.by_output)
+            .values()
+            .flat_map(|producer| match &producer.action {
+                Action::RunCommand {
+                    stdout_path,
+                    stderr_path,
+                    ..
+                } => stdout_path
+                    .iter()
+                    .chain(stderr_path)
+                    .map(|path| path.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(in crate::commands::graph::analysis) fn record_fingerprint(
         &self,
         path: &str,

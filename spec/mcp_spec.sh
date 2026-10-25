@@ -43,6 +43,29 @@ EOF
     The contents of file "$WORKSPACE/output.txt" should equal 'hello from an annotated script'
   End
 
+  It 'verifies scripts and retrieves the same retained report without execution permission'
+    cat > "$WORKSPACE/build.sh" <<'SH'
+#!/bin/sh
+# once output "out.txt"
+printf stable > out.txt
+SH
+    verify_then_query() {
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"once_exec_script","arguments":{"path":"build.sh","verify_reproducible":true}}}' |
+        "$ONCE_BIN" -C "$WORKSPACE" mcp --allow-run > "$SPEC_ROOT/verified.json" || return
+      id=$(jq -r '.result.structuredContent.result.id' "$SPEC_ROOT/verified.json")
+      printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"once_query_verification","arguments":{"id":"%s"}}}\n' "$id" |
+        "$ONCE_BIN" -C "$WORKSPACE" mcp > "$SPEC_ROOT/queried.json" || return
+      jq -S '.result.structuredContent.result' "$SPEC_ROOT/verified.json" > "$SPEC_ROOT/first.json"
+      jq -S '.result.structuredContent.result' "$SPEC_ROOT/queried.json" > "$SPEC_ROOT/second.json"
+      cmp "$SPEC_ROOT/first.json" "$SPEC_ROOT/second.json" || return
+      jq -c '[.schema, .success, .artifacts_match, .trials]' "$SPEC_ROOT/second.json"
+    }
+    When call verify_then_query
+    The status should be success
+    The stdout should equal '["once.verification.v1",true,true,2]'
+    The path "$WORKSPACE/out.txt" should not be exist
+  End
+
   It 'keeps editing and execution tools out of the default catalog'
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' > "$WORKSPACE/mcp.jsonl"
 

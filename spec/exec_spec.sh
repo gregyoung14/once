@@ -428,6 +428,150 @@ SH
     End
   End
 
+  Describe '--verify-reproducible'
+    It 'compares artifacts separately from logs without changing existing outputs'
+      cat > "$WORKSPACE/build.sh" <<'SH'
+#!/usr/bin/env -S once exec --script /bin/sh
+# once output "out.txt"
+test ! -e out.txt || exit 9
+printf fresh > out.txt
+printf '%s' "$$"
+SH
+      printf original > "$WORKSPACE/out.txt"
+      When call once --format json exec --verify-reproducible -- ./build.sh
+      The status should be success
+      The stdout should include '"artifacts_match":true'
+      The stdout should include '"logs_match":false'
+      The stdout should include 'once query verification'
+      The contents of file "$WORKSPACE/out.txt" should equal 'original'
+    End
+
+    It 'retains differing dependency outputs for inspection and reruns dependencies'
+      cat > "$WORKSPACE/generate.sh" <<'SH'
+#!/bin/sh
+# once output "generated.txt"
+printf 'prefix:%s' "$$" > generated.txt
+SH
+      cat > "$WORKSPACE/build.sh" <<'SH'
+#!/bin/sh
+# once needs "generate.sh"
+# once input "generated.txt"
+# once output "result.txt"
+cp generated.txt result.txt
+SH
+      verify_and_inspect() {
+        once --format json exec --verify-reproducible -- /bin/sh build.sh > "$SPEC_ROOT/report.json"
+        status=$?
+        [ "$status" -eq 1 ] || return 90
+        id=$(jq -r .id "$SPEC_ROOT/report.json")
+        once --format json query verification "$id" > "$SPEC_ROOT/retained.json" || return
+        cmp "$SPEC_ROOT/report.json" "$SPEC_ROOT/retained.json" || return
+        for trial in 1 2; do
+          grep -q '^prefix:' "$WORKSPACE/.once/verifications/$id/trial-$trial/outputs/result.txt" || return
+        done
+        expected_offset=$(cmp -l "$WORKSPACE/.once/verifications/$id/trial-1/outputs/result.txt" "$WORKSPACE/.once/verifications/$id/trial-2/outputs/result.txt" 2>/dev/null | awk 'NR == 1 { print $1 - 1; exit }')
+        [ "$(jq -r '.artifact_differences[0].first_differing_byte' "$SPEC_ROOT/retained.json")" = "$expected_offset" ] || return
+        jq -c '[.success, .execution_succeeded, .artifacts_match, .artifact_differences[0].path, .artifact_differences[0].kind]' "$SPEC_ROOT/retained.json"
+      }
+      When call verify_and_inspect
+      The status should be success
+      The stdout should equal '[false,true,false,"result.txt","content"]'
+      The path "$WORKSPACE/result.txt" should not be exist
+      The path "$WORKSPACE/generated.txt" should not be exist
+    End
+
+    It 'restores declared inputs that are updated in place for each trial'
+      cat > "$WORKSPACE/update.sh" <<'SH'
+#!/bin/sh
+# once input "state.txt"
+# once output "state.txt"
+printf ':updated' >> state.txt
+SH
+      printf original > "$WORKSPACE/state.txt"
+      When call once --format json exec --verify-reproducible -- /bin/sh update.sh
+      The status should be success
+      The stdout should include '"artifacts_match":true'
+      The contents of file "$WORKSPACE/state.txt" should equal 'original'
+    End
+
+    It 'distinguishes permission changes from changed artifact bytes'
+      cat > "$WORKSPACE/build.sh" <<'SH'
+#!/bin/sh
+# once output "out.txt"
+printf stable > out.txt
+if test -e "$COUNTER"; then
+  chmod 600 out.txt
+else
+  chmod 644 out.txt
+  touch "$COUNTER"
+fi
+SH
+      When call once --format json exec --verify-reproducible -e "COUNTER=$SPEC_ROOT/counter" -- /bin/sh build.sh
+      The status should be failure
+      The stdout should include '"artifacts_match":false'
+      The stdout should include '"kind":"permissions"'
+      The stdout should include '"first_differing_byte":null'
+    End
+
+    It 'does not call two identical failures a successful verification'
+      When call once --format json exec --verify-reproducible -- /bin/sh -c 'printf failure >&2; exit 7'
+      The status should be failure
+      The stdout should include '"execution_succeeded":false'
+      The stdout should include '"artifacts_match":null'
+      The stdout should include '"exit_code":7'
+      The stdout should include '"success":false'
+    End
+
+    It 'propagates network denial to annotated dependencies or refuses execution'
+      printf '#!%s\n' "$SPEC_PYTHON3" > "$WORKSPACE/dependency.py"
+      cat >> "$WORKSPACE/dependency.py" <<'PY'
+# once output "dependency.txt"
+import errno
+import pathlib
+import socket
+try:
+    socket.create_connection(("127.0.0.1", 1), timeout=1).close()
+    status = "allowed"
+except OSError as error:
+    status = "denied" if error.errno in (errno.EACCES, errno.EPERM) else "allowed"
+pathlib.Path("dependency.txt").write_text(status)
+PY
+      cat > "$WORKSPACE/build.sh" <<'SH'
+#!/bin/sh
+# once needs "dependency.py"
+# once input "dependency.txt"
+# once output "out.txt"
+cp dependency.txt out.txt
+SH
+      denied_or_refused() {
+        once exec --network deny -- /bin/sh build.sh > "$SPEC_ROOT/stdout" 2> "$SPEC_ROOT/stderr"
+        if [ "$?" -eq 0 ]; then
+          [ "$(cat "$WORKSPACE/out.txt")" = denied ] || return
+        else
+          grep -q 'network denial' "$SPEC_ROOT/stderr" || return
+          [ ! -e "$WORKSPACE/dependency.txt" ] || return
+        fi
+        printf blocked
+      }
+      When call denied_or_refused
+      The status should be success
+      The stdout should equal 'blocked'
+    End
+
+    It 'rejects offline fingerprints instead of running them without the policy'
+      cat > "$WORKSPACE/build.sh" <<'SH'
+#!/bin/sh
+# once fingerprint "touch fingerprint-ran"
+# once output "out.txt"
+printf must-not-run > out.txt
+SH
+      When call once exec --network deny -- /bin/sh build.sh
+      The status should be failure
+      The stderr should include 'fingerprint commands cannot enforce --network deny'
+      The path "$WORKSPACE/fingerprint-ran" should not be exist
+    End
+  End
+
   Describe 'large outputs'
     big_exec() {
       "$ONCE_BIN" -C "$WORKSPACE" exec --timeout-ms 10000 \

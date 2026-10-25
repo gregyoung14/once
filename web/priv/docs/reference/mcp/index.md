@@ -73,6 +73,57 @@ Server reply:
 Tool-level failures stay inside the JSON-RPC `result` envelope so the
 agent surfaces the message instead of treating the channel as broken.
 
+## Verification Reports
+
+With execution enabled, `once_build_target` and `once_exec_script` accept the
+optional boolean `verify_reproducible`, defaulting to `false`. When `true`, they
+return a `once.verification.v1` report instead of their normal execution record.
+The corresponding commands are `once build --verify-reproducible <target>`
+and `once exec --verify-reproducible --script -- <runtime> <script>`.
+
+`once_query_verification` accepts an `id` containing the verification UUID and
+returns the retained report without running commands. It is available without
+`--allow-run`, matching `once query verification <ID> --format json`. A failed
+check is inspectable as a report with `success: false`; failure to find or read
+the report is a tool-level error. Successfully reading a report does not mean
+the check passed.
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `once.verification.v1`. |
+| `id`, `subject` | Verification UUID and the command or target checked. |
+| `success` | Both trials succeeded, and either declared artifacts match or, when no artifacts are declared, captured logs match. This is the check's pass/fail decision. |
+| `execution_succeeded` | Both trials returned successful results without execution or artifact-retention errors. Identical failures cannot pass. |
+| `artifacts_match` | Artifact equality, or `null` when execution failed, no artifacts were declared, or the detail limit prevents distinguishing artifact drift from log drift. |
+| `logs_match` | Equality of captured standard output, standard error, and retained declared action logs, or `null` when complete comparison is unavailable. Log drift is advisory when declared artifacts match. |
+| `reproducible` | Stricter comparison: successful execution with no artifact, exit-code, or captured-log differences. It can be `false` while `success` is `true` for log-only drift. It is not a proof claim. |
+| `trials`, `results` | Trial count and each trial's action digest, result, and error. |
+| `differences` | Result-level differences tagged by `kind`: `exit_code`, `stdout`, `stderr`, or `output`. Output records identify the declared path and both digests, with `null` for an absent value. |
+| `artifact_differences` | Bounded file-level details with a path, difference kind, a `log` flag for declared action logs, and, when available, the first differing byte offset and text excerpts from both trials. |
+| `differences_truncated` | Whether the file-level inventory or difference listing reached its limit. Full retained artifacts remain available for inspection. |
+| `trial_directories` | Workspace-relative paths to retained trial results, decoded declared artifacts, captured logs, and trial-local Once caches. |
+| `scope`, `limitations` | What was repeated and which sources of variation or external state were not isolated. |
+| `inspect_command` | Command for reading the same retained report again. |
+
+Both trials start from the same whole-workspace snapshot at the same private
+path, using separate, initially empty local Once caches. Script dependencies
+and fingerprints run in each trial. Declared trial outputs do not replace
+outputs in the original workspace. Reports and artifacts remain local under
+`.once/verifications/<ID>/`; they are not automatically published as project
+evidence. Retained files and excerpts may contain sensitive data.
+
+The comparison covers the selected command or target's declared result, not
+artifacts and logs produced only by prerequisites.
+
+This is a repeated-trial observation, not proof of reproducibility. Host
+toolchains, host tool caches, absolute paths, network services, and external
+side effects are not isolated. Clocks, randomness, and scheduling are not
+perturbed or controlled. Authorize repeated execution before starting a check.
+See [script verification](/guide/scripted/caching#check-repeated-execution) and
+[build verification](/guide/graph/#compare-two-fresh-builds) for the workflow
+and snapshot limitations. The [tool catalog](/reference/mcp/tools) provides the
+exact tool schemas.
+
 ## Example session
 
 A complete client/server exchange:

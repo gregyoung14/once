@@ -433,6 +433,13 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
             example_return: "[\n  {\n    \"schema\": \"once.test_batch_attempt.v1\",\n    \"plan_id\": \"<stable plan digest>\",\n    \"batch_id\": \"<stable batch digest>\",\n    \"target\": \"tests/unit\",\n    \"placement\": \"local\",\n    \"worker\": \"local-1\",\n    \"duration_ms\": 842,\n    \"status\": \"passed\",\n    \"cache\": \"miss\"\n  }\n]",
         },
         ToolDefinition {
+            name: "once_query_verification",
+            description: "Inspect a retained reproducibility check without executing commands.",
+            long_description: "Returns the same once.verification.v1 record as `once query verification <id> --format json`. Start a check with verify_reproducible on once_build_target or once_exec_script. The record separates execution status, artifact equality, and log equality, retains trial results and decoded artifact paths, and includes bounded file-level differences and explicit scope limitations. No divergence observed is not proof of reproducibility. Reports and artifacts are local workspace runtime state and are never published automatically.",
+            input_schema: json!({ "type": "object", "properties": { "id": { "type": "string", "description": "Verification UUID returned by a completed check." } }, "required": ["id"] }),
+            example_return: "{\n  \"schema\": \"once.verification.v1\",\n  \"id\": \"019a0000-0000-7000-8000-000000000001\",\n  \"success\": true,\n  \"execution_succeeded\": true,\n  \"artifacts_match\": true,\n  \"logs_match\": false\n}",
+        },
+        ToolDefinition {
             name: "once_query_evidence",
             description: "List durable evidence records, optionally filtered by subject.",
             long_description: "Returns the same record shape as `once query evidence --format json`: durable action evidence captured after `once exec`, `once run`, `once build`, `once lint`, or `once test`. Declared graph actions include an input fingerprint manifest whose categorized components explain which hashed source, dependency, toolchain, command, environment, or module input changed without exposing raw command or environment values. Other action types omit the optional manifest. Pass `subject` to filter to one command action, target, or target capability, such as `cli` or `cli:test`. The tool returns the newest five matching records by default; set `limit` from 1 through 100 when more or fewer are useful. The matching command-line option is `once query evidence --limit <count>`. Evidence is historical provenance, not proof that inputs remain unchanged; run the relevant capability when a current result is required.",
@@ -499,7 +506,7 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "once_exec_script",
             description: "Execute a validated annotated script through Once's action cache.",
-            long_description: "Opt-in tool exposed only when the Model Context Protocol server starts with `once mcp --allow-run`. Validates the script contract before running the same path as `once exec --script`, materializes declared outputs, and returns captured streams, exit status, action digest, cache hit or miss state, and matching evidence. Invoke it twice with unchanged declared inputs to verify cache reuse.",
+            long_description: "Opt-in tool exposed only when the Model Context Protocol server starts with `once mcp --allow-run`. Validates the script contract before running the same path as `once exec --script`, materializes declared outputs, and returns captured streams, exit status, action digest, cache hit or miss state, and matching evidence. Invoke it twice with unchanged declared inputs to verify cache reuse. Set verify_reproducible to run `once exec --verify-reproducible --script` instead: two private workspace trials rerun script dependencies and fingerprints with initially empty local Once caches and return once.verification.v1 directly. The check retains both trials, compares artifacts separately from logs, and does not replace workspace outputs. Host tool caches, absolute paths, network services, and external side effects are not isolated; authorize repeated execution before using it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -511,6 +518,10 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Arguments passed to the script after its path."
+                    },
+                    "verify_reproducible": {
+                        "type": "boolean", "default": false,
+                        "description": "Run and retain two private trials instead of normal cached execution. Returns once.verification.v1."
                     }
                 },
                 "required": ["path"]
@@ -520,13 +531,17 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "once_build_target",
             description: "Build a target by running its generic `build` capability.",
-            long_description: "This tool is available only when the server starts with `once mcp --allow-run`. It behaves like `once build <target> --format json`, including dependency traversal, target actions, cache policy, and output groups. Because cache identity follows declared content rather than workspace history, a first build in a new workspace can reuse an equivalent action produced elsewhere. The result includes the exit status, command diagnostics under `stderr`, and bounded declared action logs under `captured_stdout` and `captured_stderr`. A captured field is null when the target did not declare that log. A failed build is returned as normal tool content with `success: false` so agents can inspect diagnostics.",
+            long_description: "This tool is available only when the server starts with `once mcp --allow-run`. It behaves like `once build <target> --format json`, including dependency traversal, target actions, cache policy, and output groups. Because cache identity follows declared content rather than workspace history, a first build in a new workspace can reuse an equivalent action produced elsewhere. The result includes the exit status, command diagnostics under `stderr`, and bounded declared action logs under `captured_stdout` and `captured_stderr`. A captured field is null when the target did not declare that log. A failed build is returned as normal tool content with `success: false` so agents can inspect diagnostics. Set verify_reproducible to run `once build --verify-reproducible <target>` instead and return once.verification.v1 directly. It runs the dependency closure in each of two private workspace trials with initially empty local Once caches, retains both results, compares artifacts separately from logs, and leaves workspace outputs untouched. Host tool caches, absolute paths, network services, and external side effects are not isolated.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "target": {
                         "type": "string",
                         "description": "Target id to build, such as `apps/service/Service` or `./Service`."
+                    },
+                    "verify_reproducible": {
+                        "type": "boolean", "default": false,
+                        "description": "Run and retain two private trials instead of normal cached execution. Returns once.verification.v1."
                     }
                 },
                 "required": ["target"]
