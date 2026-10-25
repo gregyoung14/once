@@ -40,6 +40,8 @@ pub struct TestManifest {
     pub case_filtering: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_discovery_fingerprint: Option<String>,
     #[serde(default)]
     pub sharding: TestSharding,
     pub units: Vec<TestUnit>,
@@ -73,6 +75,7 @@ impl TestManifest {
             listing_supported,
             case_filtering,
             discovery_fingerprint: None,
+            portable_discovery_fingerprint: None,
             sharding,
             units,
         };
@@ -82,6 +85,15 @@ impl TestManifest {
 
     pub fn with_discovery_fingerprint(mut self, fingerprint: Option<String>) -> Result<Self> {
         self.discovery_fingerprint = fingerprint;
+        self.refresh_id()?;
+        Ok(self)
+    }
+
+    pub fn with_portable_discovery_fingerprint(
+        mut self,
+        fingerprint: Option<String>,
+    ) -> Result<Self> {
+        self.portable_discovery_fingerprint = fingerprint;
         self.refresh_id()?;
         Ok(self)
     }
@@ -100,6 +112,9 @@ impl TestManifest {
                 &self.units,
             ),
         )?;
+        if let Some(fingerprint) = &self.portable_discovery_fingerprint {
+            self.id = stable_id("portable-test-manifest", &(&self.id, fingerprint))?;
+        }
         Ok(())
     }
 }

@@ -203,7 +203,7 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{run_event::Payload, RunEvent, RunStarted};
+    use crate::proto::{run_event::Payload, RunEvent};
 
     fn seq_event(seq: u64) -> PendingEvent {
         PendingEvent {
@@ -212,7 +212,7 @@ mod tests {
                 seq,
                 epoch_ms: 0,
                 mono_ns: 0,
-                payload: Some(Payload::RunStarted(RunStarted::default())),
+                payload: Some(Payload::RunStarted(Box::default())),
             },
         }
     }

@@ -201,6 +201,10 @@ def _ruby_test_impl(ctx, runner_type, display_name, adapter_source, adapter_name
     adapter = test_dir + "/" + adapter_name
     info = _ruby_test_info(ctx, runner_type, display_name, ruby, adapter, results, log, native_results, test_dir, file_units)
     provider = {"label_id": ctx["label"]["id"], "target_kind": runner_type + "_test", "affected_inputs": inputs, "test_discovery_inputs": inputs, "test_info": info}
+    provider["portable_test_configuration"] = _portable_test_configuration(ctx, ["ruby", "runner"], [
+        host_command([ruby, "--version"]).strip(),
+        host_command([runner, "--version"]).strip() if runner else "minitest",
+    ], _ruby_env(ctx, test_dir))
     if ctx["capability"] != "test":
         return provider
     write_path(adapter, adapter_source)

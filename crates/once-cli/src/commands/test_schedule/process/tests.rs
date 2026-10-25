@@ -81,20 +81,32 @@ fn startup_failure_preserves_its_exit_status_and_stderr_despite_old_evidence() {
         memory_bytes: 0,
         cpu_slots: 1,
     };
-    let run = run_test_target(
-        &executable,
-        workspace.path(),
-        &batch,
-        SandboxMode::Off,
-        limits,
-    )
-    .unwrap();
-    assert_eq!(run["success"], false);
-    assert_eq!(run["exit_code"], 17);
-    assert!(run["stderr"]
-        .as_str()
-        .unwrap()
-        .contains("runner startup failed"));
+    let portable = super::super::portable::Invocation {
+        path: workspace.path().join("plan.json"),
+        external_group: None,
+        partition_index: None,
+    };
+    for invocation in [None, Some(&portable)] {
+        let run = run_test_target(
+            &executable,
+            workspace.path(),
+            &batch,
+            SandboxMode::Off,
+            limits,
+            invocation,
+        )
+        .unwrap();
+        assert_eq!(run["success"], false);
+        assert_eq!(run["exit_code"], 17);
+        assert!(run["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("runner startup failed"));
+        if invocation.is_some() {
+            assert!(run["results"].is_null());
+            assert!(run["results_error"].is_string());
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -126,6 +138,7 @@ fn each_batch_is_given_its_share_of_the_cpu_budget() {
         &batch,
         SandboxMode::Off,
         limits,
+        None,
     )
     .unwrap();
 

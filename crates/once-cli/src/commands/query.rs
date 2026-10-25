@@ -718,8 +718,18 @@ pub async fn test_plan_request(
     target: Option<&str>,
     test_unit: Option<&str>,
     test_batch: Option<&str>,
+    portable: bool,
 ) -> Result<()> {
     let plan = test_plan_selection(workspace, changed_paths, target, test_unit, test_batch)?;
+    if portable {
+        anyhow::ensure!(
+            test_unit.is_none() && test_batch.is_none(),
+            "portable export requires complete target discovery, not a unit or batch selection"
+        );
+        let graph = once_frontend::load_graph_workspace(workspace)?;
+        let portable = test_plan::portable::PortableTestPlan::export(workspace, &graph, plan)?;
+        return write_body(output, || render_test_plan_human(&portable.plan), &portable).await;
+    }
     write_body(output, || render_test_plan_human(&plan), &plan).await
 }
 
@@ -900,8 +910,21 @@ pub(crate) fn stored_test_manifest_record(
 pub(crate) fn refresh_test_manifest_for_target(
     workspace: &Path,
     target: &once_frontend::GraphTarget,
+    portable_before: Option<&str>,
 ) -> Result<TestManifest> {
     let manifest = derive_test_manifest_for_target(workspace, target)?;
+    let fingerprint = once_frontend::load_graph_workspace(workspace)
+        .map_err(anyhow::Error::from)
+        .and_then(|graph| {
+            test_plan::portable::discovery_fingerprint(workspace, &graph, &target.label.id)
+        });
+    if let Err(error) = &fingerprint {
+        tracing::debug!(target = %target.label.id, %error, "portable discovery binding unavailable");
+    }
+    let fingerprint = fingerprint
+        .ok()
+        .filter(|actual| portable_before == Some(actual.as_str()));
+    let manifest = manifest.with_portable_discovery_fingerprint(fingerprint)?;
     write_test_manifest(workspace, &manifest)?;
     Ok(manifest)
 }
@@ -1739,7 +1762,7 @@ fn render_targets_human(records: &[TargetRecord]) -> String {
     out
 }
 
-async fn write_body<T: Serialize>(
+pub(crate) async fn write_body<T: Serialize>(
     output: Output,
     human: impl FnOnce() -> String,
     value: &T,

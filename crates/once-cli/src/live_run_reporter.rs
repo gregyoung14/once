@@ -79,7 +79,6 @@ impl LiveRunReporter {
 /// Establish reporting with a bounded preflight, then stream in the background.
 /// Missing configuration or a connection failure is logged without failing
 /// the build.
-#[allow(clippy::too_many_lines)]
 pub async fn spawn(
     bus: &RunEventBus,
     workspace: &Path,
@@ -87,6 +86,19 @@ pub async fn spawn(
     account: Option<String>,
     project: Option<String>,
     output: crate::cli::Output,
+) -> LiveRunReporter {
+    spawn_with_test_context(bus, workspace, xdg, account, project, output, None).await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn spawn_with_test_context(
+    bus: &RunEventBus,
+    workspace: &Path,
+    xdg: Xdg,
+    account: Option<String>,
+    project: Option<String>,
+    output: crate::cli::Output,
+    test_context: Option<once_events_client::proto::TestRunContext>,
 ) -> LiveRunReporter {
     let terminal = crate::terminal::Policy::new(output);
     let workspace = workspace.to_path_buf();
@@ -217,6 +229,7 @@ pub async fn spawn(
                 project_id: project_id.unwrap_or_default(),
                 is_ci: once_events_client::environment::is_ci(),
                 git_branch,
+                test_context,
                 ..Default::default()
             };
 

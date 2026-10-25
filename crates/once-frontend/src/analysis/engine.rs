@@ -116,6 +116,15 @@ impl fmt::Debug for AnalysisEngine {
 }
 
 impl AnalysisEngine {
+    /// Identity of the loaded implementation and effective build configuration,
+    /// independent of checkout and host executable locations.
+    pub fn implementation_fingerprint(&self) -> String {
+        let mut hash = sha2::Sha256::new();
+        hash.update(self.source.as_bytes());
+        hash.update(self.configuration.canonical_bytes());
+        super::globals::hex_digest(&hash.finalize())
+    }
+
     /// Engine over the built-in prelude only, with no workspace on disk.
     pub fn new() -> Result<Self> {
         Self::from_source_with_path(

@@ -1305,6 +1305,27 @@ identifiers. Once fingerprints those files before reusing a manifest. When the
 field is absent, Once conservatively fingerprints the provider's complete
 `affected_inputs` list.
 
+For location-independent portable replay, a provider may also return
+`portable_test_configuration`, an object containing all resolved configuration
+and environment that can change discovery, plus semantic tool version or
+toolchain identities. The shared `_portable_test_configuration(ctx,
+tool_attributes, tool_identity, env)` helper includes source patterns and every
+target attribute except the explicitly named tool-location attributes. Include
+resolved inherited environment values in `env`. Do not omit behavior-changing
+attributes or replace tool identity with a display label. Only installation
+locations may be excluded; workspace-owned runner programs and dependencies
+must remain declared inputs. Once also binds dependency inputs, source contents
+(following symbolic links), the effective workspace configuration, and loaded
+module implementations. Without this object, replay binds complete target and
+provider metadata and does not guess which host paths are irrelevant.
+
+The latest complete discovery records a separate portable fingerprint. Portable
+export falls back to a whole-target batch when that binding is absent or stale.
+Filtered execution never refreshes complete discovery. Workers validate the
+exported inventory and full batch partition before selecting assigned IDs;
+file fixtures cannot be subdivided through portable replay. See the
+[portable execution contract](/guide/graph/testing#distribute-portable-batches-to-ci-workers).
+
 The adapter writes [JavaScript Object Notation](https://www.json.org/json-en.html)
 results below the target test directory. When `ctx["test"]["batch_id"]` is
 present, the adapter must add `batches/<batch_id>` to that directory before

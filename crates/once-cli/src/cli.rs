@@ -395,6 +395,38 @@ pub enum Cmd {
         #[usage(short = 'j', long, value_name = "COUNT")]
         jobs: Option<usize>,
 
+        /// Execute an exported `once.portable_test_plan.v1` document.
+        #[usage(
+            long,
+            value_name = "FILE",
+            conflicts(
+                "target",
+                "all",
+                "changed_paths",
+                "test_unit",
+                "test_batch",
+                "batch_test_units",
+                "test_batch_id",
+                "config"
+            )
+        )]
+        plan: Option<PathBuf>,
+
+        /// Select an opaque batch ID from --plan. Repeat to select multiple batches.
+        #[usage(long = "batch", value_name = "ID", requires = "plan")]
+        batches: Vec<String>,
+
+        /// Attribute native diagnostics to an external test-report group UUID.
+        #[usage(long, value_name = "UUID", requires("plan", "partition_index"))]
+        external_group: Option<String>,
+
+        /// Nonnegative external CI partition index. The coordinator owns its report.
+        #[usage(long, requires = "external_group")]
+        partition_index: Option<u32>,
+
+        #[usage(long, hide = true, requires = "plan")]
+        internal_test_batch: bool,
+
         /// Run every discovered test target through the dynamic scheduler.
         #[usage(long, conflicts("target", "changed_paths", "test_unit"))]
         all: bool,

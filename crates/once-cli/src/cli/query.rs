@@ -102,6 +102,9 @@ pub enum QueryCmd {
 
     /// Create an immutable test plan without assigning work to runners.
     TestPlan {
+        /// Export a versioned plan for fresh workers without local discovery state.
+        #[usage(long, conflicts("test_unit", "test_batch"))]
+        portable: bool,
         /// Changed workspace-relative path. Repeat for multiple paths.
         #[usage(long = "changed-path", value_name = "PATH", conflicts = "target")]
         changed_paths: Vec<String>,

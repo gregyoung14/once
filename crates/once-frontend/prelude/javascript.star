@@ -255,6 +255,12 @@ def _javascript_test_impl(ctx, runner_type, display_name, default_runner):
     adapter = test_dir + "/once_javascript_test_adapter.mjs"
     info = _javascript_test_info(ctx, runner_type, display_name, node, runner, adapter, results, log, native_results, test_dir)
     provider = {"label_id": ctx["label"]["id"], "target_kind": runner_type + "_test", "affected_inputs": inputs, "test_discovery_inputs": discovery_inputs, "test_info": info}
+    portable_env = _javascript_env(ctx, test_dir, "")
+    runner_version_argv = ([node, runner] if runner_via_node else [runner]) + ["--version"]
+    provider["portable_test_configuration"] = _portable_test_configuration(ctx, ["node", "runner"], [
+        host_command([node, "--version"]).strip(),
+        host_command(runner_version_argv, cwd = workspace_root()).strip() if runner_is_workspace_input else host_command(runner_version_argv).strip(),
+    ], portable_env)
     if ctx["capability"] != "test":
         return provider
     write_path(adapter, _javascript_test_adapter())

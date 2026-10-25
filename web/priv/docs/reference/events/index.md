@@ -200,6 +200,17 @@ Every call carries the bearer token in the `authorization` metadata. Clients als
 | `project_id` | `string` | 12 |  |
 | `effective_limits` | `EffectiveLimits` | 13 |  |
 | `is_ci` | `bool` | 14 | Whether the run happened on CI rather than a developer machine. The dashboard splits runs on this the way it does for the other build systems, which all report the same distinction. |
+| `git_branch` | `string` | 15 | The branch the run was built from, empty when it cannot be determined. CI checkouts are usually on a detached HEAD, where git alone reports "HEAD" rather than a name, so the provider's own branch variable is preferred over asking git. |
+| `test_context` | `TestRunContext` | 16 | Attribution only. When external_group_id is nonempty, its coordinator owns the consolidated partition report; this run is diagnostic evidence. |
+
+## message `TestRunContext`
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `external_group_id` | `string` | 1 | Coordinator-owned UUID, empty for native portable execution. |
+| `partition_index` | `uint32` | 2 | Nonnegative coordinator partition, meaningful only with an external group. |
+| `plan_id` | `string` | 3 | Original portable Once plan identity, shared by all assigned partitions. |
+| `batch_id` | `string` | 4 | Native semantic batch identity, never a case identity or worker number. |
 
 ## message `ArgvToken`
 
@@ -387,6 +398,44 @@ Every call carries the bearer token in the `authorization` metadata. Clients als
 | `new_attempt` | `uint32` | 3 |  |
 | `reason` | `string` | 4 |  |
 
+## message `ActionPresentation`
+
+Ecosystem-owned context. Omission retains legacy labels and source paths.
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `package` | `ActionPackage` | 1 |  |
+| `platforms` | `repeated ActionPlatform` | 2 |  |
+| `context` | `repeated ActionContext` | 3 |  |
+
+## message `ActionPackage`
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `ecosystem` | `string` | 1 |  |
+| `name` | `string` | 2 |  |
+| `version` | `string` | 3 |  |
+| `revision` | `string` | 4 |  |
+| `digest` | `string` | 5 |  |
+| `origin` | `string` | 6 | workspace, registry, git, path, or a future producer-owned origin. |
+
+## message `ActionPlatform`
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `scheme` | `string` | 1 |  |
+| `id` | `string` | 2 |  |
+| `label` | `string` | 3 |  |
+| `usage` | `string` | 4 | product or build-tool. This is not execution-worker placement. |
+
+## message `ActionContext`
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `key` | `string` | 1 |  |
+| `value` | `string` | 2 |  |
+| `label` | `string` | 3 |  |
+
 ## message `ActionCompleted`
 
 Exactly one declared action outcome. Identity within a run is the tuple (target_execution_id, capability, action_index). The index is zero-based declaration order, never completion order; identifier is a diagnostic label. A new target attempt must use a new target_execution_id. Cached target reuse emits the retained actions with current-run timing, not old spans.
@@ -408,7 +457,28 @@ Exactly one declared action outcome. Identity within a run is the tuple (target_
 | `cache_key` | `string` | 13 | Hex digest the action probed against the content-addressable store, action_digest. Shown as the "Cache key" column on the Cacheable Actions view of the dashboard. |
 | `selected_attempt` | `uint32` | 14 | Zero means no attempt executed in this run, as with retained target reuse. Otherwise this selects one attempt from the matching tuple below. |
 | `display_name` | `optional string` | 15 | Presentation only; does not replace identifier or affect cache identity. |
-| `source_files` | `repeated string` | 16 | Repository-relative file paths using forward slashes, never host paths or generated outputs. Servers may link these at RunStarted.git_rev. |
+| `source_files` | `repeated string` | 16 | Repository-relative presentation paths using forward slashes, never host paths. Includes untracked or downloaded sources; consumers must consult source_file_statuses before linking at RunStarted.git_rev. |
+| `source_file_statuses` | `repeated SourceFileStatus` | 17 | Entry i describes source_files[i] at RunStarted.git_rev. Classifying clients send one status per path, including UNKNOWN on lookup failure. Empty means legacy metadata. A nonempty length mismatch is invalid for linking: consumers must show every path without a repository link. |
+| `presentation` | `ActionPresentation` | 18 | Optional bounded presentation data. Never action identity or cache inputs. |
+| `history` | `ActionHistoryKey` | 19 | Optional producer-owned logical identity for cross-run history. Never execution identity, observations, or action-result cache inputs. |
+
+## message `ActionHistoryKey`
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `namespace` | `string` | 1 | Versioned producer namespace (ASCII token, at most 64 bytes). |
+| `key` | `string` | 2 | Opaque stable key (at most 128 bytes); not a cache digest or run id. |
+
+## enum `SourceFileStatus`
+
+Presentation only: these values must not affect action or cache identity.
+
+| Name | Type | Number | Description |
+| --- | --- | ---: | --- |
+| `SOURCE_FILE_STATUS_UNSPECIFIED` | value | 0 |  |
+| `SOURCE_FILE_STATUS_COMMITTED` | value | 1 | A blob (regular file or symlink) at the path in RunStarted.git_rev. |
+| `SOURCE_FILE_STATUS_NOT_COMMITTED` | value | 2 | The commit tree was read successfully and contains no blob at the path. |
+| `SOURCE_FILE_STATUS_UNKNOWN` | value | 3 | No usable commit tree, including failed or bounded-out lookups. |
 
 ## message `ActionAttemptStarted`
 

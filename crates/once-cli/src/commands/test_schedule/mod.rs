@@ -1,5 +1,6 @@
 mod cancellation;
 mod executor;
+pub(crate) mod portable;
 mod process;
 mod report;
 mod results;
@@ -53,6 +54,30 @@ pub(crate) async fn execute(
         None => once_frontend::load_graph_workspace(workspace).context("loading graph")?,
     };
     validation::validate_plan_targets(workspace, &graph, &plan)?;
+    execute_validated(
+        workspace,
+        graph,
+        plan,
+        requested_workers,
+        sandbox,
+        resource_limits,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_validated(
+    workspace: &Path,
+    graph: Vec<once_frontend::GraphTarget>,
+    plan: TestPlan,
+    requested_workers: Option<usize>,
+    sandbox: SandboxMode,
+    resource_limits: ResourceLimits,
+    portable: Option<portable::Invocation>,
+) -> Result<TestExecutionReport> {
+    validate_workers(requested_workers)?;
+    anyhow::ensure!(!plan.batches.is_empty(), "test plan contains no batches");
     let store = TestTimingStore::open_workspace(workspace);
     let estimates = store.duration_estimates().await?;
     let executable = std::env::current_exe().context("resolving current once executable")?;
@@ -68,6 +93,7 @@ pub(crate) async fn execute(
             requested_workers,
             sandbox,
             &resource_limits,
+            portable.as_ref(),
         )
     });
     let completed = cancellation::supervise(schedule)

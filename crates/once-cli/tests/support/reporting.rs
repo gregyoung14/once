@@ -86,3 +86,86 @@ async fn fast_runs_keep_plain_dashboard_links_in_logs_and_respect_quiet() {
         }
     }
 }
+
+#[tokio::test]
+async fn portable_schedule_attributes_each_batch_and_forwards_cancellation() {
+    let collector = Collector::default();
+    let url = serve(collector.clone()).await;
+    let workspace = workspace(Some(&url));
+    let home = tempfile::tempdir().unwrap();
+    terminal::graph_workspace(workspace.path(), true);
+    let mut query = terminal::command(workspace.path(), home.path());
+    query
+        .args([
+            "query",
+            "test-plan",
+            "--portable",
+            "--target",
+            "Task",
+            "--format",
+            "json",
+        ])
+        .stdout(Stdio::piped());
+    let output = tokio::task::spawn_blocking(move || query.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan_path = workspace.path().join("plan.json");
+    std::fs::write(&plan_path, output.stdout).unwrap();
+    let group = "01900000-0000-7000-8000-000000000007";
+    let mut command = terminal::command(workspace.path(), home.path());
+    command
+        .env("TUIST_TOKEN", "test-token")
+        .args(["test", "--plan"])
+        .arg(plan_path)
+        .args([
+            "--external-group",
+            group,
+            "--partition-index",
+            "7",
+            "--jobs",
+            "1",
+        ]);
+    let process = terminal::PtyProcess::spawn(command);
+    let probe = collector.clone();
+    wait_until(Duration::from_secs(30), || probe.started()).await;
+    let contexts = collector
+        .recorded
+        .lock()
+        .unwrap()
+        .payloads
+        .iter()
+        .filter_map(|payload| {
+            if let Payload::RunStarted(started) = payload {
+                started.test_context.clone()
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].external_group_id, group);
+    assert_eq!(contexts[0].partition_index, 7);
+    assert_eq!(contexts[0].plan_id, plan["id"]);
+    assert_eq!(contexts[0].batch_id, plan["plan"]["batches"][0]["id"]);
+    assert!(Command::new("kill")
+        .args(["-s", "TERM", &process.child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let (status, output) = tokio::task::spawn_blocking(move || process.finish())
+        .await
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{output}");
+    assert_eq!(collector.completions().len(), 1);
+    assert_eq!(
+        collector.completions()[0].result,
+        RunResult::Cancelled as i32
+    );
+    assert_eq!(collector.completions()[0].cancellation_reason, "SIGTERM");
+}

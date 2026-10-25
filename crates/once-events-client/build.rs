@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .boxed(".once.events.v1.ActionCompleted.presentation")
         .boxed(".once.events.v1.ActionCompleted.history")
+        .boxed(".once.events.v1.RunEvent.payload.run_started")
         .compile_protos(&[proto], &["proto"])?;
     Ok(())
 }

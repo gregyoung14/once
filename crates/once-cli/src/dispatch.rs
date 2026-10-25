@@ -292,6 +292,11 @@ async fn run_command(
             sandbox,
             config,
             jobs,
+            plan,
+            batches,
+            external_group,
+            partition_index,
+            internal_test_batch,
             all,
             changed_paths,
             test_unit,
@@ -308,6 +313,13 @@ async fn run_command(
                     target,
                     sandbox,
                     jobs,
+                    portable: plan.map(|path| commands::test_schedule::portable::Invocation {
+                        path,
+                        external_group,
+                        partition_index,
+                    }),
+                    batches,
+                    internal_test_batch,
                     all,
                     changed_paths,
                     test_unit,
@@ -443,6 +455,9 @@ struct TestDispatchArgs {
     target: Option<String>,
     sandbox: SandboxMode,
     jobs: Option<usize>,
+    portable: Option<commands::test_schedule::portable::Invocation>,
+    batches: Vec<String>,
+    internal_test_batch: bool,
     all: bool,
     changed_paths: Vec<String>,
     test_unit: Option<String>,
@@ -453,7 +468,38 @@ struct TestDispatchArgs {
     resolved: commands::graph::ResolvedConfiguration,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_test(workspace: &Path, xdg: &Xdg, args: TestDispatchArgs) -> Result<ExitCode> {
+    if let Some(mut invocation) = args.portable {
+        if invocation.path.is_relative() {
+            invocation.path = std::env::current_dir()?.join(&invocation.path);
+        }
+        let graph = args.resolved.load_graph(workspace)?;
+        if args.internal_test_batch {
+            return invocation
+                .run_batch(
+                    workspace,
+                    &graph,
+                    args.output,
+                    &args.batches,
+                    args.sandbox,
+                    args.resource_limits,
+                    &args.resolved,
+                )
+                .await;
+        }
+        return commands::test_schedule::portable::run(
+            workspace,
+            graph,
+            args.output,
+            invocation,
+            &args.batches,
+            args.jobs,
+            args.sandbox,
+            args.resource_limits,
+        )
+        .await;
+    }
     if !args.batch_test_units.is_empty() {
         let target = resolve_required_target(workspace, args.target)?;
         let cache = crate::cache_provider::resolve(workspace, xdg)?;
@@ -467,6 +513,8 @@ async fn dispatch_test(workspace: &Path, xdg: &Xdg, args: TestDispatchArgs) -> R
             args.test_batch_id.as_deref(),
             args.resource_limits,
             &args.resolved,
+            None,
+            None,
         ))
         .await;
     }
@@ -621,6 +669,7 @@ async fn run_query_command(
                 .map(|()| ExitCode::SUCCESS)
         }
         Some(cli::QueryCmd::TestPlan {
+            portable,
             changed_paths,
             target,
             test_unit,
@@ -633,6 +682,7 @@ async fn run_query_command(
                 target,
                 test_unit,
                 test_batch,
+                portable,
             )
             .await
         }
@@ -703,6 +753,7 @@ async fn run_test_plan_query(
     target: Option<String>,
     test_unit: Option<String>,
     test_batch: Option<String>,
+    portable: bool,
 ) -> Result<ExitCode> {
     commands::query::test_plan_request(
         workspace,
@@ -711,6 +762,7 @@ async fn run_test_plan_query(
         target.as_deref(),
         test_unit.as_deref(),
         test_batch.as_deref(),
+        portable,
     )
     .await
     .map(|()| ExitCode::SUCCESS)

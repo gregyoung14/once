@@ -759,6 +759,79 @@ KOTLIN
     The stderr should include 'whole target'
   End
 
+  It 'executes portable file batches on a fresh relocated worker without discovery state'
+    create_pytest_workspace
+    once --format json test tests >/dev/null
+    once --format json query test-plan --portable --target tests > "$SPEC_ROOT/plan.json"
+    worker="$SPEC_ROOT/worker"
+    mkdir -p "$worker/tools"
+    cp -R "$WORKSPACE/tests" "$worker/"
+    cp "$WORKSPACE/once.toml" "$worker/once.toml"
+    cp "$WORKSPACE/.venv/bin/python" "$worker/tools/interpreter"
+    printf '\n[target.attrs]\npython = "tools/interpreter"\n' >> "$worker/once.toml"
+
+    When call /bin/sh -eu -c '
+      test ! -e "$2/.once"
+      "$1" -C "$2" --format json --cpu-limit 2 test --plan "$3" --jobs 2 > "$4"
+      jq -e ".schema == \"once.portable_test_execution.v1\" and .complete and .success and (.execution.runs | length == 2) and (.execution.runs | map(.results.summary.total) | add == 3)" "$4"
+      test ! -e "$2/.once/test-manifests"
+      id=$(jq -r ".plan.batches | max_by(.test_filters | length) | .id" "$3")
+      "$1" -C "$2" --format json test --plan "$3" --batch "$id" --jobs 1 > "$4"
+      jq -e --arg id "$id" ".complete and .success and .selected_batch_ids == [\$id] and (.execution.runs | length == 1) and .execution.runs[0].results.summary.total == 2" "$4"
+    ' sh "$ONCE_BIN" "$worker" "$SPEC_ROOT/plan.json" "$SPEC_ROOT/execution.json"
+    The status should be success
+    The stdout should include 'true'
+    The contents of file "$SPEC_ROOT/execution.json" should include '/test/batches/'
+  End
+
+  It 'rejects stale portable inputs and unknown or duplicate batch assignments before execution'
+    create_pytest_workspace
+    cat >> "$WORKSPACE/once.toml" <<'TOML'
+
+[target.attrs]
+env_inherit = ["ONCE_PORTABLE_DISCOVERY_TEST"]
+TOML
+    once --format json test tests >/dev/null
+    once --format json query test-plan --portable --target tests > "$SPEC_ROOT/plan.json"
+    batch_id="$(jq -r '.plan.batches[0].id' "$SPEC_ROOT/plan.json")"
+
+    When call /bin/sh -eu -c '
+      if "$1" -C "$2" --format json test --plan "$3" --batch unknown > "$4" 2>&1; then exit 1; fi
+      grep -q "unknown portable test batch" "$4"
+      if "$1" -C "$2" --format json test --plan "$3" --batch "$5" --batch "$5" > "$4" 2>&1; then exit 1; fi
+      grep -q "duplicate selected test batch" "$4"
+      if ONCE_PORTABLE_DISCOVERY_TEST=changed "$1" -C "$2" --format json test --plan "$3" > "$4" 2>&1; then exit 1; fi
+      grep -q "portable test plan is stale" "$4"
+      printf "\ndef test_added_after_planning():\n    assert True\n" >> "$2/tests/test_math.py"
+      if "$1" -C "$2" --format json test --plan "$3" > "$4" 2>&1; then exit 1; fi
+      grep -q "portable test plan is stale" "$4"
+      "$1" -C "$2" --format json query test-plan --portable --target tests > "$4"
+      jq -e ".plan.batches | length == 1 and .[0].test_filters == []" "$4"
+    ' sh "$ONCE_BIN" "$WORKSPACE" "$SPEC_ROOT/plan.json" "$SPEC_ROOT/rejection.json" "$batch_id"
+    The status should be success
+    The stdout should include 'true'
+  End
+
+  It 'returns every selected portable batch result when tests fail'
+    create_pytest_workspace
+    cat >> "$WORKSPACE/tests/test_math.py" <<'PY'
+
+def test_failure():
+    import os
+    assert "/batches/" not in os.environ["HOME"], "expected partition failure"
+PY
+    once --format json test tests > "$SPEC_ROOT/discovery.json"
+    once --format json query test-plan --portable --target tests > "$SPEC_ROOT/plan.json"
+
+    When call /bin/sh -eu -c '
+      if "$1" -C "$2" --format json test --plan "$3" --jobs 1 > "$4"; then exit 1; fi
+      jq -e ".schema == \"once.portable_test_execution.v1\" and .complete and (.success | not) and (.execution.runs | length == 2) and (.execution.runs | map(.results.summary.total) | add == 4) and (.execution.runs | map(.results.summary.failed) | add == 1)" "$4"
+    ' sh "$ONCE_BIN" "$WORKSPACE" "$SPEC_ROOT/plan.json" "$SPEC_ROOT/failed-execution.json"
+    The status should be success
+    The stdout should include 'true'
+    The contents of file "$SPEC_ROOT/failed-execution.json" should include 'expected partition failure'
+  End
+
   It 'keeps plan and batch identity independent of worker capacity'
     create_pytest_workspace
     once --format json test tests >/dev/null

@@ -211,6 +211,88 @@ The agent tools `once_query_test_plan` and `once_run_tests` accept `test_batch`
 with the same rules. The returned plan and schedule identify the exact work and
 its attempt.
 
+## Distribute Portable Batches to CI Workers
+
+Export a portable plan after a complete discovery run:
+
+```sh
+once test tests/unit --format json
+once query test-plan --portable --target tests/unit --format json > plan.json
+```
+
+An external scheduler distributes this document unchanged and assigns opaque
+IDs from `plan.batches`. Each fresh worker runs its assigned batches together:
+
+```sh
+once test --plan plan.json \
+  --batch '<first-batch-id>' --batch '<second-batch-id>' \
+  --jobs 4 --format json
+```
+
+Omit `--batch` to execute the complete exported plan. A repeated or unknown ID
+fails before execution. Do not reconstruct native runner filters, split a file
+batch, or transfer private discovery caches. `--jobs`, `--memory-limit`,
+`--cpu-limit`, and `--sandbox` retain their ordinary scheduling and resource
+limits. Portable replay cannot be combined with target selectors or `--config`;
+the worker must use the workspace build configuration bound by the export.
+
+The document has schema `once.portable_test_plan.v1`, a content-derived `id`,
+the native `plan`, and opaque `bindings` for its targets. Bindings tie the
+complete discovery inventory to declared input contents, resolved relevant
+configuration, dependency inputs, and loaded target-kind implementations.
+Missing or stale discovery exports a whole-target fallback, never an old exact
+inventory. Execution rejects stale bindings, malformed identities, overlapping
+scopes, incomplete inventory coverage, and split file fixtures before scheduling.
+The content digest detects changes, not authorship: retrieve plans through a
+trusted, authenticated coordinator and treat them like repository configuration.
+
+Built-in dynamic-language runners separate tool versions from installation
+paths, allowing matching checkouts and tool versions at different locations.
+Explicit environment values remain relevant, including inherited variables
+declared by the target. Changing them, runner versions, test arguments, sources,
+or configuration requires a new plan. Other target kinds remain conservative:
+without an explicit portable configuration contract, their complete metadata is
+bound and a host-dependent change may require re-exporting the plan.
+
+Replay returns `once.portable_test_execution.v1`:
+
+```json
+{
+  "schema": "once.portable_test_execution.v1",
+  "plan_id": "<portable-plan-id>",
+  "selected_batch_ids": ["<batch-id>"],
+  "complete": true,
+  "success": false,
+  "execution": {"plan": {}, "next_plan": {}, "schedule": {}, "runs": []}
+}
+```
+
+`execution` uses the ordinary scheduler report. Each `runs` entry includes its
+`batch_id`, `target`, `exit_code`, `success`, validated normalized `results` or
+null, and any `results_error` or process `error`. Case IDs, suites, ordered
+attempts, optional attempt durations in milliseconds, and failures stay native
+normalized results, not batch assignment identities. All assigned batches are
+attempted even when tests fail. Ordinary test failures return the complete JSON
+and a nonzero exit. `complete` means every selected batch has terminal evidence;
+it does not mean tests passed. Whole-target runners may still omit normalized
+results when their completed process verdict is authoritative.
+
+Require the expected plan ID, exactly the assigned batch IDs, `complete: true`,
+`success: true`, and a successful process exit before passing a CI partition.
+Validation errors, interruptions, or infrastructure errors can produce an error
+envelope or no final document. They must never pass a partition. Cancellation
+forwards the signal to running batch processes and preserves native signal exit
+behavior. Exact batches retain isolated outputs and exact-set result validation.
+
+For hosted attribution, add `--external-group <UUID> --partition-index <N>`.
+The index is a nonnegative 32-bit integer. Authenticated native batch runs carry
+these fields, the portable plan ID, and their native batch ID in
+`RunStarted.test_context`, independently of normalized command arguments.
+An external group indicates that its coordinator owns the single consolidated
+test report per partition. Native batch events remain available for diagnostics
+and must not independently replace or duplicate the partition's shared test
+report. This context does not assert partition completion.
+
 ## Understand Current Ecosystem Coverage
 
 | Target kind | Stable unit discovery | Exact unit execution | Automatic granularity |
@@ -253,8 +335,8 @@ Concurrent batches write results, logs, and native output below isolated batch
 directories. After all batches finish, Once validates and merges them into one
 canonical target result. The plan contains no provider-specific or
 worker-specific assignment, so local or future remote placement does not
-redefine test identity. The current test scheduler coordinates local workers;
-this is not yet a distributed queue or an exported CI shard matrix.
+redefine test identity. Each worker runs a local schedule; an external CI
+coordinator can assign the exported portable batches across workers.
 
 Before scheduling a complete target scope, Once verifies that exact batches are
 disjoint and cover its current discovered units. Exact batch results must report
