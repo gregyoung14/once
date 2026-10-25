@@ -12,9 +12,11 @@ mod capability;
 mod configuration;
 mod contract;
 mod lint;
+mod trigger;
 mod verification;
 
 pub use contract::{validate_action_contracts, ActionContractValidation};
+pub(crate) use trigger::TriggerBatch;
 pub use verification::verify_build;
 
 use std::path::Path;

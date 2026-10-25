@@ -326,6 +326,16 @@ impl Server {
         }
         let result = match call.name.as_str() {
             "once_query_workspace" => crate::commands::query::workspace_value(&self.workspace),
+            "once_list_triggers" => self.tool_list_triggers(&call.arguments),
+            "once_validate_trigger" => {
+                crate::commands::triggers::validate(tool_args(&call.arguments))
+            }
+            "once_edit_triggers" => {
+                crate::commands::triggers::edit(&self.workspace, tool_args(&call.arguments))
+            }
+            "once_activate_triggers" => self.tool_activate_triggers(&call.arguments),
+            "once_plan_trigger" => self.tool_plan_trigger(&call.arguments),
+            "once_run_trigger" => self.tool_run_trigger(&call.arguments),
             "once_query_targets" => self.tool_query_targets(&call.arguments),
             "once_query_capabilities" => self.tool_query_capabilities(&call.arguments),
             "once_get_target" => self.tool_get_target(&call.arguments),
@@ -368,15 +378,43 @@ impl Server {
             other => Err(anyhow::anyhow!("unknown tool `{other}`")),
         };
         match result {
-            Ok(value) => JsonRpcResponse::ok(
-                id,
-                json!({
+            Ok(value) => {
+                let failed = call.name == "once_run_trigger" && value["status"] == "failed";
+                let mut result = json!({
                     "content": [text_content(&value)],
                     "structuredContent": { "result": value },
-                }),
-            ),
+                });
+                if failed {
+                    result["isError"] = json!(true);
+                }
+                JsonRpcResponse::ok(id, result)
+            }
             Err(error) => tool_error_from_error(id, &error),
         }
+    }
+
+    fn tool_list_triggers(&self, args: &Value) -> Result<Value> {
+        let _: TriggerListArgs = serde_json::from_value(tool_args(args))?;
+        crate::commands::triggers::list(&self.workspace)
+    }
+
+    fn tool_activate_triggers(&self, args: &Value) -> Result<Value> {
+        let args: TriggerActivationArgs = serde_json::from_value(tool_args(args))?;
+        crate::commands::triggers::activate(&self.workspace, &args.revision)
+    }
+
+    fn tool_plan_trigger(&self, args: &Value) -> Result<Value> {
+        let args: TriggerEventArgs = serde_json::from_value(tool_args(args))?;
+        crate::commands::triggers::plan(&self.workspace, &args.id, args.event)
+    }
+
+    fn tool_run_trigger(&self, args: &Value) -> Result<Value> {
+        let args: TriggerEventArgs = serde_json::from_value(tool_args(args))?;
+        let workspace = self.workspace.clone();
+        let limits = self.resource_limits.clone();
+        run_async_result(async move {
+            crate::commands::triggers::run(&workspace, &args.id, args.event, limits).await
+        })
     }
 
     fn tool_query_targets(&self, args: &Value) -> Result<Value> {
@@ -966,6 +1004,23 @@ fn tool_args(args: &Value) -> Value {
     } else {
         args.clone()
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerListArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerActivationArgs {
+    revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerEventArgs {
+    id: String,
+    event: Value,
 }
 
 #[derive(Deserialize)]
@@ -1748,6 +1803,9 @@ demo_kind = target_kind(
             names,
             vec![
                 "once_query_workspace".to_string(),
+                "once_list_triggers".to_string(),
+                "once_validate_trigger".to_string(),
+                "once_plan_trigger".to_string(),
                 "once_query_targets".to_string(),
                 "once_query_capabilities".to_string(),
                 "once_query_schema".to_string(),
@@ -2056,6 +2114,9 @@ script_runtime = "sh"
             "once_exec_script",
             "once_apply_edit",
             "once_materialize_example",
+            "once_edit_triggers",
+            "once_activate_triggers",
+            "once_run_trigger",
         ] {
             let response = server(tmp.path().to_path_buf()).dispatch(request(
                 "tools/call",
@@ -2068,6 +2129,170 @@ script_runtime = "sh"
                 .as_str()
                 .unwrap()
                 .contains("--allow-run"));
+        }
+    }
+
+    #[test]
+    fn trigger_inspection_and_validation_do_not_evaluate_project_modules() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("once.toml"),
+            "[modules]\npaths = [\"missing.star\"]\n",
+        )
+        .unwrap();
+        let server = server(tmp.path().to_path_buf());
+        let response = server.dispatch(request(
+            "tools/call",
+            json!({ "name": "once_list_triggers", "arguments": {} }),
+        ));
+        let result = response.result.unwrap();
+        assert_ne!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["result"]["schema"],
+            "once.triggers.v1"
+        );
+        assert_eq!(
+            result["structuredContent"]["result"]["activation"],
+            Value::Null
+        );
+
+        let response = server.dispatch(request(
+            "tools/call",
+            json!({
+                "name": "once_validate_trigger",
+                "arguments": { "trigger": {
+                    "id": "verify-main",
+                    "on": { "event": "vcs.ref_changed", "refs": ["refs/heads/main"] },
+                    "invoke": [{
+                        "target": "checks/core",
+                        "capability": "test",
+                        "configuration": { "os": "linux", "arch": "x86_64", "tokens": [] }
+                    }]
+                }}
+            }),
+        ));
+        let result = response.result.unwrap();
+        assert_ne!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["result"]["valid"], true);
+    }
+
+    #[test]
+    fn trigger_activation_and_plan_are_data_only_and_failed_runs_keep_their_record() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        std::fs::write(workspace.join(".gitignore"), ".once/\n").unwrap();
+        std::fs::write(
+            workspace.join("once.toml"),
+            r#"
+[modules]
+paths = ["missing.star"]
+
+[[trigger]]
+id = "verify-main"
+on = { event = "vcs.ref_changed", refs = ["refs/heads/main"] }
+invoke = [{ target = "checks/core", capability = "test", configuration = { os = "linux", arch = "x86_64", tokens = [] } }]
+"#,
+        )
+        .unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&workspace)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Once Test",
+            "-c",
+            "user.email=once@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "trigger fixture",
+        ]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let server = Server::with_resource_limits(
+            workspace,
+            true,
+            ResourceLimits::new(1, 512 * 1024 * 1024),
+        );
+        let result = server
+            .dispatch(request(
+                "tools/call",
+                json!({ "name": "once_activate_triggers", "arguments": { "revision": revision } }),
+            ))
+            .result
+            .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["result"]["activated"], true);
+        let arguments = json!({
+            "id": "verify-main",
+            "event": { "event": "vcs.ref_changed", "ref": "refs/heads/main", "revision": revision }
+        });
+        let result = server
+            .dispatch(request(
+                "tools/call",
+                json!({ "name": "once_plan_trigger", "arguments": arguments }),
+            ))
+            .result
+            .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        let selection = &result["structuredContent"]["result"];
+        assert_eq!(selection["mode"], "simulation");
+        assert_eq!(
+            selection["trigger"]["invoke"][0]["configuration"],
+            json!({ "os": "linux", "arch": "x86_64", "tokens": [] })
+        );
+        let result = server
+            .dispatch(request(
+                "tools/call",
+                json!({ "name": "once_run_trigger", "arguments": arguments }),
+            ))
+            .result
+            .unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        let record = &result["structuredContent"]["result"];
+        assert_eq!(record["schema"], "once.trigger_run.v1");
+        assert_eq!(record["status"], "failed");
+        assert_eq!(record["memory_limit"], 512 * 1024 * 1024);
+        assert_eq!(record["selection"], *selection);
+        assert!(record["error"].as_str().unwrap().contains("missing.star"));
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            *record
+        );
+    }
+
+    #[test]
+    fn trigger_handlers_reject_unknown_arguments_instead_of_ignoring_them() {
+        let tmp = TempDir::new().unwrap();
+        let server = Server::new(tmp.path().to_path_buf(), true);
+        for name in [
+            "once_list_triggers",
+            "once_validate_trigger",
+            "once_edit_triggers",
+            "once_activate_triggers",
+            "once_plan_trigger",
+            "once_run_trigger",
+        ] {
+            let response = server.dispatch(request(
+                "tools/call",
+                json!({ "name": name, "arguments": { "unexpected": true } }),
+            ));
+            let result = response.result.unwrap();
+            assert_eq!(result["isError"], true, "{name}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(!text.contains("unknown tool"), "{name}: {text}");
         }
     }
 

@@ -21,7 +21,30 @@ struct Manifest {
     reporting: Option<ReportingToml>,
     modules: Option<ModulesToml>,
     rules: Option<ModulesToml>,
+    trigger: Option<toml::Value>,
     target: Vec<TargetToml>,
+}
+
+impl Manifest {
+    fn parse(path: &str, src: &str, package: &str) -> Result<Self> {
+        let manifest: Self = toml::from_str(src).map_err(|source| Error::Parse {
+            path: path.to_string(),
+            message: source.to_string(),
+        })?;
+        if manifest.trigger.is_some() {
+            if !package.is_empty() {
+                return Err(Error::Triggers {
+                    path: path.to_string(),
+                    diagnostics: vec![crate::triggers::root_only_diagnostic()],
+                });
+            }
+            crate::load_triggers_toml_str(path, src).map_err(|diagnostics| Error::Triggers {
+                path: path.to_string(),
+                diagnostics,
+            })?;
+        }
+        Ok(manifest)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,23 +119,24 @@ impl BuildConfiguration {
         let arch = configuration
             .arch
             .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+        Self::from_explicit(&os, &arch, configuration.tokens)
+    }
+
+    /// Normalize explicit platform values and selection tokens without host defaults.
+    pub fn from_explicit(os: &str, arch: &str, tokens: Vec<String>) -> Result<Self> {
         if os.trim().is_empty() || arch.trim().is_empty() {
             return Err(Error::ManifestSchema {
                 path: TOML_BUILD_FILE_NAME.to_string(),
                 kind: ManifestSchemaError::ConfigurationPlatformEmpty,
             });
         }
-        if configuration
-            .tokens
-            .iter()
-            .any(|token| token.trim().is_empty())
-        {
+        if tokens.iter().any(|token| token.trim().is_empty()) {
             return Err(Error::ManifestSchema {
                 path: TOML_BUILD_FILE_NAME.to_string(),
                 kind: ManifestSchemaError::ConfigurationTokenEmpty,
             });
         }
-        Ok(Self::new(&os, &arch, configuration.tokens))
+        Ok(Self::new(os, arch, tokens))
     }
 
     fn new(os: &str, arch: &str, extra_tokens: Vec<String>) -> Self {
@@ -226,10 +250,7 @@ pub(crate) fn load_toml_with_configuration(
     package: &str,
     configuration: &BuildConfiguration,
 ) -> Result<Vec<Target>> {
-    let manifest: Manifest = toml::from_str(src).map_err(|source| Error::Parse {
-        path: display_name.to_string(),
-        message: source.to_string(),
-    })?;
+    let manifest = Manifest::parse(display_name, src, package)?;
     if (manifest.modules.is_some() || manifest.rules.is_some()) && !package.is_empty() {
         return Err(Error::ManifestSchema {
             path: display_name.to_string(),
@@ -260,10 +281,7 @@ pub fn load_infrastructure_toml_str(
     path: &str,
     src: &str,
 ) -> Result<crate::cache_provider::InfrastructureConfig> {
-    let manifest: Manifest = toml::from_str(src).map_err(|source| Error::Parse {
-        path: path.to_string(),
-        message: source.to_string(),
-    })?;
+    let manifest = Manifest::parse(path, src, "")?;
     let cache = if let Some(raw) = manifest.infrastructure.cache {
         Some(raw.into_config(path)?)
     } else {
@@ -294,10 +312,7 @@ pub fn load_infrastructure_toml_str(
 }
 
 pub(crate) fn load_module_paths_toml_str(path: &str, src: &str) -> Result<Vec<String>> {
-    let manifest: Manifest = toml::from_str(src).map_err(|source| Error::Parse {
-        path: path.to_string(),
-        message: source.to_string(),
-    })?;
+    let manifest = Manifest::parse(path, src, "")?;
     match (manifest.modules, manifest.rules) {
         (Some(_), Some(_)) => Err(Error::ManifestSchema {
             path: path.to_string(),
@@ -309,10 +324,7 @@ pub(crate) fn load_module_paths_toml_str(path: &str, src: &str) -> Result<Vec<St
 }
 
 pub(crate) fn load_workspace_toml_str(path: &str, src: &str) -> Result<WorkspaceToml> {
-    let manifest: Manifest = toml::from_str(src).map_err(|source| Error::Parse {
-        path: path.to_string(),
-        message: source.to_string(),
-    })?;
+    let manifest = Manifest::parse(path, src, "")?;
     Ok(manifest.workspace)
 }
 

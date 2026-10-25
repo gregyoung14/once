@@ -159,6 +159,8 @@ defmodule OnceSiteWeb.Docs.Sidebar do
           %Item{label: "Overview", slug: "/docs/guide/infrastructure"},
           %Item{label: "Connect A Project", slug: "/docs/guide/infrastructure/connect"},
           %Item{label: "Remote Execution", slug: "/docs/guide/infrastructure/remote-execution"},
+          %Item{label: "Triggers (Experimental)", slug: "/docs/guide/infrastructure/triggers"},
+          %Item{label: "Buildkite", slug: "/docs/guide/infrastructure/buildkite"},
           %Item{
             label: "Microsandbox",
             slug: "/docs/guide/infrastructure/microsandbox",

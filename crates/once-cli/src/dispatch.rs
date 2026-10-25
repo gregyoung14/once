@@ -221,6 +221,8 @@ async fn run_command(
             .await
         }
         Cmd::Run {
+            trigger,
+            event,
             target,
             sandbox,
             config,
@@ -231,6 +233,17 @@ async fn run_command(
             compute,
             arguments,
         } => {
+            if let Some(id) = trigger {
+                let event = commands::triggers::read_input(event)?;
+                let value =
+                    commands::triggers::run(workspace, &id, event, resource_limits.clone()).await?;
+                commands::triggers::write(output, &value).await?;
+                return Ok(if value["status"] == "failed" {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                });
+            }
             let resolved = resolve_configuration(&config)?;
             Box::pin(dispatch_run(
                 workspace,
@@ -241,7 +254,7 @@ async fn run_command(
                     visible,
                     runtime_rpc,
                     runtime_rpc_socket,
-                    sandbox,
+                    sandbox: sandbox.unwrap_or_default(),
                     resource_limits: resource_limits.clone(),
                     arguments,
                     remote: resolve_remote_execution(workspace, xdg, remote, compute.as_deref())?,
@@ -562,6 +575,22 @@ async fn run_query_command(
         Some(cli::QueryCmd::Workspace) => commands::query::workspace(workspace, output)
             .await
             .map(|()| ExitCode::SUCCESS),
+        Some(cli::QueryCmd::Triggers) => {
+            let value = commands::triggers::list(workspace)?;
+            commands::triggers::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(cli::QueryCmd::ValidateTrigger { file }) => {
+            let value = commands::triggers::validate(commands::triggers::read_input(file)?)?;
+            commands::triggers::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(cli::QueryCmd::TriggerPlan { id, file }) => {
+            let event = commands::triggers::read_input(Some(file))?;
+            let value = commands::triggers::plan(workspace, &id, event)?;
+            commands::triggers::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(cli::QueryCmd::Targets { kind }) => {
             commands::query::targets(workspace, output, kind.as_deref())
                 .await
@@ -722,6 +751,16 @@ async fn run_edit_command(
     command: Option<cli::EditCmd>,
 ) -> Result<ExitCode> {
     match command {
+        Some(cli::EditCmd::Triggers { file }) => {
+            let value = commands::triggers::edit(workspace, commands::triggers::read_input(file)?)?;
+            commands::triggers::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(cli::EditCmd::ActivateTriggers { revision }) => {
+            let value = commands::triggers::activate(workspace, &revision)?;
+            commands::triggers::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(cli::EditCmd::Apply { file }) => commands::edit::apply(workspace, output, file)
             .await
             .map(|()| ExitCode::SUCCESS),

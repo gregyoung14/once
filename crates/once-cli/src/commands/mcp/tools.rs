@@ -1,5 +1,9 @@
 use serde_json::{json, Value};
 
+use crate::commands::triggers::schema::{
+    declaration as trigger_schema, observation as trigger_event_schema,
+};
+
 /// Build the MCP `tools/list` wire projection from the shared catalog.
 pub(super) fn tool_definitions(allow_run: bool) -> Vec<Value> {
     tool_catalog()
@@ -41,6 +45,9 @@ pub(super) fn tool_requires_allow_run(name: &str) -> bool {
             | "once_stop_runtime"
             | "once_apply_edit"
             | "once_materialize_example"
+            | "once_edit_triggers"
+            | "once_activate_triggers"
+            | "once_run_trigger"
     )
 }
 
@@ -57,8 +64,14 @@ fn tool_annotations(name: &str) -> Value {
                 | "once_validate_script"
                 | "once_runtime_status"
                 | "once_runtime_logs"
+                | "once_list_triggers"
+                | "once_validate_trigger"
+                | "once_plan_trigger"
         );
-    let destructive = matches!(name, "once_apply_edit" | "once_stop_runtime");
+    let destructive = matches!(
+        name,
+        "once_apply_edit" | "once_stop_runtime" | "once_edit_triggers" | "once_activate_triggers"
+    );
     let idempotent = read_only
         || matches!(
             name,
@@ -104,6 +117,109 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
             example_return: "{\n  \"root\": \"/work/project\",\n  \"configuration\": {\n    \"os\": \"linux\",\n    \"arch\": \"aarch64\",\n    \"tokens\": [\"linux-arm64\", \"linux-aarch64\", \"linux\", \"arm64\", \"aarch64\", \"default\"]\n  },\n  \"root_manifest\": { \"path\": \"/work/project/once.toml\", \"exists\": false },\n  \"target_count\": 0,\n  \"packages\": [],\n  \"empty\": true,\n  \"suggested_calls\": [\n    { \"tool\": \"once_list_target_kinds\", \"arguments\": {}, \"reason\": \"Discover a target kind and starter for this empty workspace.\" }\n  ]\n}",
+        },
+        ToolDefinition {
+            name: "once_list_triggers",
+            description: "List root trigger declarations and their separately activated snapshot.",
+            long_description: "Reads data-only root manifest metadata and activation state without loading the graph or evaluating project modules. Candidate declaration edits do not replace the activated contract. Matches `once query triggers`.",
+            input_schema: json!({ "type": "object", "properties": {} }),
+            example_return: "{\"schema\":\"once.triggers.v1\",\"triggers\":[],\"diagnostics\":[],\"activation\":null}",
+        },
+        ToolDefinition {
+            name: "once_validate_trigger",
+            description: "Validate one data-only trigger declaration with exact refs and configured invocations.",
+            long_description: "Validates `{ trigger: { id, on: { event, refs }, invoke: [{ target, capability, configuration: { os, arch, tokens } }] } }` without graph loading or project-module evaluation. Platform configuration is explicit, including an empty tokens list when no additional tokens are needed. This does not prove that a configured target exists or executes successfully. Matches `once query validate-trigger --file <path>`; the CLI also accepts stdin.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "trigger": trigger_schema() },
+                "required": ["trigger"]
+            }),
+            example_return: "{\"valid\":true,\"diagnostics\":[]}",
+        },
+        ToolDefinition {
+            name: "once_edit_triggers",
+            description: "Atomically create, replace, or delete root trigger declarations without activating them.",
+            long_description: "Requires `once mcp --allow-run`. Applies an ordered operation batch to the root once.toml only. An update replaces the complete declaration identified by id. A rejected batch leaves the manifest unchanged; no edit changes the activated snapshot. Matches `once edit triggers --file <path>`; the CLI also accepts stdin.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object", "additionalProperties": false,
+                                    "properties": {
+                                        "op": { "type": "string", "const": "create" },
+                                        "trigger": trigger_schema()
+                                    },
+                                    "required": ["op", "trigger"]
+                                },
+                                {
+                                    "type": "object", "additionalProperties": false,
+                                    "properties": {
+                                        "op": { "type": "string", "const": "update" },
+                                        "id": { "type": "string" },
+                                        "trigger": trigger_schema()
+                                    },
+                                    "required": ["op", "id", "trigger"]
+                                },
+                                {
+                                    "type": "object", "additionalProperties": false,
+                                    "properties": {
+                                        "op": { "type": "string", "const": "delete" },
+                                        "id": { "type": "string" }
+                                    },
+                                    "required": ["op", "id"]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["operations"]
+            }),
+            example_return: "{\"applied\":true,\"changed\":true,\"path\":\"/work/project/once.toml\"}",
+        },
+        ToolDefinition {
+            name: "once_activate_triggers",
+            description: "Activate root trigger declarations from an exact committed definition revision.",
+            long_description: "Requires `once mcp --allow-run`. Replaces the activated snapshot separately from candidate edits, using declarations from the full source revision supplied by the caller. Activation is local state, not authenticated event provenance or external required-check authorization. Matches `once edit activate-triggers --revision <full-sha>`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "revision": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" }
+                },
+                "required": ["revision"]
+            }),
+            example_return: "{\"activated\":true}",
+        },
+        ToolDefinition {
+            name: "once_plan_trigger",
+            description: "Simulate an event against one activated trigger without executing work.",
+            long_description: "Matches the exact ref against the activated declaration and returns its exact target, capability, and explicit configuration selections. This is data-only simulation, not authenticated source-host provenance, graph analysis, or status publication. Does not evaluate project modules. Matches `once query trigger-plan <id> --file <event-path>`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "event": trigger_event_schema()
+                },
+                "required": ["id", "event"]
+            }),
+            example_return: "{\"schema\":\"once.trigger_selection.v1\",\"mode\":\"simulation\",\"contract_generation\":\"019b0000-0000-7000-8000-000000000000\",\"definition_revision\":\"0123456789012345678901234567890123456789\",\"observation\":{\"event\":\"vcs.ref_changed\",\"ref\":\"refs/heads/main\",\"revision\":\"0123456789012345678901234567890123456789\"},\"trigger\":{\"id\":\"verify-main\",\"on\":{\"event\":\"vcs.ref_changed\",\"refs\":[\"refs/heads/main\"]},\"invoke\":[{\"target\":\"checks/core\",\"capability\":\"test\",\"configuration\":{\"os\":\"linux\",\"arch\":\"x86_64\",\"tokens\":[]}}]}}",
+        },
+        ToolDefinition {
+            name: "once_run_trigger",
+            description: "Execute an activated trigger on the existing CI worker within one resource budget.",
+            long_description: "Requires `once mcp --allow-run`. Executes the activated exact configured invocations using the supplied local event document and the server's memory budget. The event does not authenticate origin or authorize privileges. The CI worker remains responsible for isolation, lifecycle, credentials, and external checks. No native webhook, controller, or status publication is created. A failed aggregate returns isError while retaining the structured result. Matches `once run --trigger <id> --event <event-path>`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "event": trigger_event_schema()
+                },
+                "required": ["id", "event"]
+            }),
+            example_return: "{\"schema\":\"once.trigger_run.v1\",\"mode\":\"simulation\",\"status\":\"failed\",\"error\":\"configured trigger target is missing\"}",
         },
         ToolDefinition {
             name: "once_query_targets",
@@ -734,6 +850,121 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_tools_have_matching_cli_paths_and_mutation_gates() {
+        let cases: &[(&str, &[&str], &[&str], bool)] = &[
+            (
+                "once_list_triggers",
+                &["query", "triggers"],
+                &["query", "triggers"],
+                false,
+            ),
+            (
+                "once_validate_trigger",
+                &["query", "validate-trigger"],
+                &["query", "validate-trigger"],
+                false,
+            ),
+            (
+                "once_edit_triggers",
+                &["edit", "triggers"],
+                &["edit", "triggers"],
+                true,
+            ),
+            (
+                "once_activate_triggers",
+                &[
+                    "edit",
+                    "activate-triggers",
+                    "--revision",
+                    "0123456789012345678901234567890123456789",
+                ],
+                &["edit", "activate-triggers"],
+                true,
+            ),
+            (
+                "once_plan_trigger",
+                &[
+                    "query",
+                    "trigger-plan",
+                    "verify-main",
+                    "--file",
+                    "event.json",
+                ],
+                &["query", "trigger-plan"],
+                false,
+            ),
+            (
+                "once_run_trigger",
+                &["run", "--trigger", "verify-main", "--event", "event.json"],
+                &["run"],
+                true,
+            ),
+        ];
+        let catalog = tool_definitions(true);
+        let read_only_catalog = tool_definitions(false);
+        for (name, arguments, path, gated) in cases {
+            let argv = std::iter::once("once")
+                .chain(arguments.iter().copied())
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>();
+            let cli = crate::cli::Cli::try_parse_from(&argv).unwrap();
+            assert_eq!(cli.surface_path(), *path, "{name}");
+            assert_eq!(cli.incomplete_command_help_path(), None, "{name}");
+            let definition = catalog.iter().find(|tool| tool["name"] == *name).unwrap();
+            assert_eq!(tool_requires_allow_run(name), *gated, "{name}");
+            assert_eq!(definition["annotations"]["readOnlyHint"], !gated, "{name}");
+            assert_eq!(
+                read_only_catalog.iter().any(|tool| tool["name"] == *name),
+                !gated,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_schemas_describe_closed_nested_objects_and_explicit_configuration() {
+        fn assert_closed(value: &Value) {
+            match value {
+                Value::Object(object) => {
+                    if object.get("type") == Some(&json!("object")) {
+                        assert_eq!(object.get("additionalProperties"), Some(&json!(false)));
+                    }
+                    for nested in object.values() {
+                        assert_closed(nested);
+                    }
+                }
+                Value::Array(array) => {
+                    for nested in array {
+                        assert_closed(nested);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for tool in tool_definitions(true).into_iter().filter(|tool| {
+            tool["name"].as_str().unwrap().ends_with("_trigger")
+                || tool["name"].as_str().unwrap().ends_with("_triggers")
+        }) {
+            assert_closed(&tool["inputSchema"]);
+        }
+        let declaration = trigger_schema();
+        let invocation = &declaration["properties"]["invoke"]["items"];
+        assert_eq!(
+            invocation["properties"]["capability"]["enum"],
+            json!(["build", "test", "run"])
+        );
+        assert_eq!(
+            invocation["properties"]["configuration"]["required"],
+            json!(["os", "arch", "tokens"])
+        );
+        assert_eq!(
+            trigger_event_schema()["required"],
+            json!(["event", "ref", "revision"])
+        );
+    }
 
     #[test]
     fn catalog_examples_stay_toolchain_neutral() {

@@ -37,6 +37,550 @@ Call this first when filesystem tools and the Once server may have different wor
 }
 ```
 
+## `once_list_triggers`
+
+List root trigger declarations and their separately activated snapshot.
+
+Reads data-only root manifest metadata and activation state without loading the graph or evaluating project modules. Candidate declaration edits do not replace the activated contract. Matches `once query triggers`.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+**Example return**
+
+```json
+{"schema":"once.triggers.v1","triggers":[],"diagnostics":[],"activation":null}
+```
+
+## `once_validate_trigger`
+
+Validate one data-only trigger declaration with exact refs and configured invocations.
+
+Validates `{ trigger: { id, on: { event, refs }, invoke: [{ target, capability, configuration: { os, arch, tokens } }] } }` without graph loading or project-module evaluation. Platform configuration is explicit, including an empty tokens list when no additional tokens are needed. This does not prove that a configured target exists or executes successfully. Matches `once query validate-trigger --file <path>`; the CLI also accepts stdin.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+        },
+        "on": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "vcs.ref_changed"
+            },
+            "refs": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact fully qualified ref, such as refs/heads/main. Patterns are not supported."
+              }
+            }
+          },
+          "required": [
+            "event",
+            "refs"
+          ]
+        },
+        "invoke": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "target": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact canonical workspace-relative target id."
+              },
+              "capability": {
+                "type": "string",
+                "enum": [
+                  "build",
+                  "test",
+                  "run"
+                ]
+              },
+              "configuration": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "os": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "arch": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "tokens": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                },
+                "required": [
+                  "os",
+                  "arch",
+                  "tokens"
+                ]
+              }
+            },
+            "required": [
+              "target",
+              "capability",
+              "configuration"
+            ]
+          }
+        }
+      },
+      "required": [
+        "id",
+        "on",
+        "invoke"
+      ]
+    }
+  },
+  "required": [
+    "trigger"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"valid":true,"diagnostics":[]}
+```
+
+## `once_edit_triggers`
+
+Atomically create, replace, or delete root trigger declarations without activating them.
+
+Requires `once mcp --allow-run`. Applies an ordered operation batch to the root once.toml only. An update replaces the complete declaration identified by id. A rejected batch leaves the manifest unchanged; no edit changes the activated snapshot. Matches `once edit triggers --file <path>`; the CLI also accepts stdin.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "operations": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "type": "string",
+                "const": "create"
+              },
+              "trigger": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+                  },
+                  "on": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "event": {
+                        "type": "string",
+                        "const": "vcs.ref_changed"
+                      },
+                      "refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Exact fully qualified ref, such as refs/heads/main. Patterns are not supported."
+                        }
+                      }
+                    },
+                    "required": [
+                      "event",
+                      "refs"
+                    ]
+                  },
+                  "invoke": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "target": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Exact canonical workspace-relative target id."
+                        },
+                        "capability": {
+                          "type": "string",
+                          "enum": [
+                            "build",
+                            "test",
+                            "run"
+                          ]
+                        },
+                        "configuration": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "os": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "arch": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "tokens": {
+                              "type": "array",
+                              "uniqueItems": true,
+                              "items": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            }
+                          },
+                          "required": [
+                            "os",
+                            "arch",
+                            "tokens"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "target",
+                        "capability",
+                        "configuration"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "id",
+                  "on",
+                  "invoke"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "trigger"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "type": "string",
+                "const": "update"
+              },
+              "id": {
+                "type": "string"
+              },
+              "trigger": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+                  },
+                  "on": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "event": {
+                        "type": "string",
+                        "const": "vcs.ref_changed"
+                      },
+                      "refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Exact fully qualified ref, such as refs/heads/main. Patterns are not supported."
+                        }
+                      }
+                    },
+                    "required": [
+                      "event",
+                      "refs"
+                    ]
+                  },
+                  "invoke": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "target": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Exact canonical workspace-relative target id."
+                        },
+                        "capability": {
+                          "type": "string",
+                          "enum": [
+                            "build",
+                            "test",
+                            "run"
+                          ]
+                        },
+                        "configuration": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "os": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "arch": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "tokens": {
+                              "type": "array",
+                              "uniqueItems": true,
+                              "items": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            }
+                          },
+                          "required": [
+                            "os",
+                            "arch",
+                            "tokens"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "target",
+                        "capability",
+                        "configuration"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "id",
+                  "on",
+                  "invoke"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "id",
+              "trigger"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "type": "string",
+                "const": "delete"
+              },
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "id"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "operations"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"applied":true,"changed":true,"path":"/work/project/once.toml"}
+```
+
+## `once_activate_triggers`
+
+Activate root trigger declarations from an exact committed definition revision.
+
+Requires `once mcp --allow-run`. Replaces the activated snapshot separately from candidate edits, using declarations from the full source revision supplied by the caller. Activation is local state, not authenticated event provenance or external required-check authorization. Matches `once edit activate-triggers --revision <full-sha>`.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "revision": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+    }
+  },
+  "required": [
+    "revision"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"activated":true}
+```
+
+## `once_plan_trigger`
+
+Simulate an event against one activated trigger without executing work.
+
+Matches the exact ref against the activated declaration and returns its exact target, capability, and explicit configuration selections. This is data-only simulation, not authenticated source-host provenance, graph analysis, or status publication. Does not evaluate project modules. Matches `once query trigger-plan <id> --file <event-path>`.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "type": "string",
+          "const": "vcs.ref_changed"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact fully qualified ref."
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+        }
+      },
+      "required": [
+        "event",
+        "ref",
+        "revision"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "event"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"schema":"once.trigger_selection.v1","mode":"simulation","contract_generation":"019b0000-0000-7000-8000-000000000000","definition_revision":"0123456789012345678901234567890123456789","observation":{"event":"vcs.ref_changed","ref":"refs/heads/main","revision":"0123456789012345678901234567890123456789"},"trigger":{"id":"verify-main","on":{"event":"vcs.ref_changed","refs":["refs/heads/main"]},"invoke":[{"target":"checks/core","capability":"test","configuration":{"os":"linux","arch":"x86_64","tokens":[]}}]}}
+```
+
+## `once_run_trigger`
+
+Execute an activated trigger on the existing CI worker within one resource budget.
+
+Requires `once mcp --allow-run`. Executes the activated exact configured invocations using the supplied local event document and the server's memory budget. The event does not authenticate origin or authorize privileges. The CI worker remains responsible for isolation, lifecycle, credentials, and external checks. No native webhook, controller, or status publication is created. A failed aggregate returns isError while retaining the structured result. Matches `once run --trigger <id> --event <event-path>`.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "type": "string",
+          "const": "vcs.ref_changed"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact fully qualified ref."
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+        }
+      },
+      "required": [
+        "event",
+        "ref",
+        "revision"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "event"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"schema":"once.trigger_run.v1","mode":"simulation","status":"failed","error":"configured trigger target is missing"}
+```
+
 ## `once_query_targets`
 
 List every declared target in the workspace, optionally filtered by target kind.

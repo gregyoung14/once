@@ -4,6 +4,20 @@ use usage::Subcommands;
 
 #[derive(Subcommands)]
 pub enum EditCmd {
+    /// Atomically edit root trigger declarations without changing activation.
+    Triggers {
+        /// JSON document containing trigger operations. Reads stdin when omitted.
+        #[usage(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+
+    /// Activate root trigger declarations from an exact committed revision.
+    ActivateTriggers {
+        /// Full source revision containing the declarations to activate.
+        #[usage(long, value_name = "FULL_SHA")]
+        revision: String,
+    },
+
     /// Apply a batch of operations to one `once.toml` atomically.
     ///
     /// Reads `{ "package": "...", "operations": [...] }` from `--file`
@@ -36,6 +50,8 @@ pub enum EditCmd {
 impl EditCmd {
     pub fn surface_path(&self) -> Vec<&'static str> {
         match self {
+            Self::Triggers { .. } => vec!["triggers"],
+            Self::ActivateTriggers { .. } => vec!["activate-triggers"],
             Self::Apply { .. } => vec!["apply"],
             Self::MaterializeExample { .. } => vec!["materialize-example"],
         }

@@ -51,11 +51,12 @@ use self::actions::{
 use self::analysis_memo::AnalysisMemo;
 use self::resolution_cache::ResolutionCache;
 use self::scheduler::{BuildScheduler, DependencyInputs};
-use self::source_digest_cache::{KnownChanges, SourceDigestCache};
+use self::source_digest_cache::SourceDigestCache;
 use self::target_outcomes::TargetOutcomes;
 use crate::commands::change_tracker::{ChangePosition, ChangeSnapshot};
 
 pub(super) use self::source_digest_cache::stored_position as recorded_digest_position;
+pub(super) use self::source_digest_cache::KnownChanges;
 pub(super) use self::source_digest_cache::SourceDigestCache as RecordedDigests;
 
 /// Turn a watcher snapshot into a statement about the recorded digests.
@@ -413,6 +414,29 @@ impl BuildSession {
 
     pub(super) fn log_paths(&self) -> Vec<String> {
         self.producers.log_paths()
+    }
+
+    pub(super) fn with_resource_pool(mut self, resources: Arc<ResourcePool>) -> Self {
+        self.resources = resources;
+        self.producers = Producers::default();
+        self
+    }
+
+    pub(super) fn trigger_resolution(&self) -> Result<JsonValue> {
+        let targets: BTreeMap<_, _> = self
+            .targets
+            .iter()
+            .map(|(id, target)| (id, target.as_ref()))
+            .collect();
+        Ok(serde_json::json!({
+            "graph_digest": Digest::of_bytes(&serde_json::to_vec(&targets)?).to_string(),
+            "module_digest": self.module_source_digest.to_string(),
+            "tool_cache_fingerprint": self.tool_cache_fingerprint,
+        }))
+    }
+
+    pub(super) fn has_implementation(&self, target: &GraphTarget) -> bool {
+        self.analyzer.target_kind_has_impl(&target.kind)
     }
 
     pub(super) fn with_output_observer(

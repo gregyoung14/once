@@ -12,6 +12,25 @@ pub enum QueryCmd {
     /// discovery or validation calls.
     Workspace,
 
+    /// List data-only root trigger declarations and their activated snapshot.
+    Triggers,
+
+    /// Validate a proposed trigger without evaluating project modules.
+    ValidateTrigger {
+        /// JSON document containing a trigger. Reads stdin when omitted.
+        #[usage(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+
+    /// Simulate an event against an activated trigger without executing work.
+    TriggerPlan {
+        /// Activated trigger id.
+        id: String,
+        /// JSON event with event, ref, and full revision fields.
+        #[usage(long, value_name = "PATH")]
+        file: PathBuf,
+    },
+
     /// List declared graph targets.
     Targets {
         /// Only include targets with this target kind.
@@ -214,6 +233,9 @@ impl QueryCmd {
     pub fn surface_path(&self) -> Vec<&'static str> {
         match self {
             Self::Workspace => vec!["workspace"],
+            Self::Triggers => vec!["triggers"],
+            Self::ValidateTrigger { .. } => vec!["validate-trigger"],
+            Self::TriggerPlan { .. } => vec!["trigger-plan"],
             Self::Targets { .. } => vec!["targets"],
             Self::Capabilities { .. } => vec!["capabilities"],
             Self::Schema { .. } => vec!["schema"],

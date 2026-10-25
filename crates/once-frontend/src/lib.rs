@@ -23,6 +23,7 @@ mod script;
 mod target;
 mod target_ref;
 mod target_validator;
+mod triggers;
 mod workspace;
 mod workspace_validator;
 
@@ -67,6 +68,10 @@ pub use target_ref::{
     target_id, validate_target_name, TargetIdError,
 };
 pub use target_validator::validate_target;
+pub use triggers::{
+    apply_trigger_operations, load_triggers_toml_str, validate_triggers, TriggerConfiguration,
+    TriggerEditOperation, TriggerInvocation, TriggerOn, TriggerSpec,
+};
 pub use workspace::{
     load_cache_provider, load_cache_provider_override, load_file, load_infrastructure_config,
     load_workspace, load_workspace_with_configuration,

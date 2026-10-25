@@ -28,6 +28,11 @@ pub enum Error {
     },
     #[error("parse error in {path}:\n{message}")]
     Parse { path: String, message: String },
+    #[error("{path}: {}", .diagnostics.iter().map(|diagnostic| diagnostic.message.as_str()).collect::<Vec<_>>().join("; "))]
+    Triggers {
+        path: String,
+        diagnostics: Vec<crate::Diagnostic>,
+    },
     #[error("evaluation error in {path}:\n{message}")]
     Eval { path: String, message: String },
     #[error("{source}")]

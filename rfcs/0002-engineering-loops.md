@@ -17,6 +17,8 @@ This RFC proposes a small extension to the current model:
 4. Make human gates, policy gates, and agent checks queryable graph concepts.
 5. Prefer executable hooks, tools, tests, and schemas over growing prompt
    context.
+6. Let data-only event registrations select existing capabilities without
+   duplicating the build or loop graph.
 
 The result is an engineering graph rather than only a build graph. Build graph
 targets are still first-class. Engineering loops sit above them and call into
@@ -85,6 +87,11 @@ diagnostics, remote execution, runtime introspection, and MCP-first discovery.
 - Make natural language specs the primary source of truth.
 - Require a hosted Once service for the first useful implementation.
 - Add arbitrary executable graph construction to target declarations.
+
+Event registration does not change the CI replacement non-goal. The initial
+experiment retains an existing CI service's lifecycle and status authority.
+A native controller requires a separate product decision and the recovery and
+trust acceptance criteria below.
 
 ## Product Model
 
@@ -158,6 +165,165 @@ agent, policy, or human produced this conclusion.
 Action results can be reused. Evidence records can be inspected, compared, and
 used as prerequisites, but they must not be blindly replayed as truth.
 
+## Event Registrations
+
+Root declarations, explicit local activation, and simulation inside an existing
+CI worker are implemented experimentally through matching query/edit/run CLI
+and MCP interfaces. The controller, authorization, retained-snapshot, and
+recovery contracts in this section remain proposals. The interface selects
+existing capabilities when a source ref changes, without another job DAG:
+
+```toml
+[[trigger]]
+id = "verify-main"
+on = { event = "vcs.ref_changed", refs = ["refs/heads/main"] }
+
+[[trigger.invoke]]
+target = "checks/core"
+capability = "test"
+configuration = { os = "linux", arch = "x86_64", tokens = [] }
+```
+
+Registrations live in root `once.toml`. Initial selectors are exact refs and
+exact target/capability references with complete, normalized configuration.
+Reject duplicate members, empty required selections, absent capabilities, and
+unsupported configurations. Do not add shell stages, query selectors,
+matrices, or registration-specific dependency edges. Configuration is distinct
+from the worker's execution platform. A future registration can invoke a loop
+capability; loop stages remain the only loop graph.
+
+Keep one coarse Once invocation per necessary CI worker allocation. Generating
+a CI step per Once action retains the competing dependency graph this proposal
+removes. A native controller is a separate product decision, not a requirement
+for removing duplicated build knowledge from an existing CI pipeline.
+
+### Activation Is Separate From Candidate Source
+
+An activated registration and required-check contract determine the obligation
+for a candidate revision. A commit that deletes or narrows its own declaration
+must still satisfy the prior activated contract. Validate and authorize the
+replacement before activating a new generation, then reconcile the current
+head. Required-check retirement needs a coordinated policy and source-host
+check migration. Missing work never becomes a successful empty aggregate.
+
+Repository installation binds an authorized definition revision, repository
+identity, and check obligations. This is authorization state, not a parallel
+Once configuration file. Any future Once-owned policy declarations use the
+existing `once.toml` family. A protected branch is source provenance, not
+permission to expose credentials to project code.
+
+These rules preserve selected check coverage, not the semantic correctness of
+tests changed by a candidate. Reviewing the tests themselves remains necessary.
+
+### Intent, Plan, And Attempt Are Distinct
+
+The controller reads bounded data-only metadata without evaluating modules.
+It persists an authorized intent containing source snapshot identity,
+definition revision, active contract generation, policy decision, exact roots,
+and effective configuration. An isolated worker then resolves configured
+capabilities and records a plan with module, tool, and environment identities.
+Deferred action expansion must bind its input artifact digests and be recorded
+before the expanded actions execute; it is not a reason to evaluate project
+code in the controller.
+
+Retain and verify source, submodules, large-file content, module sources, Once
+and built-in module identity, and tool artifacts or immutable worker images.
+Reject dirty authoritative runs. Unavailable retained inputs are unavailable,
+not permission to substitute a host tool or re-resolve dependencies. Undeclared
+host state remains an explicit reproducibility limitation. Changed content or
+configuration creates new work, not another attempt of the same plan.
+
+Declare required environment inputs without persisting secret plaintext.
+
+Authenticate delivery identity separately from intent. Duplicate delivery does
+not create a rerun. Each attempt has a lease epoch and an accepted-outcome
+identity. Local replay is simulation without external check or elevated cache
+write authority. Authorized retry rechecks current revocations; a historical
+policy record does not preserve privileges indefinitely.
+
+### Current-Head Convergence, Not Every Historical Push
+
+`vcs.ref_changed` describes desired source state, not the envelope of a push
+webhook. Notifications wake reconciliation. Persist admission before delivery
+acknowledgement, verify the current source-host ref, and conditionally advance
+the desired generation. Promise eventual verification of a quiescent head.
+Polling records an authenticated ref observation; it cannot invent a lost
+push's actor or reconstruct every transition in an A to B to A sequence.
+Execute-every-commit semantics and event-only predicates are excluded.
+
+Keep generations for disabled registrations and deleted refs. Force pushes
+and observed delete/recreate transitions invalidate prior desired generations;
+stale deliveries cannot revive them. Receipt acceptance and queued status
+publication must match the current run, accepted attempt, lease epoch, plan,
+and contract generation. An exact source SHA alone is insufficient. A native
+adapter must prove delayed or ambiguous writes cannot make obsolete work
+satisfy the current required-check contract.
+
+### Admit And Isolate Before Project Evaluation
+
+Acquire a bounded worker allocation before checkout helpers, tool bootstrap,
+discovery, or analysis. Isolate all those operations as well as actions, and
+keep controller credentials outside the worker. Scope source/artifact access
+and cache writes by authority, not branch name. Action resource limits fit
+inside the worker allocation. Supersession fences outcomes immediately but
+does not reclaim capacity until termination or isolation teardown is known.
+
+Start with one supported pool. Multi-platform placement and cross-pool
+admission must avoid hold-and-wait deadlocks before they are introduced.
+Native workers remain possible; containers are not the orchestration model.
+
+Events do not invalidate unchanged action keys. Event-derived values affecting
+bytes are declared inputs; delivery and attempt identities are not. Reused
+action results yield new run evidence under the current contract. Deployments,
+release publication, approvals, arbitrary event sources, PR/merge-queue checks,
+and effectful stages are outside this experiment. Cache bypass does not make
+external effects safe to retry.
+
+Supporting external effects later requires operation identities, destination
+reconciliation, and authorization bound to the exact artifacts and destination.
+An ambiguous result must not automatically retry an external effect.
+
+### Adversarial Scenarios
+
+The controller contracts must withstand these scenarios from design review:
+
+1. A candidate removes a required invocation or narrows its matching ref.
+   Evaluate it under the activated contract and authorize changes separately.
+2. A local replay claims to be a protected-branch push. Authenticate provenance
+   separately from execution privileges; replay defaults to simulation.
+3. Workers resolve different host defaults for the same invocation. Freeze the
+   exact configuration, then retain the resolved plan.
+4. An old tool or submodule is unavailable. Report unavailable rather than
+   substituting content and calling it replay.
+5. A branch moves A to B to A during an outage. Reconcile the current head;
+   do not manufacture missed push events or promise every intermediate commit.
+6. An old success arrives after a newer policy failure on the same commit.
+   Fence receipt acceptance and publication by attempt and contract generation.
+7. Pushes exhaust memory during discovery before action admission starts.
+   Allocate and bound workers before checkout or project evaluation.
+
+These are design counterexamples, not claims that native-controller guarantees
+are implemented or have been tested.
+
+### Acceptance Criteria
+
+First retain the existing CI service as lifecycle/status owner, with one
+bounded worker pool and coarse capability invocation rather than per-action
+pipeline generation. Require simulation replay, narrowing/deletion tests,
+snapshot mismatch and unavailable-input failures, and bounded concurrent
+discovery. Trigger discovery, validation, edits, and replay need typed CLI/MCP
+parity, without reserving command names in advance.
+
+The experimental worker supplies selection and checkout checks. It does not
+retain complete snapshots or enforce OS-level worker limits; those remain CI
+responsibilities and prerequisites for a native controller.
+
+A native controller additionally needs missed-event convergence,
+force-push/delete/recreate handling, revoked-retry denial, stale-attempt
+rejection, and crash or ambiguous-publication recovery without false green.
+Do not build it if the existing-CI experiment removes the duplicated build
+knowledge without needing another lifecycle owner.
+
 ## Loop Targets
 
 A loop target is a typed target whose primary output is evidence, not a build
@@ -169,7 +335,6 @@ name = "new-dependency-review"
 kind = "engineering_loop"
 
 [target.attrs]
-trigger = { files = ["Cargo.toml", "Cargo.lock"] }
 stages = [
   { id = "metadata", kind = "action", run = "cargo metadata" },
   { id = "advisory-scan", kind = "action", run = "cargo deny check advisories" },
@@ -180,7 +345,10 @@ stages = [
 
 The exact TOML shape is illustrative. The invariant is that loop stages are
 typed data, validated against schemas, and available through the same query and
-MCP surfaces as graph targets.
+MCP surfaces as graph targets. Event registrations are separate data that
+invoke a loop capability; target-local trigger evaluation must not become a
+second subscription mechanism. File-change predicates are a later extension,
+not part of the initial ref-state experiment.
 
 ### Stage Kinds
 
@@ -273,7 +441,9 @@ named commands are stable shortcuts for common graph expressions.
 ### New Dependency Review
 
 A developer or agent changes a dependency lockfile. Once detects that the
-`new-dependency-review` trigger matches and starts the loop.
+change matches a future file-change registration and starts the
+`new-dependency-review` loop. Until that selector exists, the loop can be
+invoked explicitly.
 
 ```sh
 once loop run checks/new-dependency-review
@@ -588,3 +758,6 @@ even before agent orchestration exists.
 - Swamp manual: https://swamp-club.com/manual/
 - Jose Valim, "Agentic engineering is still software engineering":
   https://gist.github.com/josevalim/27e2fd147ea3765010ed5ada7162db1e
+- Buildkite dynamic pipelines:
+  https://buildkite.com/docs/pipelines/configure/dynamic-pipelines
+- Dagger Cloud Checks: https://docs.dagger.io/cloud-checks

@@ -4,6 +4,12 @@
 Configure it when developers and coding agents should reuse the same action
 results.
 
+::: info Trigger orchestration is coming
+Tuist support for [Once triggers](/guide/infrastructure/triggers) is coming.
+This page covers the shared-cache integration available today, not CI
+orchestration.
+:::
+
 ## Create And Connect A Project
 
 Provision a Tuist project and bind this repository to it in one command:

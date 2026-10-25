@@ -328,15 +328,38 @@ pub enum Cmd {
         target: Option<String>,
     },
 
-    /// Run a declared target.
+    /// Run a declared target or an activated trigger on an existing CI worker.
     ///
     /// Resolves the target id against the workspace graph and executes
     /// its `run` capability through the action cache. Use `--remote`
     /// to ask a compute provider to execute the command.
     Run {
-        /// Local filesystem sandbox policy for command actions.
-        #[usage(long, default = "off")]
-        sandbox: SandboxMode,
+        /// Execute an activated trigger using the supplied local event document.
+        #[usage(
+            long,
+            value_name = "ID",
+            requires = "event",
+            conflicts(
+                "target",
+                "arguments",
+                "config",
+                "sandbox",
+                "visible",
+                "runtime_rpc",
+                "runtime_rpc_socket",
+                "remote",
+                "compute"
+            )
+        )]
+        trigger: Option<String>,
+
+        /// JSON event with event, ref, and full revision fields. Does not authenticate origin.
+        #[usage(long, value_name = "PATH", requires = "trigger")]
+        event: Option<PathBuf>,
+
+        /// Local filesystem sandbox policy for command actions. Defaults to off.
+        #[usage(long)]
+        sandbox: Option<SandboxMode>,
 
         /// Override the workspace build configuration. See `once build --config`.
         #[usage(long, value_name = "KEY=VALUE")]
@@ -767,7 +790,11 @@ impl Cli {
         }
 
         match self.command.as_ref()? {
-            Cmd::Run { target: None, .. } => Some(&["run"]),
+            Cmd::Run {
+                target: None,
+                trigger: None,
+                ..
+            } => Some(&["run"]),
             Cmd::Exec { argv, .. } if argv.is_empty() => Some(&["exec"]),
             Cmd::Cache { cmd: None } => Some(&["cache"]),
             Cmd::Cache {
@@ -955,6 +982,136 @@ mod tests {
         };
         assert_eq!(target.as_deref(), Some("server/application_dev"));
         assert_eq!(arguments, ["phx.server", "--port", "4001"]);
+    }
+
+    #[test]
+    fn trigger_run_accepts_an_event_and_global_memory_budget_without_target_help() {
+        let cli = parse(&[
+            "once",
+            "--memory-limit",
+            "512MiB",
+            "run",
+            "--trigger",
+            "verify-main",
+            "--event",
+            "event.json",
+        ]);
+        assert_eq!(cli.incomplete_command_help_path(), None);
+        assert_eq!(cli.surface_path(), ["run"]);
+        assert_eq!(cli.memory_limit.unwrap().bytes(), 512 * 1024 * 1024);
+        let Some(Cmd::Run {
+            trigger,
+            event,
+            target,
+            sandbox,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(trigger.as_deref(), Some("verify-main"));
+        assert_eq!(event, Some(PathBuf::from("event.json")));
+        assert!(target.is_none());
+        assert!(sandbox.is_none());
+    }
+
+    #[test]
+    fn trigger_run_requires_both_trigger_and_event() {
+        for arguments in [
+            vec!["once", "run", "--trigger", "verify-main"],
+            vec!["once", "run", "--event", "event.json"],
+        ] {
+            let argv = arguments.iter().map(OsStr::new).collect::<Vec<_>>();
+            assert!(Cli::try_parse_from(&argv).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn trigger_run_rejects_target_execution_overrides_in_either_order() {
+        let trigger = ["--trigger", "verify-main", "--event", "event.json"];
+        for conflicting in [
+            vec!["checks/core"],
+            vec!["--config", "os=linux"],
+            vec!["--sandbox", "off"],
+            vec!["--sandbox", "inputs"],
+            vec!["--visible"],
+            vec!["--runtime-rpc"],
+            vec!["--runtime-rpc-socket", "control.sock"],
+            vec!["--remote"],
+            vec!["--compute", "worker"],
+        ] {
+            for before in [true, false] {
+                let mut arguments = vec!["once", "run"];
+                if before {
+                    arguments.extend(&conflicting);
+                    arguments.extend(trigger);
+                } else {
+                    arguments.extend(trigger);
+                    arguments.extend(&conflicting);
+                }
+                let argv = arguments.iter().map(OsStr::new).collect::<Vec<_>>();
+                assert!(Cli::try_parse_from(&argv).is_err(), "{arguments:?}");
+            }
+        }
+        let argv = [
+            "once",
+            "run",
+            "--trigger",
+            "verify-main",
+            "--event",
+            "event.json",
+            "--",
+            "extra",
+        ]
+        .map(OsStr::new);
+        assert!(Cli::try_parse_from(&argv).is_err());
+    }
+
+    #[test]
+    fn trigger_json_inputs_preserve_paths_and_allow_stdin_where_supported() {
+        let cli = parse(&["once", "query", "validate-trigger", "--file", "draft.json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Query {
+                cmd: Some(QueryCmd::ValidateTrigger { file: Some(file) }),
+                ..
+            }) if file == std::path::Path::new("draft.json")
+        ));
+        let cli = parse(&[
+            "once",
+            "query",
+            "trigger-plan",
+            "verify-main",
+            "--file",
+            "event.json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Query {
+                cmd: Some(QueryCmd::TriggerPlan { id, file }),
+                ..
+            }) if id == "verify-main" && file == std::path::Path::new("event.json")
+        ));
+        let cli = parse(&["once", "edit", "triggers", "--file", "edit.json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Edit {
+                cmd: Some(EditCmd::Triggers { file: Some(file) })
+            }) if file == std::path::Path::new("edit.json")
+        ));
+        for arguments in [
+            vec!["once", "query", "validate-trigger"],
+            vec!["once", "edit", "triggers"],
+        ] {
+            assert_eq!(parse(&arguments).incomplete_command_help_path(), None);
+        }
+        for arguments in [
+            vec!["once", "query", "trigger-plan", "verify-main"],
+            vec!["once", "edit", "activate-triggers"],
+        ] {
+            let argv = arguments.iter().map(OsStr::new).collect::<Vec<_>>();
+            assert!(Cli::try_parse_from(&argv).is_err(), "{arguments:?}");
+        }
     }
 
     #[test]

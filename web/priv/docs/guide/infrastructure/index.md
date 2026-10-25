@@ -93,3 +93,10 @@ provider for one invocation.
 
 Start with [Remote Execution](/guide/infrastructure/remote-execution), then open
 the setup guide for the provider you want to use.
+
+For CI orchestration, read
+[Event-Driven Automation](/guide/infrastructure/triggers). Declare triggers
+that select existing capabilities and let the CI service schedule workers
+without maintaining another build graph. The guide lists service integration
+status, including upcoming Tuist support and a
+[Buildkite dynamic-pipeline example](/guide/infrastructure/buildkite).
