@@ -96,15 +96,7 @@ async fn portable_schedule_attributes_each_batch_and_forwards_cancellation() {
     terminal::graph_workspace(workspace.path(), true);
     let mut query = terminal::command(workspace.path(), home.path());
     query
-        .args([
-            "query",
-            "test-plan",
-            "--portable",
-            "--target",
-            "Task",
-            "--format",
-            "json",
-        ])
+        .args(["query", "test-plan", "--target", "Task", "--format", "json"])
         .stdout(Stdio::piped());
     let output = tokio::task::spawn_blocking(move || query.output().unwrap())
         .await

@@ -53,7 +53,7 @@ fn fixture() -> (tempfile::TempDir, Vec<GraphTarget>, PortableTestPlan) {
             .collect(),
     )
     .unwrap()
-    .with_portable_discovery_fingerprint(Some(
+    .with_discovery_fingerprint(Some(
         discovery_fingerprint(workspace.path(), &graph, "tests").unwrap(),
     ))
     .unwrap();
@@ -76,7 +76,7 @@ fn fixture() -> (tempfile::TempDir, Vec<GraphTarget>, PortableTestPlan) {
     let plan = PortableTestPlan::export(
         workspace.path(),
         &graph,
-        TestPlan::for_selected_targets(selection).unwrap(),
+        super::super::plan_from_selection_with_graph(workspace.path(), &graph, selection).unwrap(),
     )
     .unwrap();
     (workspace, graph, plan)

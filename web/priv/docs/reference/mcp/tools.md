@@ -521,9 +521,9 @@ Maps changed paths to test targets using graph relationships, declared inputs, a
 
 ## `once_query_test_plan`
 
-Create an immutable test plan without assigning work to runners.
+Export a replayable test plan with complete discovery and input bindings.
 
-Returns the selection policy, normalized changed paths, unmatched paths, selected tests, and stable execution batches. The plan deliberately contains no local worker, remote provider, or fixed-job assignment, so scheduling can change without changing test identity or invalidating reusable results. Before a target's first complete run, or when its discovery inputs change, the plan intentionally contains one whole-target batch. Run that target once with `once_run_tests`, inspect `once_query_test_manifest`, then query the plan again to see automatic file or case batches. Pass `target` with a `test_unit` from the manifest to create an exact unit-filtered plan. Planning rejects targets that do not declare exact filtering and units absent from the persisted whole-target manifest. Pass `target` with `test_batch` to select one batch ID from that target's current plan. Batch and unit selectors are mutually exclusive and cannot be combined with changed paths. The matching batch command is `once query test-plan --target <target> --test-batch <id> --format json`. The matching command-line operations are `once query test-plan --changed-path <path> --format json` and `once query test-plan --target <target> --test-unit <unit> --format json`.
+Returns a `once.portable_test_plan.v1` document with selection reasons, stable batches, complete discovery inventories, and input/configuration bindings. Every exported plan can be replayed on a fresh worker using `once test --plan <file> --batch <id>` without copying private state or reconstructing runner filters. Select targets with either target or changed_paths, never both. Plans always cover complete selected targets; choose batches at execution, not during export. Missing or stale discovery produces a whole-target fallback. Run targets completely with once_run_tests, then query again for automatic file or case batches. Worker counts and placement are not part of batch identity. The matching command is `once query test-plan --format json`.
 
 **Input schema**
 
@@ -540,17 +540,10 @@ Returns the selection policy, normalized changed paths, unmatched paths, selecte
     },
     "target": {
       "type": "string",
-      "description": "Explicit canonical test target. When set, changed paths are ignored."
-    },
-    "test_unit": {
-      "type": "string",
-      "description": "One stable unit identifier from once_query_test_manifest. Requires target."
-    },
-    "test_batch": {
-      "type": "string",
-      "description": "One batch ID from the target's current once_query_test_plan. Requires target; conflicts with test_unit and changed_paths."
+      "description": "Explicit canonical test target. Conflicts with changed_paths."
     }
-  }
+  },
+  "additionalProperties": false
 }
 ```
 
@@ -558,16 +551,21 @@ Returns the selection policy, normalized changed paths, unmatched paths, selecte
 
 ```json
 {
-  "schema": "once.test_plan.v1",
-  "id": "<stable digest>",
-  "selection": {
-    "schema": "once.test_selection.v1",
-    "policy": { "mode": "affected", "safety": "conservative", "evidence": "declared_graph_and_package_ownership" },
-    "changed_paths": ["src/lib.src"],
-    "unmatched_paths": [],
-    "tests": [{ "id": "tests/unit", "kind": "test_suite", "reasons": ["changed dependency `lib` input `src/lib.src`"] }]
+  "schema": "once.portable_test_plan.v1",
+  "id": "<bound plan digest>",
+  "plan": {
+    "schema": "once.test_plan.v1",
+    "id": "<scope digest>",
+    "selection": {
+      "schema": "once.test_selection.v1",
+      "policy": { "mode": "affected", "safety": "conservative", "evidence": "declared_graph_and_package_ownership" },
+      "changed_paths": ["src/lib.src"],
+      "unmatched_paths": [],
+      "tests": [{ "id": "tests/unit", "kind": "test_suite", "reasons": ["changed dependency `lib` input `src/lib.src`"] }]
+    },
+    "batches": [{ "id": "<batch digest>", "target": "tests/unit", "test_filters": [] }]
   },
-  "batches": [{ "id": "<stable digest>", "target": "tests/unit", "test_filters": [] }]
+  "bindings": [{ "target": "tests/unit", "fingerprint": "<input digest>", "manifest": null }]
 }
 ```
 
@@ -575,7 +573,7 @@ Returns the selection policy, normalized changed paths, unmatched paths, selecte
 
 Run test targets by id, or run tests affected by changed workspace paths.
 
-Creates the same immutable plan as `once_query_test_plan`, then pulls stable batches from a shared local queue. Batches with longer historical uncached durations are queued first, and idle workers dynamically take the next batch. Explicit `target` or `targets` produce an exact plan; otherwise `changed_paths` drive conservative graph selection. With exactly one target, `test_unit` runs a stable unit returned by `once_query_test_manifest` when the target kind declares filtering support. With exactly one target, `test_batch` reruns one batch ID from the target's current plan without splitting its fixture scope. It conflicts with `test_unit` and changed paths. Unknown or obsolete IDs fail before execution and suggest current batches. The matching command is `once test <target> --test-batch <id> --format json`. `jobs` caps workers without changing plan or batch identity. Set `summary_only` for compact normalized totals without case-level records. The result's `plan` is the work that just executed. Its `next_plan` is recomputed after complete runs refresh discovery, so use that field to assess file or case batching for the next run. The result also includes actual schedule attempts and normalized test results. Failed tests are returned as normal tool content with `success: false` rather than a tool protocol error, so agents can inspect failures and iterate. The matching command-line operations are `once test --changed-path <path> --jobs <count> --format json` and `once test <target> --test-unit <unit> --format json`.
+Schedules selected test scopes through a shared local queue. Batches with longer historical uncached durations are queued first, and idle workers dynamically take the next batch. Explicit `target` or `targets` produce an exact plan; otherwise `changed_paths` drive conservative graph selection. With exactly one target, `test_unit` runs a stable unit returned by `once_query_test_manifest` when the target kind declares filtering support. With exactly one target, `test_batch` reruns one batch ID from the target's current plan without splitting its fixture scope. It conflicts with `test_unit` and changed paths. Unknown or obsolete IDs fail before execution and suggest current batches. The matching command is `once test <target> --test-batch <id> --format json`. `jobs` caps workers without changing plan or batch identity. Set `summary_only` for compact normalized totals without case-level records. The result's `plan` is the work that just executed. Its `next_plan` is recomputed after complete runs refresh discovery, so use that field to assess file or case batching for the next run. The result also includes actual schedule attempts and normalized test results. Failed tests are returned as normal tool content with `success: false` rather than a tool protocol error, so agents can inspect failures and iterate. The matching command-line operations are `once test --changed-path <path> --jobs <count> --format json` and `once test <target> --test-unit <unit> --format json`.
 
 **Input schema**
 
@@ -696,7 +694,7 @@ Reads the normalized result file produced by the target's `test` capability. Thi
 
 List stable test units discovered in a target's normalized results.
 
-Returns an immutable `once.test_manifest.v1` projection of the target's current normalized test results and its target-kind-declared listing and filtering support. When no results exist, the manifest reports `whole_target_fallback` with no units; run the whole target once to refresh discovery. Unit identifiers can be passed to `once_query_test_plan` or `once_run_tests` only when `case_filtering` is `runner_args`. The matching command-line operation is `once query test-manifest <target> --format json`.
+Returns an immutable `once.test_manifest.v1` projection of the target's current normalized test results and its target-kind-declared listing and filtering support. When no results exist, the manifest reports `whole_target_fallback` with no units; run the whole target once to refresh discovery. Unit identifiers can be passed to `once_run_tests` only when `case_filtering` is `runner_args`. The matching command-line operation is `once query test-manifest <target> --format json`.
 
 **Input schema**
 

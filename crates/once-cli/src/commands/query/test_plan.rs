@@ -130,11 +130,7 @@ pub(crate) fn plan_from_selection_with_graph(
             batches.push(TestBatch::new(&test.id, Vec::new())?);
             continue;
         };
-        let sharded = manifest.source == "normalized_results"
-            && manifest.listing_supported
-            && manifest.case_filtering == "runner_args"
-            && manifest.sharding.supported
-            && !manifest.units.is_empty()
+        let sharded = portable::shardable(&manifest)
             && super::test_manifest_is_current_with_graph(workspace, &test.id, &manifest, graph);
         if !sharded {
             batches.push(TestBatch::new(&test.id, Vec::new())?);

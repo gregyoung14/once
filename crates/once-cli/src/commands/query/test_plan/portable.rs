@@ -30,33 +30,22 @@ pub(crate) struct Binding {
 }
 
 impl PortableTestPlan {
-    pub fn export(workspace: &Path, graph: &[GraphTarget], mut plan: TestPlan) -> Result<Self> {
+    pub fn export(workspace: &Path, graph: &[GraphTarget], plan: TestPlan) -> Result<Self> {
         plan.validate()?;
         let mut bindings = Vec::new();
         for selected in &plan.selection.tests {
             let fingerprint = discovery_fingerprint(workspace, graph, &selected.id)?;
             let stored = super::super::stored_test_manifest_record(workspace, &selected.id)?;
             let manifest = stored
-                .filter(|manifest| {
-                    manifest.portable_discovery_fingerprint.as_deref() == Some(&fingerprint)
-                })
+                .filter(|manifest| manifest.discovery_fingerprint.as_deref() == Some(&fingerprint))
                 .map(|manifest| portable_manifest(&manifest))
                 .transpose()?;
-            let batches = manifest
-                .as_ref()
-                .filter(|manifest| shardable(manifest))
-                .map(|manifest| super::batches_for_manifest(selected, manifest.clone()))
-                .transpose()?
-                .unwrap_or(vec![TestBatch::new(&selected.id, vec![])?]);
-            plan.batches.retain(|batch| batch.target != selected.id);
-            plan.batches.extend(batches);
             bindings.push(Binding {
                 target: selected.id.clone(),
                 fingerprint,
                 manifest: manifest.filter(shardable),
             });
         }
-        let plan = TestPlan::new(plan.selection, plan.batches)?;
         let mut portable = Self {
             schema: SCHEMA.to_string(),
             id: String::new(),
@@ -165,7 +154,7 @@ impl PortableTestPlan {
     }
 }
 
-fn shardable(manifest: &TestManifest) -> bool {
+pub(super) fn shardable(manifest: &TestManifest) -> bool {
     manifest.source == "normalized_results"
         && manifest.listing_supported
         && manifest.case_filtering == "runner_args"

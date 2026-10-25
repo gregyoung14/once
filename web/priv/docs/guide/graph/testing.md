@@ -124,7 +124,8 @@ whole-target run.
 
 ## Plan Affected Tests Before Running
 
-Inspect the immutable plan for changed workspace paths:
+Every plan query exports the same replayable document, including discovery
+inventories and input bindings. Inspect one for changed workspace paths:
 
 ```sh
 once query test-plan \
@@ -166,17 +167,14 @@ once query test-attempts --limit 20 --format json
 Choose an identifier returned by the current complete manifest:
 
 ```sh
-once query test-plan \
-  --target tests/unit \
-  --test-unit 'tests/unit::returns_greeting' \
-  --format json
+once query test-manifest tests/unit --format json
 
 once test tests/unit \
   --test-unit 'tests/unit::returns_greeting' \
   --format json
 ```
 
-Planning verifies both conditions before it creates an exact batch:
+Before execution, Once verifies both conditions:
 
 1. the target declares `case_filtering = "runner_args"`; and
 2. the requested identifier is present in the persisted complete manifest.
@@ -191,7 +189,6 @@ current target plan and copy a batch's `id`:
 
 ```sh
 once query test-plan --target tests/unit --format json
-once query test-plan --target tests/unit --test-batch '<batch-id>' --format json
 once test tests/unit --test-batch '<batch-id>' --format json
 ```
 
@@ -207,21 +204,22 @@ fixture boundary. It does not replace the complete discovery manifest with the
 filtered result. Worker count does not change the batch ID. This reproduces the
 scope of the work, not necessarily its outcome after code or environment changes.
 
-The agent tools `once_query_test_plan` and `once_run_tests` accept `test_batch`
-with the same rules. The returned plan and schedule identify the exact work and
-its attempt.
+The agent tool `once_query_test_plan` exports the complete replayable plan.
+`once_run_tests` accepts `test_batch` for local replay with the same rules.
+The returned execution scope and schedule identify the exact work and attempt.
 
-## Distribute Portable Batches to CI Workers
+## Replay Saved Plans on CI Workers
 
-Export a portable plan after a complete discovery run:
+Export the plan after a complete discovery run:
 
 ```sh
 once test tests/unit --format json
-once query test-plan --portable --target tests/unit --format json > plan.json
+once query test-plan --target tests/unit --format json > plan.json
 ```
 
-An external scheduler distributes this document unchanged and assigns opaque
-IDs from `plan.batches`. Each fresh worker runs its assigned batches together:
+Plan queries always cover complete selected targets. Choose opaque batch IDs
+from `plan.batches` at execution, not during export. An external scheduler
+distributes the document unchanged, and each fresh worker runs its assignments:
 
 ```sh
 once test --plan plan.json \

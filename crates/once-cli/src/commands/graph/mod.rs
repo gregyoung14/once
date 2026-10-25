@@ -505,7 +505,7 @@ pub async fn test_with_filters(
             crate::commands::query::validate_test_unit(manifest, target_id, test_filter)?;
         }
     }
-    let portable_before = if test_filters.is_empty() && resolved.path_suffix.is_empty() {
+    let discovery_before = if test_filters.is_empty() && resolved.path_suffix.is_empty() {
         crate::commands::query::test_plan::portable::discovery_fingerprint(
             workspace, &graph, target_id,
         )
@@ -583,7 +583,7 @@ pub async fn test_with_filters(
         crate::commands::query::refresh_test_manifest_for_target(
             workspace,
             target,
-            portable_before.as_deref(),
+            discovery_before.as_deref(),
         )
         .context("persisting test manifest")?;
     }

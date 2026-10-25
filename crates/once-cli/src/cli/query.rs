@@ -100,30 +100,14 @@ pub enum QueryCmd {
         changed_paths: Vec<String>,
     },
 
-    /// Create an immutable test plan without assigning work to runners.
+    /// Export a replayable test plan with complete discovery and input bindings.
     TestPlan {
-        /// Export a versioned plan for fresh workers without local discovery state.
-        #[usage(long, conflicts("test_unit", "test_batch"))]
-        portable: bool,
         /// Changed workspace-relative path. Repeat for multiple paths.
         #[usage(long = "changed-path", value_name = "PATH", conflicts = "target")]
         changed_paths: Vec<String>,
         /// Create an explicit plan for this target instead of selecting by changed path.
         #[usage(long, conflicts = "changed_paths")]
         target: Option<String>,
-        /// Select one current, filterable unit from `once query test-manifest`.
-        /// Planning fails when the target does not support exact filtering or
-        /// the unit is absent from the persisted whole-target manifest.
-        #[usage(long = "test-unit", requires = "target", conflicts = "test_batch")]
-        test_unit: Option<String>,
-        /// Select one batch ID from the current plan for this target.
-        #[usage(
-            long = "test-batch",
-            value_name = "ID",
-            requires = "target",
-            conflicts = "test_unit"
-        )]
-        test_batch: Option<String>,
     },
 
     /// Read normalized `once.test_results.v1` results for a target.

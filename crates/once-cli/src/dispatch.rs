@@ -669,22 +669,12 @@ async fn run_query_command(
                 .map(|()| ExitCode::SUCCESS)
         }
         Some(cli::QueryCmd::TestPlan {
-            portable,
             changed_paths,
             target,
-            test_unit,
-            test_batch,
         }) => {
-            run_test_plan_query(
-                workspace,
-                output,
-                &changed_paths,
-                target,
-                test_unit,
-                test_batch,
-                portable,
-            )
-            .await
+            commands::query::test_plan_request(workspace, output, &changed_paths, target.as_deref())
+                .await
+                .map(|()| ExitCode::SUCCESS)
         }
         Some(cli::QueryCmd::TestResults {
             target,
@@ -744,28 +734,6 @@ async fn run_query_command(
         }
         None => anyhow::bail!("query subcommand required"),
     }
-}
-
-async fn run_test_plan_query(
-    workspace: &Path,
-    output: Output,
-    changed_paths: &[String],
-    target: Option<String>,
-    test_unit: Option<String>,
-    test_batch: Option<String>,
-    portable: bool,
-) -> Result<ExitCode> {
-    commands::query::test_plan_request(
-        workspace,
-        output,
-        changed_paths,
-        target.as_deref(),
-        test_unit.as_deref(),
-        test_batch.as_deref(),
-        portable,
-    )
-    .await
-    .map(|()| ExitCode::SUCCESS)
 }
 
 async fn run_edit_command(
