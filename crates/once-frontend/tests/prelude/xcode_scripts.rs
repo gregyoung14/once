@@ -7,7 +7,7 @@ fn preserves_outputless_phases_and_skips_install_only_phases() {
 def workspace_root():
     return "/workspace"
 objects = {{
-    "before": {{"isa": "PBXShellScriptBuildPhase", "shellScript": "verify", "name": "Repeated name"}},
+    "before": {{"isa": "PBXShellScriptBuildPhase", "shellScript": ["verify", "prepare"], "name": "Repeated name"}},
     "sources": {{"isa": "PBXSourcesBuildPhase"}},
     "after": {{"isa": "PBXShellScriptBuildPhase", "shellScript": "finish", "name": "Repeated name"}},
     "install": {{"isa": "PBXShellScriptBuildPhase", "shellScript": "install", "runOnlyForDeploymentPostprocessing": "1"}},
@@ -16,13 +16,13 @@ phases = _xcode_shell_script_phases(
     {{"label": {{"package": "", "id": "Seed"}}, "attr": {{"project": "App.xcodeproj"}}}},
     objects, {{"buildPhases": ["before", "sources", "after", "install"]}}, {{}}, "", "App",
 )
-result = repr([[json_decode(a)["id"], json_decode(a)["cacheable"]] for a in phases["actions"] + phases["postbuild_actions"]])
+result = repr([[json_decode(a)["id"], json_decode(a)["cacheable"], json_decode(a)["script"]] for a in phases["actions"] + phases["postbuild_actions"]])
 "#,
         xcode_prelude_source()
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"[["before", False], ["after", False]]"#
+        r#"[["before", False, "verify\nprepare"], ["after", False, "finish"]]"#
     );
 }
 
@@ -78,8 +78,8 @@ def workspace_root():
 def host_file_exists(path):
     return True
 def host_file_read(path):
-    return "$(SRCROOT)/input.txt\n" if path.endswith("inputs.xcfilelist") else "$(TARGET_BUILD_DIR)/result.txt\n"
-phase = {{"isa": "PBXShellScriptBuildPhase", "shellScript": "generate", "inputPaths": ["$(SRCROOT)/script.sh"], "inputFileListPaths": ["$(SRCROOT)/inputs.xcfilelist"], "outputFileListPaths": ["$(SRCROOT)/outputs.xcfilelist"]}}
+    return "$(SRCROOT)/Nested/../input.txt\n" if path.endswith("inputs.xcfilelist") else "$(TARGET_BUILD_DIR)/result.txt\n"
+phase = {{"isa": "PBXShellScriptBuildPhase", "shellScript": "generate", "inputPaths": ["$(SRCROOT)/Scripts/../script.sh"], "inputFileListPaths": ["$(SRCROOT)/inputs.xcfilelist"], "outputFileListPaths": ["$(SRCROOT)/outputs.xcfilelist"]}}
 phases = _xcode_shell_script_phases({{"label": {{"package": "", "id": "Seed"}}, "attr": {{"project": "App.xcodeproj"}}}}, {{"phase": phase}}, {{"buildPhases": ["phase"]}}, {{}}, "", "App")
 action = json_decode(phases["actions"][0])
 result = repr([action["inputs"], action["outputs"], action["env"]["SCRIPT_INPUT_FILE_COUNT"], action["env"]["SCRIPT_INPUT_FILE_LIST_COUNT"], action["env"]["SCRIPT_OUTPUT_FILE_COUNT"], action["env"]["SCRIPT_OUTPUT_FILE_LIST_0"], action["cacheable"]])
@@ -160,7 +160,12 @@ fn dependency_products_are_staged_for_the_native_environment() {
         r#"{}
 _apple_script_dependency_products({{
     "label": {{"id": "App"}}, "build_dir": ".once/out/config/App",
-    "deps": [{{"framework_path": ".once/out/Framework/Library.framework", "framework_files": [".once/out/Framework/Library.framework/Library"]}}],
+    "attr": {{"postbuild_actions": [_json_encode({{"build_dir": ".once/out/App", "inputs": [".once/out/App/Dependency/Library.framework", ".once/out/App/Support/Support.framework"]}})]}},
+    "deps": [
+        {{"framework_path": ".once/out/Framework/Library.framework", "framework_files": [".once/out/Framework/Library.framework/Library"]}},
+        {{"transitive_framework_bundles": [{{"path": ".once/out/Support/Support.framework", "files": [".once/out/Support/Support.framework/Support"]}}]}},
+        {{"app_path": ".once/out/Tool/Tool.app", "app_executable": ".once/out/Tool/Tool.app/Tool", "app_files": [".once/out/Tool/Tool.app/Tool"]}},
+    ],
 }})
 result = repr(True)
 "#,
@@ -179,6 +184,25 @@ result = repr(True)
     assert!(action
         .inputs
         .contains(&".once/out/Framework/Library.framework/Library".to_string()));
+    let tool = action_by_identifier(&store, "script_product:.once/out/config/App/Tool");
+    assert_eq!(tool.outputs, [".once/out/config/App/Tool"]);
+    assert_eq!(tool.inputs, [".once/out/Tool/Tool.app/Tool"]);
+    let nested = action_by_identifier(
+        &store,
+        "script_product:.once/out/config/App/Dependency/Library.framework",
+    );
+    assert_eq!(nested.inputs, action.inputs);
+    let transitive = action_by_identifier(
+        &store,
+        "script_product:.once/out/config/App/Support/Support.framework",
+    );
+    assert_eq!(
+        transitive.outputs,
+        [".once/out/config/App/Support/Support.framework"]
+    );
+    assert!(transitive
+        .inputs
+        .contains(&".once/out/Support/Support.framework/Support".to_string()));
 }
 
 #[test]
@@ -193,12 +217,12 @@ phases = _xcode_shell_script_phases(
     {{"buildPhases": ["phase"]}}, {{"CUSTOM_TOOL": "$(DEVELOPER_DIR)/Toolchains"}}, "", "App",
 )
 env = json_decode(phases["actions"][0])["env"]
-result = repr([env["DEVELOPER_DIR"], env["CUSTOM_TOOL"]])
+result = repr([env["DEVELOPER_DIR"], env["CUSTOM_TOOL"], env["TOOLCHAIN_DIR"], env["CODE_SIGNING_ALLOWED"], env["EXPANDED_CODE_SIGN_IDENTITY_NAME"]])
 "#,
         xcode_prelude_source()
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"["/opt/Selected Xcode/Contents/Developer", "/opt/Selected Xcode/Contents/Developer/Toolchains"]"#
+        r#"["/opt/Selected Xcode/Contents/Developer", "/opt/Selected Xcode/Contents/Developer/Toolchains", "/opt/Selected Xcode/Contents/Developer/Toolchains/XcodeDefault.xctoolchain", "YES", ""]"#
     );
 }

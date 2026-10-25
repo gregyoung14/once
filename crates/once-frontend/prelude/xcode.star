@@ -1623,7 +1623,7 @@ def _xcode_filter_excluded_sources(sources, settings):
 
 _XCODE_SOURCE_EXTS = [".swift", ".m", ".mm", ".c", ".cc", ".cpp", ".cxx", ".c++", ".S"]
 _XCODE_HEADER_EXTS = [".h", ".hh", ".hpp", ".ipp", ".hxx"]
-_XCODE_RESOURCE_EXTS = [".storyboard", ".xib", ".strings", ".plist", ".json", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".entitlements"]
+_XCODE_RESOURCE_EXTS = [".storyboard", ".xib", ".strings", ".xcstrings", ".plist", ".json", ".css", ".html", ".js", ".applescript", ".scpt", ".sdef", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".entitlements"]
 
 def _xcode_is_source(path):
     for ext in _XCODE_SOURCE_EXTS:
@@ -1679,6 +1679,15 @@ def _xcode_asset_catalog_dir(path):
             return path
     return ""
 
+def _xcode_resource_bundle_dir(path):
+    for marker in [".bundle", ".help"]:
+        index = path.find(marker + "/")
+        if index >= 0:
+            return path[:index + len(marker)]
+        if path.endswith(marker):
+            return path
+    return ""
+
 def _xcode_synced_exceptions(objects, group, target_name, base):
     # Collect the package-relative paths a synchronized group excludes from the
     # target named `target_name`. A membership exception path is relative to the
@@ -1706,13 +1715,21 @@ def _xcode_path_excluded(path, excluded):
             return True
     return False
 
-def _xcode_classify_synced_path(path, buckets):
+def _xcode_classify_synced_path(path, buckets, explicit_folders = []):
     if _xcode_is_excluded_source_path(path):
         return
+    for folder in explicit_folders:
+        if path == folder or path.startswith(folder + "/"):
+            buckets["resources"].append(folder)
+            buckets["structured_resources"].append(folder)
+            return
     # A synchronized glob returns files inside a `.xcassets`, not the catalog
     # directory itself, so recover the catalog from the path and skip contents.
     catalog = _xcode_asset_catalog_dir(path)
-    if catalog:
+    resource_bundle = _xcode_resource_bundle_dir(path)
+    if resource_bundle:
+        buckets["resources"].append(resource_bundle)
+    elif catalog:
         buckets["asset_catalogs"].append(catalog)
     elif _xcode_is_intent_definition(path):
         buckets["intent_definitions"].append(path)
@@ -1738,7 +1755,7 @@ def _xcode_synced_group_files(ctx, objects, target, project_dir, path_maps, grou
     # once across every target it belongs to rather than N times per target
     # visit. Cache omitted defaults to the original one-glob-per-visit path.
     group_dirs = path_maps["groups"]
-    buckets = {"sources": [], "headers": [], "resources": [], "asset_catalogs": [], "intent_definitions": []}
+    buckets = {"sources": [], "headers": [], "resources": [], "structured_resources": [], "asset_catalogs": [], "intent_definitions": []}
     target_name = target.get("name") or ""
     owned = {}
     for group_id in target.get("fileSystemSynchronizedGroups") or []:
@@ -1748,26 +1765,30 @@ def _xcode_synced_group_files(ctx, objects, target, project_dir, path_maps, grou
         if base == None:
             continue
         excluded = _xcode_synced_exceptions(objects, group, target_name, base)
-        for path in _xcode_synced_group_walk(base, group_walk_cache):
+        explicit_folders = [_xcode_join(base, relative) for relative in group.get("explicitFolders") or []]
+        for path in explicit_folders + _xcode_synced_group_walk(base, group_walk_cache):
             if _xcode_path_excluded(path, excluded):
                 continue
-            _xcode_classify_synced_path(path, buckets)
+            _xcode_classify_synced_path(path, buckets, explicit_folders)
 
     # Additive membership from synchronized groups owned by other targets,
     # looked up from the precomputed map keyed by target.
     for entry in path_maps["additive"].get(target_name) or []:
         if entry["group_id"] in owned:
             continue
+        group = objects.get(entry["group_id"]) or {}
+        explicit_folders = [_xcode_join(entry["base"], relative) for relative in group.get("explicitFolders") or []]
         for relative in entry["relatives"]:
             trimmed = relative[1:] if relative.startswith("/") else relative
             candidate = _xcode_join(entry["base"], trimmed)
             if host_path_exists(_xcode_abs(candidate)):
-                _xcode_classify_synced_path(candidate, buckets)
+                _xcode_classify_synced_path(candidate, buckets, explicit_folders)
 
     return {
         "sources": _unique(buckets["sources"]),
         "headers": _unique(buckets["headers"]),
         "resources": _unique(buckets["resources"]),
+        "structured_resources": _unique(buckets["structured_resources"]),
         "asset_catalogs": _unique(buckets["asset_catalogs"]),
         "intent_definitions": _unique(buckets["intent_definitions"]),
     }
@@ -1922,7 +1943,7 @@ def _xcode_target_files(ctx, objects, target, file_paths, project_dir, path_maps
         "headers": _unique(classic["headers"] + synced["headers"]),
         "exported_headers": _unique(classic["exported_headers"] + synced["headers"]),
         "resources": _unique(classic["resources"] + synced["resources"]),
-        "structured_resources": classic["structured_resources"],
+        "structured_resources": _unique(classic["structured_resources"] + synced["structured_resources"]),
         "asset_catalogs": _unique(classic["asset_catalogs"] + synced["asset_catalogs"]),
         "intent_definitions": _unique(classic["intent_definitions"] + synced["intent_definitions"]),
         "frameworks": classic["frameworks"],
@@ -1978,7 +1999,7 @@ def _xcode_script_path(value, subs):
     path = _xcode_resolve_vars(value or "", subs)
     if not path or path.startswith("$("):
         return ""
-    return _xcode_workspace_relative(path)
+    return _xcode_workspace_relative(_xcode_normalize_path(path))
 
 def _xcode_shell_phase_paths(phase, paths_key, file_lists_key, subs):
     paths = []
@@ -2089,6 +2110,24 @@ def _xcode_datamodel_sources(ctx, resources, module_name, swift_version, target_
         sources.extend(outputs)
     return {"actions": actions, "sources": _unique(sources)}
 
+def _xcode_string_catalog_sources(ctx, resources, target_sources, settings, target_name):
+    actions = []
+    sources = []
+    if _xcode_scalar(settings.get("STRING_CATALOG_GENERATE_SYMBOLS")).upper() != "YES" or not any([path.endswith(".swift") for path in target_sources]):
+        return {"actions": actions, "sources": sources}
+    out_dir = ".once/out/" + ((ctx["label"]["package"] + "/") if ctx["label"]["package"] else "") + _xcode_sanitized_target_name(target_name) + "/StringSymbols"
+    for catalog in _unique(resources):
+        if not catalog.endswith(".xcstrings") or any([part.endswith(".lproj") for part in catalog.split("/")[:-1]]):
+            continue
+        stem = _basename(catalog)[:-len(".xcstrings")]
+        output = out_dir + "/GeneratedStringSymbols_" + stem + ".swift"
+        if output in sources:
+            fail(ctx["label"]["id"] + ": cannot generate string symbols for multiple " + _basename(catalog) + " catalogs in the same target")
+        args = ["generate-symbols", "--language", "swift", "--output-directory", out_dir, catalog]
+        actions.append(_json_encode({"id": "string-symbols:" + catalog, "name": "Generate string symbols · " + _basename(catalog), "tool": "xcstringstool", "args": args, "inputs": [catalog], "outputs": [output], "cacheable": True}))
+        sources.append(output)
+    return {"actions": actions, "sources": sources}
+
 def _xcode_intent_sources(ctx, definitions, target_name):
     actions = []
     sources = []
@@ -2161,8 +2200,16 @@ def _xcode_shell_script_phases(ctx, objects, target, subs, project_dir, target_n
     developer_dir = ctx["attr"].get("xcode_developer_dir") or ""
     if not developer_dir and "/Platforms/" in (script_subs.get("SDKROOT") or ""):
         developer_dir = script_subs["SDKROOT"].split("/Platforms/")[0]
+    if not developer_dir:
+        developer_dir = script_subs.get("DEVELOPER_DIR") or host_env("DEVELOPER_DIR") or ""
     if developer_dir:
         script_subs["DEVELOPER_DIR"] = developer_dir
+        if not script_subs.get("TOOLCHAIN_DIR"):
+            script_subs["TOOLCHAIN_DIR"] = developer_dir.rstrip("/") + "/Toolchains/XcodeDefault.xctoolchain"
+    if "CODE_SIGNING_ALLOWED" not in script_subs:
+        script_subs["CODE_SIGNING_ALLOWED"] = "YES"
+    if "EXPANDED_CODE_SIGN_IDENTITY_NAME" not in script_subs:
+        script_subs["EXPANDED_CODE_SIGN_IDENTITY_NAME"] = script_subs.get("EXPANDED_CODE_SIGN_IDENTITY") or script_subs.get("CODE_SIGN_IDENTITY") or ""
     for phase_id in target.get("buildPhases") or []:
         phase = objects.get(phase_id) or {}
         if phase.get("isa") != "PBXShellScriptBuildPhase":
@@ -2179,6 +2226,8 @@ def _xcode_shell_script_phases(ctx, objects, target, subs, project_dir, target_n
         if phase.get("runOnlyForDeploymentPostprocessing") == "1":
             continue
         script = phase.get("shellScript") or ""
+        if type(script) == "list":
+            script = "\n".join(script)
         if not script:
             continue
         outputs = _xcode_shell_phase_paths(phase, "outputPaths", "outputFileListPaths", script_subs)
@@ -2319,6 +2368,10 @@ def _xcode_target_spm_products(objects, target, package_refs):
     # `PBXBuildFile.productRef`.
     products = []
     product_ids = list(target.get("packageProductDependencies") or [])
+    for dependency_id in target.get("dependencies") or []:
+        product_id = (objects.get(dependency_id) or {}).get("productRef")
+        if product_id and product_id not in product_ids:
+            product_ids.append(product_id)
     for phase_id in target.get("buildPhases") or []:
         phase = objects.get(phase_id) or {}
         if phase.get("isa") != "PBXFrameworksBuildPhase":
@@ -2924,9 +2977,11 @@ private final class BundleFinder {}
 extension Bundle {
     static let module: Bundle = {
         let paths = [
+            Bundle.main.resourceURL?.appendingPathComponent(""" + repr(bundle_name) + """),
+            Bundle(for: BundleFinder.self).resourceURL?.appendingPathComponent(""" + repr(bundle_name) + """),
             Bundle.main.bundleURL.appendingPathComponent(""" + repr(bundle_name) + """),
             Bundle(for: BundleFinder.self).bundleURL.appendingPathComponent(""" + repr(bundle_name) + """),
-        ]
+        ].compactMap { $0 }
         for path in paths {
             if let bundle = Bundle(url: path) {
                 return bundle
@@ -3039,6 +3094,7 @@ def _xcode_swift_package_name_flags(package):
 def _xcode_swift_package_target_flags(target, platform, default_language_mode, enabled_traits = []):
     swift_flags = []
     clang_flags = []
+    header_search_paths = []
     swift_language_mode = default_language_mode
     for setting in target.get("settings") or []:
         if not _xcode_package_condition_allows(setting.get("condition") or {}, platform, enabled_traits):
@@ -3067,11 +3123,17 @@ def _xcode_swift_package_target_flags(target, platform, default_language_mode, e
             definition = (kind.get("define") or {}).get("_0") or ""
             if definition:
                 clang_flags.append("-D" + definition)
+            header_path = (kind.get("headerSearchPath") or {}).get("_0") or ""
+            if header_path:
+                header_search_paths.append(header_path)
+    if not any([flag in swift_flags for flag in ["-whole-module-optimization", "-wmo", "-Owholemodule"]]):
+        swift_flags = ["-j1", "-enable-batch-mode"] + swift_flags
     if target.get("resources") or []:
         clang_flags.append("-DSWIFTPM_MODULE_BUNDLE=[NSBundle mainBundle]")
     return {
         "swift": swift_flags,
         "clang": clang_flags,
+        "header_search_paths": header_search_paths,
         "language_mode": swift_language_mode,
     }
 
@@ -3315,7 +3377,7 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
                     "swift_flags": _xcode_swift_package_name_flags(package) + ["-swift-version", flags["language_mode"]] + flags["swift"],
                     "clang_flags": ["-std=c++17"] + flags["clang"],
                     "exported_header_dirs": _xcode_swift_package_include_dirs(package_path, target),
-                    "private_header_dirs": _xcode_swift_package_target_header_dirs(package_path, target),
+                    "private_header_dirs": _unique(_xcode_swift_package_target_header_dirs(package_path, target) + [_xcode_join(_xcode_join(package_path, _xcode_swift_package_target_path(target)), path) for path in flags["header_search_paths"]]),
                     "private_headers": _xcode_swift_package_target_private_headers(package_path, target),
                     "prebuild_actions": prebuild_actions,
                     "resources": resource_paths,
@@ -3436,7 +3498,7 @@ def _xcode_product_dependency_key(name):
     for suffix in [".framework", ".a", ".dylib"]:
         if _ends_with(value, suffix):
             value = value[:len(value) - len(suffix)]
-    return value.replace("_", "-").lower()
+    return _xcode_sanitized_target_name(value).replace("_", "-").lower()
 
 def _xcode_realpath(path):
     absolute = _xcode_abs(path)
@@ -3993,6 +4055,17 @@ def _xcode_swift_feature_name(setting_suffix):
     return out
 
 def _xcode_swift_feature_flags(settings):
+    settings = dict(settings)
+    if "SWIFT_EXPERIMENTAL_FEATURE_DEBUG_DESCRIPTION_MACRO" not in settings:
+        settings["SWIFT_EXPERIMENTAL_FEATURE_DEBUG_DESCRIPTION_MACRO"] = "YES"
+    if _xcode_scalar(settings.get("SWIFT_APPROACHABLE_CONCURRENCY")).upper() == "YES":
+        defaults = ["INFER_ISOLATED_CONFORMANCES", "NONISOLATED_NONSENDING_BY_DEFAULT"]
+        if (_xcode_scalar(settings.get("SWIFT_VERSION")) or "5").split(".")[0] in ["4", "5"]:
+            defaults.extend(["DISABLE_OUTWARD_ACTOR_ISOLATION", "GLOBAL_ACTOR_ISOLATED_TYPES_USABILITY", "INFER_SENDABLE_FROM_CAPTURES"])
+        for suffix in defaults:
+            key = "SWIFT_UPCOMING_FEATURE_" + suffix
+            if key not in settings:
+                settings[key] = "YES"
     flags = []
     families = [
         ("SWIFT_UPCOMING_FEATURE_", "-enable-upcoming-feature"),
@@ -4028,8 +4101,14 @@ def _xcode_swift_language_flags(settings):
         flags.extend(["-package-name", package_name])
     if _xcode_scalar(settings.get("SWIFT_DEFAULT_ACTOR_ISOLATION")) == "MainActor":
         flags.extend(["-default-isolation", "MainActor"])
-    if _xcode_scalar(settings.get("SWIFT_APPROACHABLE_CONCURRENCY")).upper() == "YES":
-        flags.extend(["-enable-upcoming-feature", "NonisolatedNonsendingByDefault"])
+    if (version or "5").split(".")[0] in ["4", "5"]:
+        if _xcode_scalar(settings.get("SWIFT_ENABLE_BARE_SLASH_REGEX", "YES")).upper() == "YES":
+            flags.append("-enable-bare-slash-regex")
+        concurrency = _xcode_scalar(settings.get("SWIFT_STRICT_CONCURRENCY")).lower()
+        if concurrency == "complete":
+            flags.extend(["-enable-upcoming-feature", "StrictConcurrency"])
+        elif concurrency == "targeted":
+            flags.append("-strict-concurrency=targeted")
     if _xcode_scalar(settings.get("APPLICATION_EXTENSION_API_ONLY")).upper() == "YES":
         flags.append("-application-extension")
     flags.extend(_xcode_swift_feature_flags(settings))
@@ -4405,7 +4484,8 @@ def _xcode_application_attrs(ctx, target, settings, subs, platform, files):
     if _xcode_scalar(settings.get("ENABLE_TESTABILITY")).upper() == "YES" or _xcode_scalar(settings.get("SWIFT_ENABLE_TESTABILITY")).upper() == "YES":
         attrs["enable_testing"] = True
     entitlements = _xcode_resolve_vars(_xcode_scalar(settings.get("CODE_SIGN_ENTITLEMENTS")), subs)
-    if entitlements and not entitlements.startswith("$("):
+    signing_disabled = platform in ["macos", "macosx"] and _xcode_scalar(settings.get("CODE_SIGNING_ALLOWED")).upper() == "NO"
+    if entitlements and not entitlements.startswith("$(") and not signing_disabled:
         if not entitlements.startswith("/") and (subs.get("PROJECT_DIR") or ""):
             entitlements = _xcode_join(subs["PROJECT_DIR"], entitlements)
         attrs["entitlements"] = entitlements
@@ -4513,12 +4593,21 @@ def _xcode_referenced_test_plan_paths(ctx):
             if not absolute_scheme:
                 continue
             contents = host_file_read(absolute_scheme)
+            selected = ""
             for block in contents.split("<TestPlanReference")[1:]:
-                reference = _xcode_xml_attribute(block.replace(" = ", "="), "reference")
+                attributes = block.split(">", 1)[0].replace(" = ", "=")
+                reference = _xcode_xml_attribute(attributes, "reference")
                 if reference.startswith("container:"):
                     reference = reference[len("container:"):]
-                if reference and host_file_exists(_xcode_abs(reference)) and reference not in paths:
-                    paths.append(reference)
+                if not reference or not host_file_exists(_xcode_abs(reference)):
+                    continue
+                if not selected:
+                    selected = reference
+                if _xcode_xml_attribute(attributes, "default") == "YES":
+                    selected = reference
+                    break
+            if selected and selected not in paths:
+                paths.append(selected)
     return paths
 
 def _xcode_test_plan_settings(ctx):
@@ -4748,7 +4837,7 @@ def _xcode_workspace_resolver(ctx):
                 spec["deps"] = _unique(spec["deps"] + ["./" + dependency])
             for product in per_target_products[target.get("name") or ""]:
                 identity = product.get("package_identity") or ""
-                dep_ids = package_graph["products"].get(identity + "\x1f" + product["name"]) or package_graph["products"].get(product["name"])
+                dep_ids = package_graph["products"].get(identity + "\x1f" + product["name"]) or package_graph["products"].get(product["name"]) or package_graph["modules"].get(product["name"])
                 if dep_ids and type(dep_ids) != "list":
                     dep_ids = [dep_ids]
                 for dep_id in dep_ids or []:
@@ -5031,8 +5120,9 @@ def _xcode_lower_target(ctx, objects, target, project_settings, name_to_id, dep_
     subs["ARCHS"] = host_arch()
     subs["CURRENT_ARCH"] = host_arch()
     subs["NATIVE_ARCH_ACTUAL"] = host_arch()
-    subs["CODE_SIGN_IDENTITY"] = "-"
-    subs["EXPANDED_CODE_SIGN_IDENTITY"] = "-"
+    signing_identity = "" if platform in ["macos", "macosx"] and _xcode_scalar(settings.get("CODE_SIGNING_ALLOWED")).upper() == "NO" else "-"
+    subs["CODE_SIGN_IDENTITY"] = signing_identity
+    subs["EXPANDED_CODE_SIGN_IDENTITY"] = signing_identity
 
     files = _xcode_target_files(ctx, objects, target, file_paths, project_dir, path_maps, platform, group_walk_cache = group_walk_cache)
     shell_scripts = _xcode_shell_script_phases(ctx, objects, target, subs, project_dir, target_name)
@@ -5044,7 +5134,8 @@ def _xcode_lower_target(ctx, objects, target, project_settings, name_to_id, dep_
     swift_version = _xcode_scalar(settings.get("SWIFT_VERSION"))
     data_models = _xcode_datamodel_sources(ctx, files["resources"], product_name_seed, swift_version, target_name)
     intents = _xcode_intent_sources(ctx, files["intent_definitions"], target_name)
-    files["sources"] = _unique(files["sources"] + data_models["sources"] + intents["sources"])
+    string_symbols = _xcode_string_catalog_sources(ctx, files["resources"], files["sources"] if kind != "bundle" else [], settings, target_name)
+    files["sources"] = _unique(files["sources"] + data_models["sources"] + intents["sources"] + string_symbols["sources"])
     direct_deps = _unique(_xcode_target_dependencies(objects, target) + _xcode_framework_product_dependencies(objects, target, name_to_id))
     is_test = kind == "test"
     closure = dep_closure.get(target_name) or []
@@ -5124,7 +5215,7 @@ def _xcode_lower_target(ctx, objects, target, project_settings, name_to_id, dep_
         if modulemap_headers:
             attrs["modulemap_headers"] = modulemap_headers
 
-    prebuild_actions = shell_scripts["actions"] + data_models["actions"] + intents["actions"]
+    prebuild_actions = shell_scripts["actions"] + data_models["actions"] + intents["actions"] + string_symbols["actions"]
     if prebuild_actions:
         attrs["prebuild_actions"] = prebuild_actions
     if shell_scripts["prepackage_actions"]:

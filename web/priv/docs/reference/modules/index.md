@@ -26,6 +26,47 @@ apple-application-linux`, and the same example is available through MCP.
 See [Build iOS Applications on Linux](/guide/graph/apple/linux) for setup and
 unsupported macOS runtime and resolver workflows.
 
+Apple bundle target kinds preserve embedded framework trees, including versioned
+macOS frameworks. Framework signing declares the complete signed tree as its
+output instead of assuming where the signature lives. Dependency resource bundles
+inside macOS test bundles use `Contents/Resources`.
+Resource `.bundle` and `.help` directories retain their complete trees, including
+when discovered inside synchronized Xcode groups. Synchronized groups also
+include CSS, HTML, and JavaScript files as bundle resources. Explicit folder
+references preserve their directory names and contents rather than compiling
+source files found inside them.
+
+Native Xcode build phases receive dependency products in `BUILT_PRODUCTS_DIR`,
+including transitive runtime frameworks and the executable from a package tool
+represented as an application. Declared product inputs also retain their native
+subdirectory layout. Scripts receive the selected developer and toolchain paths.
+Package tools declared through target dependencies are resolved even when the
+package does not export a separate executable product.
+
+Swift package targets use single-worker batch compilation unless they request
+whole-module optimization. Explicit package compiler flags follow the defaults,
+so a package can still disable batching.
+
+Xcode imports preserve Swift language settings, including bare-slash regular
+expressions, strict concurrency, and approachable concurrency defaults. Explicit
+feature overrides take precedence over defaults. On macOS, string catalogs
+compile into localized `.strings` and `.stringsdict` resources. Code targets
+that enable `STRING_CATALOG_GENERATE_SYMBOLS` also compile the generated Swift
+symbols; catalogs inside localized variant directories do not generate symbols.
+AppleScript resources compile from `.applescript` into `.scpt` files with
+`osacompile` on macOS. Scripting dictionaries remain `.sdef` bundle resources.
+
+Application-hosted macOS tests run through Xcode's `test-without-building`
+runner, using the application and test bundle built by Once. Hostless tests
+continue to use XCTest or the Swift Testing runner directly.
+Test settings come from each scheme's default test plan, or its first plan
+when no default is marked. Alternative plans do not add exclusions or arguments.
+
+On macOS, an explicit `CODE_SIGNING_ALLOWED=NO` omits signing entitlements and
+the expanded signing identity from imported targets. Once still seals bundles
+ad hoc for local integrity checks. This configuration disables capabilities
+that require authorized signing; it does not grant access to those capabilities.
+
 ## Loading Project Modules
 
 Project modules are listed from the root manifest:
@@ -744,6 +785,10 @@ top-level signatures are removed before these scripts; final
 signing and subsequent scripts consume the updated tree.
 Native records may carry `unresolved_file_lists` to retain bootstrap-dependent
 phases during import; executing such a record fails until those settings resolve.
+Tool records can select `momc`, `intentbuilderc`, or `xcstringstool` through
+`tool`, with an `args` list, declared `inputs` and `outputs`, and `cacheable`.
+The Apple target kind resolves the tool from the selected Xcode installation
+and includes its identity in the action's cache key.
 
 `run_action` accepts:
 

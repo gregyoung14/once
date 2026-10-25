@@ -57,7 +57,23 @@ fn native_test_output_supplies_case_verdicts_and_durations() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(
         dir.path().join("Suite.swift"),
-        "import XCTest\nclass ParserTests: XCTestCase {\n  func testKnown() {}\n  func testNotReached() {}\n}\nstruct SwiftSuite {\n  @Test func computes() {}\n}\nstruct OtherSuite {\n  @Test func computes() {}\n}\n",
+        r#"import XCTest
+class ParserTests: XCTestCase {
+  final class Helper { let braces = "}" }
+  func testKnown() {
+    struct LocalError: Error {}
+    // struct NotASuite { func testNotACase() {}
+  }
+  func testNotReached() {}
+}
+struct SwiftSuite {
+  @Test func computes() {}
+}
+struct OtherSuite {
+  @Test
+  func computes() {}
+}
+"#,
     )
     .unwrap();
     std::fs::write(
@@ -83,8 +99,10 @@ fn native_test_output_supplies_case_verdicts_and_durations() {
     let cases = results["cases"].as_array().unwrap();
     let named = |name: &str| cases.iter().find(|case| case["name"] == name).unwrap();
     assert_eq!(named("testKnown")["status"], "passed");
+    assert_eq!(named("testKnown")["suite"], "ParserTests");
     assert_eq!(named("testKnown")["attempts"][0]["duration_ms"], 125);
     assert_eq!(named("testNotReached")["status"], "unknown");
+    assert_eq!(named("testNotReached")["suite"], "ParserTests");
     assert_eq!(
         cases
             .iter()

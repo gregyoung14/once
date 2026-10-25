@@ -265,6 +265,13 @@ fn swift_package_native_project_loads_without_a_once_manifest() {
         kinds_by_id.get("SwiftPackage_OnceNativeSwiftPackage_OnceNativeSwiftPackage"),
         Some(&"apple_library")
     );
+    for target in graph.iter().filter(|target| target.kind == "apple_library") {
+        let Some(AttrValue::List(flags)) = target.attrs.get("swift_flags") else {
+            panic!("{} must declare Swift compilation flags", target.label.id);
+        };
+        assert!(flags.contains(&AttrValue::String("-j1".to_string())));
+        assert!(flags.contains(&AttrValue::String("-enable-batch-mode".to_string())));
+    }
 }
 
 #[cfg(target_os = "macos")]

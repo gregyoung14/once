@@ -555,6 +555,99 @@ printf "spawn_count=%s\n" "$(grep -c "simctl spawn" "$2/xcrun.log")"' sh "$ONCE_
     The path "$WORKSPACE/.once/out/apps/ios/AppTests/test/test_results.json" should be file
   End
 
+  It 'links and runs an Objective-C-only XCTest bundle for older macOS versions'
+    Skip if 'apple toolchain unavailable on this host' apple_toolchain_unavailable
+    cat > "$WORKSPACE/once.toml" <<'TOML'
+[[target]]
+name = "ObjCTests"
+kind = "apple_test_bundle"
+srcs = ["Tests.m"]
+
+[target.attrs]
+platform = "macos"
+minimum_os = "12.0"
+TOML
+    cat > "$WORKSPACE/Tests.m" <<'OBJC'
+#import <XCTest/XCTest.h>
+@interface ArithmeticTests : XCTestCase
+@end
+@implementation ArithmeticTests
+- (void)testArithmetic { XCTAssertEqual(7 * 3, 21); }
+@end
+OBJC
+
+    When call once --format json test ObjCTests
+    The status should be success
+    The stdout should include '"status":"completed"'
+    The contents of file "$WORKSPACE/.once/out/ObjCTests/test/test_results.json" should include '"passed":1'
+    The contents of file "$WORKSPACE/.once/out/ObjCTests/test/test_results.json" should include 'ArithmeticTests/testArithmetic'
+  End
+
+  It 'compiles string catalogs into localized runtime resources'
+    Skip if 'apple toolchain unavailable on this host' apple_toolchain_unavailable
+    cat > "$WORKSPACE/once.toml" <<'TOML'
+[[target]]
+name = "Messages"
+kind = "apple_resource_bundle"
+
+[target.attrs]
+platform = "macos"
+minimum_os = "14.0"
+resources = ["Localizable.xcstrings", "Empty.xcstrings", "Guide.help", "Arithmetic.applescript"]
+TOML
+    cat > "$WORKSPACE/Localizable.xcstrings" <<'JSON'
+{"sourceLanguage":"en","strings":{"greeting":{"localizations":{"en":{"stringUnit":{"state":"translated","value":"Hello"}},"fr":{"stringUnit":{"state":"translated","value":"Bonjour"}}}}},"version":"1.0"}
+JSON
+    printf '%s\n' '{"sourceLanguage":"en","strings":{},"version":"1.0"}' > "$WORKSPACE/Empty.xcstrings"
+    printf '%s\n' 'return 7 * 3' > "$WORKSPACE/Arithmetic.applescript"
+    mkdir -p "$WORKSPACE/Guide.help/Contents/Resources/fr.lproj"
+    printf '%s\n' '<?xml version="1.0"?><plist version="1.0"><dict><key>greeting</key><string>Aide</string></dict></plist>' > "$WORKSPACE/Guide.help/Contents/Resources/fr.lproj/Localizable.strings"
+
+    compiled_messages() {
+      once --format json build Messages >/dev/null &&
+        plutil -extract greeting raw -o - "$WORKSPACE/.once/out/Messages/Messages.bundle/en.lproj/Localizable.strings" &&
+        plutil -extract greeting raw -o - "$WORKSPACE/.once/out/Messages/Messages.bundle/fr.lproj/Localizable.strings" &&
+        plutil -extract greeting raw -o - "$WORKSPACE/.once/out/Messages/Messages.bundle/Guide.help/Contents/Resources/fr.lproj/Localizable.strings" &&
+        osascript "$WORKSPACE/.once/out/Messages/Messages.bundle/Arithmetic.scpt"
+    }
+
+    When call compiled_messages
+    The status should be success
+    The line 1 of stdout should equal 'Hello'
+    The line 2 of stdout should equal 'Bonjour'
+    The line 3 of stdout should equal 'Aide'
+    The line 4 of stdout should equal '21'
+    The path "$WORKSPACE/.once/out/Messages/Messages.bundle/Localizable.xcstrings" should not be exist
+    The path "$WORKSPACE/.once/out/Messages/Messages.bundle/Empty.xcstrings" should not be exist
+    The path "$WORKSPACE/.once/out/Messages/Messages.bundle/Arithmetic.applescript" should not be exist
+  End
+
+  It 'links Swift runtime compatibility libraries once when all archives are loaded'
+    Skip if 'apple toolchain unavailable on this host' apple_toolchain_unavailable
+    cat > "$WORKSPACE/once.toml" <<'TOML'
+[[target]]
+name = "CompatibilityTests"
+kind = "apple_test_bundle"
+srcs = ["Tests.swift"]
+
+[target.attrs]
+platform = "macos"
+minimum_os = "10.13"
+linkopts = ["-Xlinker", "-all_load"]
+TOML
+    cat > "$WORKSPACE/Tests.swift" <<'SWIFT'
+import XCTest
+final class CompatibilityTests: XCTestCase {
+    func testArithmetic() { XCTAssertEqual(7 * 3, 21) }
+}
+SWIFT
+
+    When call once --format json test CompatibilityTests
+    The status should be success
+    The stdout should include '"status":"completed"'
+    The contents of file "$WORKSPACE/.once/out/CompatibilityTests/test/test_results.json" should include '"passed":1'
+  End
+
   It 'runs Swift Testing Apple tests through the generic test capability'
     Skip if 'apple toolchain unavailable on this host' apple_toolchain_unavailable
     copy_apple_swift_testing_fixture

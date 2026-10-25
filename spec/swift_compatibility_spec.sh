@@ -22,6 +22,52 @@ SH
     cp -R "$REPO_ROOT/crates/once-frontend/prelude/examples/swift-package-workspace-native-project/." "$WORKSPACE/"
   }
 
+  test_dependency_resources() {
+    mkdir -p "$WORKSPACE/Sources/Data" "$WORKSPACE/Tests/DataTests" \
+      "$WORKSPACE/Sources/CValue/include" "$WORKSPACE/Sources/CValue/Private/nested"
+    cat > "$WORKSPACE/Package.swift" <<'SWIFT'
+// swift-tools-version: 6.0
+import PackageDescription
+let package = Package(name: "ResourcePackage", targets: [
+    .target(name: "CValue", cSettings: [.headerSearchPath("Private")]),
+    .target(name: "Data", dependencies: ["CValue"], resources: [.copy("value.txt")]),
+    .testTarget(name: "DataTests", dependencies: ["Data"]),
+])
+SWIFT
+    printf 'resource payload\n' > "$WORKSPACE/Sources/Data/value.txt"
+    printf 'int resourceNumber(void);\n' > "$WORKSPACE/Sources/CValue/include/CValue.h"
+    printf '#define RESOURCE_NUMBER 17\n' > "$WORKSPACE/Sources/CValue/Private/nested/value.h"
+    cat > "$WORKSPACE/Sources/CValue/value.c" <<'C'
+#include "CValue.h"
+#include "nested/value.h"
+int resourceNumber(void) { return RESOURCE_NUMBER; }
+C
+    cat > "$WORKSPACE/Sources/Data/Data.swift" <<'SWIFT'
+import Foundation
+import CValue
+public func resourceValue() throws -> String {
+    try String(contentsOf: Bundle.module.url(forResource: "value", withExtension: "txt")!, encoding: .utf8)
+}
+public func headerValue() -> Int32 { resourceNumber() }
+SWIFT
+    cat > "$WORKSPACE/Tests/DataTests/DataTests.swift" <<'SWIFT'
+import XCTest
+import Data
+final class DataTests: XCTestCase {
+    func testResource() throws {
+        XCTAssertEqual(try resourceValue(), "resource payload\n")
+        XCTAssertEqual(headerValue(), 17)
+    }
+}
+SWIFT
+    once --memory-limit 2GiB --cpu-limit 2 test --quiet > "$WORKSPACE/test.out" 2> "$WORKSPACE/test.err" || {
+      cat "$WORKSPACE/test.out" "$WORKSPACE/test.err"
+      return 1
+    }
+    jq -e '.summary.total == 1 and .summary.passed == 1 and .cases[0].status == "passed"' \
+      "$WORKSPACE/.once/out/SwiftPackage_ResourcePackage_DataTests/test/test_results.json" >/dev/null
+  }
+
   clear_swift_build_outputs() {
     find "$WORKSPACE/.once/out" -type f -delete
     find "$WORKSPACE/.once/out" -depth -type d -exec rmdir {} \;
@@ -142,6 +188,15 @@ SH
     The stderr should include 'once  test SwiftPackage_OnceNativeSwiftPackage_OnceNativeSwiftPackageTests'
     The stderr should include 'Done'
     The path "$WORKSPACE/.once/out/SwiftPackage_OnceNativeSwiftPackage_OnceNativeSwiftPackageTests/test/test_results.json" should be file
+  End
+
+  It 'loads dependency resources from a signed macOS test bundle'
+    Skip if 'Apple Swift toolchain unavailable on this host' swift_package_tools_unavailable
+
+    When call test_dependency_resources
+    The status should be success
+    The output should equal ''
+    The path "$WORKSPACE/.once/out/SwiftPackage_ResourcePackage_DataTests/DataTests.xctest/Contents/Resources/ResourcePackage_Data.bundle/value.txt" should be file
   End
 
   It 'builds and tests a discovered Swift package without a Once manifest'

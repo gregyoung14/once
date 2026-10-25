@@ -7330,13 +7330,9 @@ result = repr([
                 .is_some_and(|id| id == "apple_application_embed_Shared.framework")
         })
         .expect("embed action");
-    assert!(
-        embed
-            .outputs
-            .iter()
-            .any(|output| output == ".once/out/app/App.app/Frameworks/Shared.framework"),
-        "{:?}",
-        embed.outputs
+    assert_eq!(
+        embed.outputs,
+        [".once/out/app/App.app/Frameworks/Shared.framework"]
     );
     let generated_header = ".once/out/shared/Headers/Shared/Shared-Swift.h";
     let compile = action_by_identifier(&store, "apple_application_compile_App");
@@ -8225,6 +8221,8 @@ fn prelude_apple_test_bundle_stages_transitive_framework_runtime_closure() {
 def host_which(name):
     if name == "xcrun":
         return "/usr/bin/xcrun"
+    if name == "xcodebuild":
+        return "/usr/bin/xcodebuild"
     if name == "codesign":
         return "/usr/bin/codesign"
     if name == "sh":
@@ -8305,6 +8303,7 @@ ctx = {{
     }}, {{
         "label_id": "app/App",
         "target_kind": "apple_application",
+        "app_path": ".once/out/app/App.app",
         "app_executable": ".once/out/app/App.app/App",
         "host_link_archives": [".once/out/plugin/Plugin.a"],
     }}],
@@ -8448,7 +8447,9 @@ result = repr(provider["test_bundle_path"])
     assert_eq!(resource.inputs, ["tests/Fixtures/Nested/fixture.json"]);
     assert_eq!(
         resource.outputs,
-        [".once/out/tests/PluginTests/PluginTests.xctest/Contents/Resources/Fixtures/Nested/fixture.json"]
+        [
+            ".once/out/tests/PluginTests/PluginTests.xctest/Contents/Resources/Fixtures/Nested/fixture.json"
+        ]
     );
     assert!(codesign
         .inputs
@@ -8456,7 +8457,7 @@ result = repr(provider["test_bundle_path"])
         .any(|input| input.ends_with("Contents/Resources/Fixtures/Nested/fixture.json")));
     assert!(action_has_input_suffix(
         codesign,
-        "Contents/Frameworks/Support.framework/_CodeSignature/CodeResources"
+        "Contents/Frameworks/Support.framework"
     ));
     assert!(codesign
         .outputs
@@ -8501,8 +8502,17 @@ fn prelude_apple_test_bundle_runs_ios_hosted_tests_with_xctestrun() {
         "import XCTest\nfinal class HostedTests: XCTestCase { func testHost() {} }\n",
     )
     .unwrap();
-    let source = format!(
-        r#"{prelude}
+    for (platform, sdk, contents_dir, binary_dir) in [
+        ("ios", "iPhoneSimulator", "", ""),
+        ("macos", "MacOSX", "Contents/", "Contents/MacOS/"),
+    ] {
+        let app_executable = format!(".once/out/app/App/App.app/{binary_dir}App");
+        let app_plist = format!(".once/out/app/App/App.app/{contents_dir}Info.plist");
+        let source = format!(
+            r#"{prelude}
+def host_arch():
+    return "arm64"
+
 def host_which(name):
     return "/usr/bin/" + name
 
@@ -8512,9 +8522,9 @@ def host_command(argv, env = None, merge_stderr = None):
             return "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc\n"
         return "/toolchain/" + argv[len(argv) - 1] + "\n"
     if "--show-sdk-path" in argv:
-        return "/sdks/iPhoneSimulator.sdk\n"
+        return "/sdks/{sdk}.sdk\n"
     if "--show-sdk-platform-path" in argv:
-        return "/Platforms/iPhoneSimulator.platform\n"
+        return "/Platforms/{sdk}.platform\n"
     if "--version" in argv:
         return "Swift version test\n"
     fail("unexpected host_command: " + str(argv))
@@ -8526,7 +8536,7 @@ ctx = {{
         "id": "tests/HostedTests",
     }},
     "attr": {{
-        "platform": "ios",
+        "platform": "{platform}",
         "minimum_os": "17.0",
         "sdk_variant": "simulator",
         "test_env": {{
@@ -8540,10 +8550,10 @@ ctx = {{
         "label_id": "app/App",
         "target_kind": "apple_application",
         "app_path": ".once/out/app/App/App.app",
-        "app_executable": ".once/out/app/App/App.app/App",
+        "app_executable": "{app_executable}",
         "app_files": [
-            ".once/out/app/App/App.app/App",
-            ".once/out/app/App/App.app/Info.plist",
+            "{app_executable}",
+            "{app_plist}",
         ],
         "bundle_id": "dev.once.App",
         "product_name": "App",
@@ -8555,56 +8565,64 @@ ctx = {{
 provider = _apple_test_bundle_impl(ctx)
 result = repr(provider["test_info"]["command"]["argv"])
 "#
-    );
-    let store = AnalysisStore::new(
-        workspace.path().to_path_buf(),
-        "tests".to_string(),
-        ".once/out/tests/HostedTests".to_string(),
-    );
+        );
+        let store = AnalysisStore::new(
+            workspace.path().to_path_buf(),
+            "tests".to_string(),
+            ".once/out/tests/HostedTests".to_string(),
+        );
 
-    let (store, out) = with_active_store(store, || eval_prelude_source_to_repr(source));
+        let (store, out) = with_active_store(store, || eval_prelude_source_to_repr(source));
 
-    let out = out.unwrap();
-    assert!(out.contains("/usr/bin/xcodebuild"), "{out}");
-    assert!(out.contains("test-without-building"), "{out}");
-    let xctestrun = action_by_identifier(
-        &store,
-        "write_path:.once/out/tests/HostedTests/runner/tests.xctestrun",
-    );
-    let Some(DeclaredActionOperation::WriteFile { bytes, .. }) = &xctestrun.operation else {
-        panic!("xctestrun action must write its property list");
-    };
-    let contents = std::str::from_utf8(bytes).unwrap();
-    assert!(contents.contains("<key>IsAppHostedTestBundle</key><true/>"));
-    assert!(contents.contains(".once/out/app/App/App.app"));
-    assert!(contents.contains("libXCTestBundleInject.dylib"));
-    assert!(contents.contains("<key>AppleLanguages</key><string>(en)</string>"));
-    assert!(contents.contains("<key>AppleLocale</key><string>en_US</string>"));
-    assert!(contents.contains("<key>TZ</key><string>America/New_York</string>"));
-    assert!(contents.contains("<string>SlowTests</string>"));
-    let run = action_by_identifier(&store, "apple_xctest:tests/HostedTests");
-    let script = run.argv.last().unwrap();
-    assert!(script.contains("test-without-building"), "{script}");
-    assert!(
-        script.contains("-skip-testing:HostedTests/SlowTests"),
-        "{script}"
-    );
-    assert!(
-        script.contains("-skip-testing:HostedTests/FeatureTests/testManual"),
-        "{script}"
-    );
-    assert!(
-        script.contains("-destination \"id=$simulator_id\""),
-        "{script}"
-    );
-    assert!(run
-        .inputs
-        .iter()
-        .any(|input| input == ".once/out/app/App/App.app/Info.plist"));
-    assert!(run
-        .inputs
-        .iter()
-        .any(|input| input.ends_with("runner/tests.xctestrun")));
+        let out = out.unwrap();
+        assert!(out.contains("/usr/bin/xcodebuild"), "{out}");
+        assert!(out.contains("test-without-building"), "{out}");
+        let xctestrun = action_by_identifier(
+            &store,
+            "write_path:.once/out/tests/HostedTests/runner/tests.xctestrun",
+        );
+        let Some(DeclaredActionOperation::WriteFile { bytes, .. }) = &xctestrun.operation else {
+            panic!("xctestrun action must write its property list");
+        };
+        let contents = std::str::from_utf8(bytes).unwrap();
+        assert!(contents.contains("<key>IsAppHostedTestBundle</key><true/>"));
+        assert!(contents.contains(&app_executable), "{contents}");
+        assert!(contents.contains("libXCTestBundleInject.dylib"));
+        assert!(contents.contains("<key>AppleLanguages</key><string>(en)</string>"));
+        assert!(contents.contains("<key>AppleLocale</key><string>en_US</string>"));
+        assert!(contents.contains("<key>TZ</key><string>America/New_York</string>"));
+        assert!(contents.contains("<string>SlowTests</string>"));
+        let run = action_by_identifier(&store, "apple_xctest:tests/HostedTests");
+        let script = run.argv.last().unwrap();
+        assert!(script.contains("test-without-building"), "{script}");
+        assert!(
+            script.contains("-skip-testing:HostedTests/SlowTests"),
+            "{script}"
+        );
+        assert!(
+            script.contains("-skip-testing:HostedTests/FeatureTests/testManual"),
+            "{script}"
+        );
+        if platform == "macos" {
+            assert!(
+                script.contains("'-destination' 'platform=macOS,arch=arm64'"),
+                "{script}"
+            );
+            assert!(!script.contains("simctl"), "{script}");
+            assert!(!script.contains("simulator_id"), "{script}");
+        } else {
+            assert!(
+                script.contains("-destination \"id=$simulator_id\""),
+                "{script}"
+            );
+            assert!(script.contains("simctl bootstatus"), "{script}");
+        }
+        assert!(run.inputs.contains(&app_plist));
+        assert!(run
+            .inputs
+            .iter()
+            .any(|input| input.ends_with("runner/tests.xctestrun")));
+    }
 }
 
 #[test]
@@ -9562,7 +9580,7 @@ result = repr(_apple_swift_link_flags([
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"["-Onone", "-j1", "-enable-testing"]"#
+        r#"["-Onone", "-j1", "-enable-testing", "-disable-autolinking-runtime-compatibility", "-disable-autolinking-runtime-compatibility-concurrency", "-disable-autolinking-runtime-compatibility-dynamic-replacements"]"#
     );
 }
 
@@ -15112,6 +15130,28 @@ result = repr([product_name, attrs["bundle_id"], attrs["info_plist"], attrs["inf
 }
 
 #[test]
+fn prelude_xcode_macos_signing_opt_out_omits_capability_entitlements() {
+    let prelude = xcode_prelude_source();
+    let source = format!(
+        r#"{prelude}
+def host_file_read(path):
+    return "<plist><dict/></plist>"
+
+files = {{"sources": [], "headers": [], "resources": [], "structured_resources": [], "asset_catalogs": [], "frameworks": [], "source_flags": {{}}, "project_header_dirs": []}}
+def entitlements(platform, allowed):
+    settings = {{"CODE_SIGN_ENTITLEMENTS": "App.entitlements", "CODE_SIGNING_ALLOWED": allowed}}
+    attrs, product = _xcode_application_attrs({{"attr": {{}}}}, {{"name": "App"}}, settings, {{}}, platform, files)
+    return attrs.get("entitlements") or ""
+result = repr([entitlements(platform, allowed) for platform, allowed in [("macos", "NO"), ("macos", "YES"), ("macos", ""), ("ios", "NO")]])
+"#
+    );
+    assert_eq!(
+        eval_prelude_source_to_repr(source).unwrap(),
+        r#"["", "App.entitlements", "App.entitlements", "App.entitlements"]"#
+    );
+}
+
+#[test]
 fn prelude_xcode_reads_referenced_test_plan_environment_and_skips() {
     let prelude = xcode_prelude_source();
     let workspace = TempDir::new().unwrap();
@@ -15122,7 +15162,22 @@ fn prelude_xcode_reads_referenced_test_plan_environment_and_skips() {
     std::fs::create_dir_all(workspace.path().join("Test Plans")).unwrap();
     std::fs::write(
         scheme_dir.join("App.xcscheme"),
-        r#"<Scheme><TestAction><TestPlans><TestPlanReference reference = "container:Test Plans/App.xctestplan" default = "YES"></TestPlanReference></TestPlans></TestAction></Scheme>"#,
+        r#"<Scheme><TestAction><TestPlans><TestPlanReference reference = "container:Test Plans/CI.xctestplan"></TestPlanReference><TestPlanReference reference = "container:Test Plans/App.xctestplan" default = "YES"></TestPlanReference></TestPlans></TestAction></Scheme>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("Test Plans/CI.xctestplan"),
+        serde_json::json!({
+            "defaultOptions": {
+                "environmentVariableEntries": [{"key": "CI_ONLY", "value": "yes"}],
+                "commandLineArgumentEntries": [{"argument": "-CIOnly"}]
+            },
+            "testTargets": [{
+                "target": {"name": "AppTests"},
+                "skippedTests": ["ScriptingTests"]
+            }]
+        })
+        .to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -15560,15 +15615,19 @@ fn prelude_xcode_lowers_package_default_isolation_settings() {
         r#"{prelude}
 main_actor = {{"settings": [{{"tool": "swift", "kind": {{"defaultIsolation": {{"_0": "MainActor"}}}}}}]}}
 nonisolated = {{"settings": [{{"tool": "swift", "kind": {{"defaultIsolation": {{"_0": "nonisolated"}}}}}}]}}
+whole_module = {{"settings": [{{"tool": "swift", "kind": {{"unsafeFlags": {{"_0": ["-whole-module-optimization"]}}}}}}]}}
+disabled_batch = {{"settings": [{{"tool": "swift", "kind": {{"unsafeFlags": {{"_0": ["-disable-batch-mode"]}}}}}}]}}
 result = repr([
     _xcode_swift_package_target_flags(main_actor, "ios", "5")["swift"],
     _xcode_swift_package_target_flags(nonisolated, "ios", "6")["swift"],
+    _xcode_swift_package_target_flags(whole_module, "ios", "6")["swift"],
+    _xcode_swift_package_target_flags(disabled_batch, "ios", "6")["swift"],
 ])
 "#
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"[["-default-isolation", "MainActor"], ["-default-isolation", "nonisolated"]]"#
+        r#"[["-j1", "-enable-batch-mode", "-default-isolation", "MainActor"], ["-j1", "-enable-batch-mode", "-default-isolation", "nonisolated"], ["-whole-module-optimization"], ["-j1", "-enable-batch-mode", "-disable-batch-mode"]]"#
     );
 }
 
@@ -15742,6 +15801,65 @@ result = repr(files["intent_definitions"])
         eval_prelude_source_to_repr(source).unwrap(),
         r#"["App/Base.lproj/Actions.intentdefinition"]"#
     );
+}
+
+#[test]
+fn prelude_xcode_generates_string_catalog_sources_for_swift_targets() {
+    let prelude = xcode_prelude_source();
+    let source = format!(
+        r#"{prelude}
+ctx = {{"label": {{"package": "Apps", "id": "Apps/Example"}}}}
+resources = ["Apps/Localizable.xcstrings", "Apps/Other Table.xcstrings", "Apps/mul.lproj/Main.xcstrings", "Apps/en.lproj/Other.xcstrings", "Apps/Info.plist", "Apps/Localizable.xcstrings"]
+enabled = {{"STRING_CATALOG_GENERATE_SYMBOLS": "YES"}}
+generated = _xcode_string_catalog_sources(ctx, resources, ["Apps/Main.swift"], enabled, "Example")
+result = _json_encode({{
+    "actions": [json_decode(action) for action in generated["actions"]],
+    "sources": generated["sources"],
+    "disabled": [_xcode_string_catalog_sources(ctx, resources, ["Apps/Main.swift"], settings, "Example") for settings in [{{}}, {{"STRING_CATALOG_GENERATE_SYMBOLS": "NO"}}]],
+    "without_swift": [_xcode_string_catalog_sources(ctx, resources, sources, enabled, "Example") for sources in [[], ["Apps/Main.m"]]],
+}})
+"#
+    );
+    let actual: serde_json::Value =
+        serde_json::from_str(&eval_prelude_source_to_repr(source).unwrap()).unwrap();
+    let output_dir = ".once/out/Apps/Example/StringSymbols";
+    let sources = [
+        format!("{output_dir}/GeneratedStringSymbols_Localizable.swift"),
+        format!("{output_dir}/GeneratedStringSymbols_Other Table.swift"),
+    ];
+    assert_eq!(actual["sources"], serde_json::json!(sources));
+    for (index, input) in ["Apps/Localizable.xcstrings", "Apps/Other Table.xcstrings"]
+        .iter()
+        .enumerate()
+    {
+        let action = &actual["actions"][index];
+        assert_eq!(action["tool"], "xcstringstool");
+        assert_eq!(
+            action["args"],
+            serde_json::json!([
+                "generate-symbols",
+                "--language",
+                "swift",
+                "--output-directory",
+                output_dir,
+                input,
+            ])
+        );
+        assert_eq!(action["inputs"], serde_json::json!([input]));
+        assert_eq!(action["outputs"], serde_json::json!([sources[index]]));
+        assert_eq!(action["cacheable"], true);
+    }
+    assert_eq!(actual["actions"].as_array().unwrap().len(), 2);
+    assert_ne!(actual["actions"][0]["id"], actual["actions"][1]["id"]);
+    for key in ["disabled", "without_swift"] {
+        assert_eq!(
+            actual[key],
+            serde_json::json!([
+                {"actions": [], "sources": []},
+                {"actions": [], "sources": []},
+            ])
+        );
+    }
 }
 
 #[test]
@@ -16351,6 +16469,75 @@ result = repr(_xcode_swift_feature_flags({{
         eval_prelude_source_to_repr(source).unwrap(),
         r#"["-enable-experimental-feature", "DebugDescriptionMacro", "-enable-upcoming-feature", "DisableOutwardActorInference", "-enable-upcoming-feature", "ImportObjcForwardDeclarations", "-enable-upcoming-feature", "InternalImportsByDefault", "-enable-upcoming-feature", "MemberImportVisibility:migrate"]"#
     );
+}
+
+#[test]
+fn prelude_xcode_swift_language_defaults_respect_overrides() {
+    let prelude = xcode_prelude_source();
+    let source = format!(
+        r#"{prelude}
+result = _json_encode([
+    _xcode_swift_language_flags({{"SWIFT_VERSION": version}}) for version in ["4", "4.2", "5.0", "6.0"]
+] + [
+    _xcode_swift_language_flags({{"SWIFT_VERSION": "5.0", "SWIFT_ENABLE_BARE_SLASH_REGEX": "NO", "SWIFT_STRICT_CONCURRENCY": "targeted", "SWIFT_EXPERIMENTAL_FEATURE_DEBUG_DESCRIPTION_MACRO": "NO"}}),
+    _xcode_swift_language_flags({{"SWIFT_VERSION": "5.0", "SWIFT_STRICT_CONCURRENCY": "complete"}}),
+    _xcode_swift_language_flags({{"SWIFT_VERSION": "5.0", "SWIFT_APPROACHABLE_CONCURRENCY": "YES"}}),
+    _xcode_swift_language_flags({{"SWIFT_VERSION": "5.0", "SWIFT_APPROACHABLE_CONCURRENCY": "YES", "SWIFT_UPCOMING_FEATURE_DISABLE_OUTWARD_ACTOR_ISOLATION": "NO", "SWIFT_UPCOMING_FEATURE_GLOBAL_ACTOR_ISOLATED_TYPES_USABILITY": "NO", "SWIFT_UPCOMING_FEATURE_INFER_ISOLATED_CONFORMANCES": "MIGRATE", "SWIFT_UPCOMING_FEATURE_INFER_SENDABLE_FROM_CAPTURES": "NO", "SWIFT_UPCOMING_FEATURE_NONISOLATED_NONSENDING_BY_DEFAULT": "MIGRATE"}}),
+    _xcode_swift_language_flags({{"SWIFT_VERSION": "6.0", "SWIFT_STRICT_CONCURRENCY": "complete", "SWIFT_APPROACHABLE_CONCURRENCY": "YES"}}),
+])
+"#
+    );
+    let flags: Vec<Vec<String>> =
+        serde_json::from_str(&eval_prelude_source_to_repr(source).unwrap()).unwrap();
+    for (index, version) in ["4", "4.2", "5", "6"].iter().enumerate() {
+        let mut expected = vec!["-swift-version", version];
+        if index < 3 {
+            expected.push("-enable-bare-slash-regex");
+        }
+        expected.extend(["-enable-experimental-feature", "DebugDescriptionMacro"]);
+        assert_eq!(flags[index], expected);
+    }
+    assert_eq!(
+        flags[4],
+        ["-swift-version", "5", "-strict-concurrency=targeted"]
+    );
+    assert!(flags[5]
+        .windows(2)
+        .any(|pair| pair == ["-enable-upcoming-feature", "StrictConcurrency"]));
+    let features = |index: usize| {
+        flags[index]
+            .windows(2)
+            .filter(|pair| pair[0] == "-enable-upcoming-feature")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        features(6),
+        [
+            "DisableOutwardActorInference",
+            "GlobalActorIsolatedTypesUsability",
+            "InferIsolatedConformances",
+            "InferSendableFromCaptures",
+            "NonisolatedNonsendingByDefault",
+        ]
+    );
+    assert_eq!(
+        features(7),
+        [
+            "InferIsolatedConformances:migrate",
+            "NonisolatedNonsendingByDefault:migrate",
+        ]
+    );
+    assert_eq!(
+        features(8),
+        [
+            "InferIsolatedConformances",
+            "NonisolatedNonsendingByDefault"
+        ]
+    );
+    assert!(!flags[8]
+        .iter()
+        .any(|flag| flag == "-enable-bare-slash-regex"));
 }
 
 #[test]
@@ -17111,9 +17298,11 @@ fn prelude_xcode_spm_collects_framework_phase_product_refs() {
     let prelude = xcode_prelude_source();
     let objects = serde_json::json!({
         "LOCAL_PRODUCT": {"isa": "XCSwiftPackageProductDependency", "productName": "SharedKit"},
+        "TOOL_PRODUCT": {"isa": "XCSwiftPackageProductDependency", "productName": "Generator"},
+        "TOOL_DEPENDENCY": {"isa": "PBXTargetDependency", "productRef": "TOOL_PRODUCT"},
         "BUILD_FILE": {"isa": "PBXBuildFile", "productRef": "LOCAL_PRODUCT"},
         "FRAMEWORKS": {"isa": "PBXFrameworksBuildPhase", "files": ["BUILD_FILE"]},
-        "APP": {"isa": "PBXNativeTarget", "name": "App", "buildPhases": ["FRAMEWORKS"]},
+        "APP": {"isa": "PBXNativeTarget", "name": "App", "buildPhases": ["FRAMEWORKS"], "dependencies": ["TOOL_DEPENDENCY"]},
     })
     .to_string();
     let source = format!(
@@ -17125,7 +17314,7 @@ result = repr([[product["name"], product["package_identity"]] for product in pro
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"[["SharedKit", ""]]"#
+        r#"[["Generator", ""], ["SharedKit", ""]]"#
     );
 }
 
@@ -17133,7 +17322,7 @@ result = repr([[product["name"], product["package_identity"]] for product in pro
 fn prelude_xcode_recovers_built_framework_target_dependencies() {
     let prelude = xcode_prelude_source();
     let objects = serde_json::json!({
-        "FRAMEWORK": {"isa": "PBXFileReference", "name": "Pods_Sample.framework", "sourceTree": "BUILT_PRODUCTS_DIR"},
+        "FRAMEWORK": {"isa": "PBXFileReference", "name": "Pods_Sample_Mac.framework", "sourceTree": "BUILT_PRODUCTS_DIR"},
         "BUILD": {"isa": "PBXBuildFile", "fileRef": "FRAMEWORK"},
         "PHASE": {"isa": "PBXFrameworksBuildPhase", "files": ["BUILD"]},
         "APP": {"isa": "PBXNativeTarget", "buildPhases": ["PHASE"]},
@@ -17142,12 +17331,12 @@ fn prelude_xcode_recovers_built_framework_target_dependencies() {
     let source = format!(
         r#"{prelude}
 objects = json_decode({objects:?})
-result = repr(_xcode_framework_product_dependencies(objects, objects["APP"], {{"Pods-Sample": "Pods-Sample"}}))
+result = repr(_xcode_framework_product_dependencies(objects, objects["APP"], {{"Pods-Sample Mac": "Pods-Sample_Mac"}}))
 "#
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"["Pods-Sample"]"#
+        r#"["Pods-Sample Mac"]"#
     );
 }
 
@@ -17453,7 +17642,7 @@ result = repr(_xcode_swift_language_flags({{"SWIFT_VERSION": "5.0", "SWIFT_PACKA
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"["-swift-version", "5", "-package-name", "PrimaryFeature"]"#
+        r#"["-swift-version", "5", "-package-name", "PrimaryFeature", "-enable-bare-slash-regex", "-enable-experimental-feature", "DebugDescriptionMacro"]"#
     );
 }
 
@@ -17831,11 +18020,12 @@ fn prelude_xcode_synced_group_honors_membership_exceptions() {
             "path": "App",
             "sourceTree": "<group>",
             "exceptions": ["EX"],
+            "explicitFolders": ["Templates", "Excluded"],
         },
         "EX": {
             "isa": "PBXFileSystemSynchronizedBuildFileExceptionSet",
             "target": "APPTGT",
-            "membershipExceptions": ["Widget/WidgetData.swift", "Info.plist"],
+            "membershipExceptions": ["Widget/WidgetData.swift", "Info.plist", "Excluded"],
         },
     })
     .to_string();
@@ -17844,16 +18034,16 @@ fn prelude_xcode_synced_group_honors_membership_exceptions() {
 objects = json_decode({objects:?})
 
 def glob(patterns):
-    return ["App/Main.swift", "App/Widget/WidgetData.swift", "App/Info.plist", "App/Assets.xcassets"]
+    return ["App/Main.swift", "App/Widget/WidgetData.swift", "App/Info.plist", "App/Assets.xcassets", "App/Localizable.xcstrings", "App/mul.lproj/Main.xcstrings", "App/Guide.help/Contents/Info.plist", "App/Guide.help/Contents/Resources/fr.lproj/InfoPlist.strings", "App/Data.bundle/Resource.swift", "App/core.css", "App/template.html", "App/main.js", "App/Templates/Helper.swift", "App/Templates/theme.custom", "App/Excluded/image.png"]
 
 path_maps = {{"files": {{}}, "groups": {{"G": "App"}}, "additive": {{}}}}
 files = _xcode_synced_group_files({{}}, objects, objects["APPTGT"], "", path_maps)
-result = repr([files["sources"], files["asset_catalogs"], files["resources"]])
+result = repr([files["sources"], files["asset_catalogs"], files["resources"], files["structured_resources"]])
 "#
     );
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"[["App/Main.swift"], ["App/Assets.xcassets"], []]"#
+        r#"[["App/Main.swift"], ["App/Assets.xcassets"], ["App/Templates", "App/Localizable.xcstrings", "App/mul.lproj/Main.xcstrings", "App/Guide.help", "App/Data.bundle", "App/core.css", "App/template.html", "App/main.js"], ["App/Templates"]]"#
     );
 }
 
@@ -17998,7 +18188,7 @@ fn prelude_xcode_workspace_resolver_lowers_native_targets() {
             // application and test sources sit at the group root.
             "GRP": {
                 "isa": "PBXGroup",
-                "children": ["SOURCE_GRP", "APP_FILE", "TEST_FILE"],
+                "children": ["SOURCE_GRP", "APP_FILE", "TEST_FILE", "APP_CATALOG", "APP_IB_CATALOG"],
                 "sourceTree": "<group>",
             },
             "SOURCE_GRP": {
@@ -18053,7 +18243,7 @@ fn prelude_xcode_workspace_resolver_lowers_native_targets() {
                 "name": "App",
                 "productType": "com.apple.product-type.application",
                 "buildConfigurationList": "APP_CL",
-                "buildPhases": ["APP_SRC"],
+                "buildPhases": ["APP_SRC", "APP_RES"],
                 "dependencies": ["APP_DEP"],
             },
             "APP_CL": {
@@ -18071,6 +18261,7 @@ fn prelude_xcode_workspace_resolver_lowers_native_targets() {
                     "DEVELOPMENT_TEAM": "TEAM123",
                     "TARGETED_DEVICE_FAMILY": "1,2",
                     "ENABLE_TESTABILITY": "YES",
+                    "STRING_CATALOG_GENERATE_SYMBOLS": "YES",
                 },
             },
             "APP_SRC": {"isa": "PBXSourcesBuildPhase", "files": ["APP_BF"]},
@@ -18080,6 +18271,11 @@ fn prelude_xcode_workspace_resolver_lowers_native_targets() {
                 "path": "App.swift",
                 "sourceTree": "<group>",
             },
+            "APP_RES": {"isa": "PBXResourcesBuildPhase", "files": ["APP_CATALOG_BF", "APP_IB_CATALOG_BF"]},
+            "APP_CATALOG_BF": {"isa": "PBXBuildFile", "fileRef": "APP_CATALOG"},
+            "APP_IB_CATALOG_BF": {"isa": "PBXBuildFile", "fileRef": "APP_IB_CATALOG"},
+            "APP_CATALOG": {"isa": "PBXFileReference", "path": "Localizable.xcstrings", "sourceTree": "<group>"},
+            "APP_IB_CATALOG": {"isa": "PBXFileReference", "path": "mul.lproj/Main.xcstrings", "sourceTree": "<group>"},
             "APP_DEP": {"isa": "PBXTargetDependency", "target": "FW"},
 
             "TEST": {
@@ -18176,7 +18372,13 @@ result = repr([
     let out = eval_prelude_source_to_repr(source.clone()).unwrap();
     assert_eq!(
         out,
-        r#"[["App"], ["AppTests"], ["apple_framework", "apple_application", "apple_test_bundle"], ["./Feature"], ["./App"], ["Source/Core/Feature.swift"], {"Source/Core/Feature.swift": "[\"-DNDEBUG\",\"-fno-objc-arc\"]"}, ["App.swift"], "dev.once.App", "CustomAppModule", "TEAM123", ["iphone", "ipad"], "16.0", True]"#
+        r#"[["App"], ["AppTests"], ["apple_framework", "apple_application", "apple_test_bundle"], ["./Feature"], ["./App"], ["Source/Core/Feature.swift"], {"Source/Core/Feature.swift": "[\"-DNDEBUG\",\"-fno-objc-arc\"]"}, ["App.swift", ".once/out/app/App/StringSymbols/GeneratedStringSymbols_Localizable.swift"], "dev.once.App", "CustomAppModule", "TEAM123", ["iphone", "ipad"], "16.0", True]"#
+    );
+    let generated = source.clone()
+        + "\nresult = repr([[json_decode(action)[\"tool\"], json_decode(action)[\"inputs\"], json_decode(action)[\"outputs\"]] for action in specs[\"App\"][\"attrs\"][\"prebuild_actions\"]])\n";
+    assert_eq!(
+        eval_prelude_source_to_repr(generated).unwrap(),
+        r#"[["xcstringstool", ["app/Localizable.xcstrings"], [".once/out/app/App/StringSymbols/GeneratedStringSymbols_Localizable.swift"]]]"#
     );
     let explicit = source.replace(
         "\"attr\": {\"project\": \"App.xcodeproj\"}",
