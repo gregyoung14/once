@@ -436,6 +436,8 @@ pub async fn test(
         None,
         resource_limits,
         resolved,
+        None,
+        None,
     )
     .await
 }
@@ -451,6 +453,8 @@ pub async fn test_with_filters(
     test_batch_id: Option<&str>,
     resource_limits: ResourceLimits,
     resolved: &configuration::ResolvedConfiguration,
+    portable_manifest: Option<&once_core::TestManifest>,
+    test_context: Option<once_events_client::proto::TestRunContext>,
 ) -> Result<ExitCode> {
     if let Some(batch_id) = test_batch_id {
         if Digest::from_hex(batch_id).is_none() {
@@ -461,13 +465,14 @@ pub async fn test_with_filters(
     let bus = RunEventBus::new(EVENT_BUS_CAPACITY);
     let command_label = format!("test {target_id}");
     let reporter = spawn_reporter(&bus, output, &command_label);
-    let live_reporter = crate::live_run_reporter::spawn(
+    let live_reporter = crate::live_run_reporter::spawn_with_test_context(
         &bus,
         workspace,
         once_core::Xdg::from_env(),
         crate::cache_provider::account(workspace),
         crate::cache_provider::project(workspace),
         output,
+        test_context,
     )
     .await;
     bus_events::run_started(&bus, target_id, bus_events::now_ms());
@@ -489,12 +494,27 @@ pub async fn test_with_filters(
         }
     };
     if !test_filters.is_empty() {
-        let manifest =
-            crate::commands::query::test_manifest_record_with_graph(workspace, target_id, &graph)?;
+        let local_manifest;
+        let manifest = if let Some(manifest) = portable_manifest {
+            manifest
+        } else {
+            local_manifest = crate::commands::query::test_manifest_record_with_graph(
+                workspace, target_id, &graph,
+            )?;
+            &local_manifest
+        };
         for test_filter in test_filters {
-            crate::commands::query::validate_test_unit(&manifest, target_id, test_filter)?;
+            crate::commands::query::validate_test_unit(manifest, target_id, test_filter)?;
         }
     }
+    let discovery_before = if test_filters.is_empty() && resolved.path_suffix.is_empty() {
+        crate::commands::query::test_plan::portable::discovery_fingerprint(
+            workspace, &graph, target_id,
+        )
+        .ok()
+    } else {
+        None
+    };
     let session = analysis::BuildSession::new_with_options_with_configuration(
         workspace,
         cache,
@@ -562,8 +582,12 @@ pub async fn test_with_filters(
     };
     record_capability_run(workspace, &record).await;
     if test_filters.is_empty() {
-        crate::commands::query::refresh_test_manifest_for_target(workspace, target)
-            .context("persisting test manifest")?;
+        crate::commands::query::refresh_test_manifest_for_target(
+            workspace,
+            target,
+            discovery_before.as_deref(),
+        )
+        .context("persisting test manifest")?;
     }
     let test_results =
         load_test_results_for_events(workspace, target_id, record.test_results.as_deref());

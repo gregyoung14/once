@@ -80,13 +80,13 @@ hosted planning service or a new configuration file.
    complete-target selection, exact scopes must cover the entire manifest;
    explicit unit and batch requests deliberately cover only their scope.
    Preserve deterministic aggregation and resource-budgeted scheduling.
-4. Add `once test <target> --test-batch ID` and
-   `once query test-plan --target <target> --test-batch ID`, and the matching
-   optional MCP arguments. A batch request requires exactly one explicit
-   target. Resolve against the current target plan,
-   preserve the batch's unit set and ID, and reject obsolete or unknown IDs
-   with corrected syntax and a shortlist. Batch selection is mutually exclusive
-   with unit and affected/full selection.
+4. Add `once test <target> --test-batch ID` and the matching optional MCP
+   argument. Plan queries export complete, replayable target inventories;
+   saved plans select batches at execution with `once test --plan FILE --batch ID`.
+   A local batch request requires exactly one explicit target. Resolve against
+   the current target plan, preserve the batch's unit set and ID, and reject
+   obsolete or unknown IDs with corrected syntax and a shortlist. Batch
+   selection is mutually exclusive with unit and affected/full selection.
 5. Update public testing, MCP, and Starlark module references and add regression
    coverage for ignored filters, missing/duplicate units, overlapping plans,
    startup failures, deterministic schedules, batch replay, stale IDs, and

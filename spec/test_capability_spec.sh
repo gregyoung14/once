@@ -620,8 +620,10 @@ KOTLIN
 
     When call once --format json query test-plan --changed-path spec/removed_spec.sh
     The status should be success
+    The stdout should include '"schema":"once.portable_test_plan.v1"'
     The stdout should include '"schema":"once.test_plan.v1"'
     The stdout should include '"schema":"once.test_selection.v1"'
+    The stdout should include '"bindings":[{"target":"cli_e2e"'
     The stdout should include '"target":"cli_e2e"'
     The stdout should include '"test_filters":[]'
     The stdout should include 'changed test input `spec/removed_spec.sh`'
@@ -733,7 +735,6 @@ KOTLIN
     batch_id="$(jq -r '.next_plan.batches | max_by(.test_filters | length) | .id' "$WORKSPACE/discovery.json")"
 
     When call /bin/sh -c '
-      "$1" -C "$2" --format json query test-plan --target tests --test-batch "$3" > "$2/replay-plan.json" &&
       "$1" -C "$2" --format json test tests --test-batch "$3" > "$2/replay-run.json" &&
       jq -e --arg id "$3" ".plan.batches | length == 1" "$2/replay-run.json" &&
       jq -e ".plan.batches[0].test_filters | length == 2" "$2/replay-run.json" &&
@@ -757,6 +758,85 @@ KOTLIN
     The stderr should include 'not in the current plan'
     The stderr should include 'once query test-plan --target tests'
     The stderr should include 'whole target'
+  End
+
+  It 'executes portable file batches on a fresh relocated worker without discovery state'
+    create_pytest_workspace
+    once --format json test tests >/dev/null
+    once --format json query test-plan --target tests > "$SPEC_ROOT/plan.json"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"once_query_test_plan","arguments":{"target":"tests"}}}' |
+      once mcp > "$SPEC_ROOT/mcp-plan.json"
+    worker="$SPEC_ROOT/worker"
+    mkdir -p "$worker/tools"
+    cp -R "$WORKSPACE/tests" "$worker/"
+    cp "$WORKSPACE/once.toml" "$worker/once.toml"
+    cp "$WORKSPACE/.venv/bin/python" "$worker/tools/interpreter"
+    printf '\n[target.attrs]\npython = "tools/interpreter"\n' >> "$worker/once.toml"
+
+    When call /bin/sh -eu -c '
+      jq -e --slurpfile plan "$3" ".result.structuredContent.result == \$plan[0]" "$5"
+      test ! -e "$2/.once"
+      "$1" -C "$2" --format json --cpu-limit 2 test --plan "$3" --jobs 2 > "$4"
+      jq -e ".schema == \"once.portable_test_execution.v1\" and .complete and .success and (.execution.runs | length == 2) and (.execution.runs | map(.results.summary.total) | add == 3)" "$4"
+      test ! -e "$2/.once/test-manifests"
+      id=$(jq -r ".plan.batches | max_by(.test_filters | length) | .id" "$3")
+      "$1" -C "$2" --format json test --plan "$3" --batch "$id" --jobs 1 > "$4"
+      jq -e --arg id "$id" ".complete and .success and .selected_batch_ids == [\$id] and (.execution.runs | length == 1) and .execution.runs[0].results.summary.total == 2" "$4"
+    ' sh "$ONCE_BIN" "$worker" "$SPEC_ROOT/plan.json" "$SPEC_ROOT/execution.json" "$SPEC_ROOT/mcp-plan.json"
+    The status should be success
+    The stdout should include 'true'
+    The contents of file "$SPEC_ROOT/execution.json" should include '/test/batches/'
+  End
+
+  It 'rejects stale portable inputs and unknown or duplicate batch assignments before execution'
+    create_pytest_workspace
+    cat >> "$WORKSPACE/once.toml" <<'TOML'
+
+[target.attrs]
+env_inherit = ["ONCE_PORTABLE_DISCOVERY_TEST"]
+TOML
+    once --format json test tests >/dev/null
+    once --format json query test-plan --target tests > "$SPEC_ROOT/plan.json"
+    batch_id="$(jq -r '.plan.batches[0].id' "$SPEC_ROOT/plan.json")"
+
+    When call /bin/sh -eu -c '
+      if "$1" -C "$2" --format json test --plan "$3" --batch unknown > "$4" 2>&1; then exit 1; fi
+      grep -q "unknown portable test batch" "$4"
+      if "$1" -C "$2" --format json test --plan "$3" --batch "$5" --batch "$5" > "$4" 2>&1; then exit 1; fi
+      grep -q "duplicate selected test batch" "$4"
+      if ONCE_PORTABLE_DISCOVERY_TEST=changed "$1" -C "$2" --format json test --plan "$3" > "$4" 2>&1; then exit 1; fi
+      grep -q "portable test plan is stale" "$4"
+      printf "\ndef test_added_after_planning():\n    assert True\n" >> "$2/tests/test_math.py"
+      if "$1" -C "$2" --format json test --plan "$3" > "$4" 2>&1; then exit 1; fi
+      grep -q "portable test plan is stale" "$4"
+      unit=$(jq -r ".bindings[0].manifest.units[0].id" "$3")
+      if "$1" -C "$2" --format json test tests --test-unit "$unit" > "$4" 2>&1; then exit 1; fi
+      grep -q "test manifest for .* is stale" "$4"
+      "$1" -C "$2" --format json query test-plan --target tests > "$4"
+      jq -e ".plan.batches | length == 1 and .[0].test_filters == []" "$4"
+    ' sh "$ONCE_BIN" "$WORKSPACE" "$SPEC_ROOT/plan.json" "$SPEC_ROOT/rejection.json" "$batch_id"
+    The status should be success
+    The stdout should include 'true'
+  End
+
+  It 'returns every selected portable batch result when tests fail'
+    create_pytest_workspace
+    cat >> "$WORKSPACE/tests/test_math.py" <<'PY'
+
+def test_failure():
+    import os
+    assert "/batches/" not in os.environ["HOME"], "expected partition failure"
+PY
+    once --format json test tests > "$SPEC_ROOT/discovery.json"
+    once --format json query test-plan --target tests > "$SPEC_ROOT/plan.json"
+
+    When call /bin/sh -eu -c '
+      if "$1" -C "$2" --format json test --plan "$3" --jobs 1 > "$4"; then exit 1; fi
+      jq -e ".schema == \"once.portable_test_execution.v1\" and .complete and (.success | not) and (.execution.runs | length == 2) and (.execution.runs | map(.results.summary.total) | add == 4) and (.execution.runs | map(.results.summary.failed) | add == 1)" "$4"
+    ' sh "$ONCE_BIN" "$WORKSPACE" "$SPEC_ROOT/plan.json" "$SPEC_ROOT/failed-execution.json"
+    The status should be success
+    The stdout should include 'true'
+    The contents of file "$SPEC_ROOT/failed-execution.json" should include 'expected partition failure'
   End
 
   It 'keeps plan and batch identity independent of worker capacity'
@@ -856,7 +936,6 @@ PY
 
     When call /bin/sh -c '
       "$1" -C "$2" --format json query test-manifest hello_tests > "$2/manifest.json" &&
-      "$1" -C "$2" --format json query test-plan --target hello_tests --test-unit "hello_tests::returns_greeting" > "$2/plan.json" &&
       "$1" -C "$2" --format json test hello_tests --test-unit "hello_tests::returns_greeting" &&
       "$1" -C "$2" --format json query test-manifest hello_tests > "$2/complete-manifest.json"
     ' sh "$ONCE_BIN" "$WORKSPACE"
@@ -866,7 +945,6 @@ PY
     The contents of file "$WORKSPACE/manifest.json" should include '"case_filtering":"runner_args"'
     The contents of file "$WORKSPACE/manifest.json" should include 'hello_tests::returns_greeting'
     The contents of file "$WORKSPACE/manifest.json" should include 'hello_tests::other_greeting'
-    The contents of file "$WORKSPACE/plan.json" should include '"test_filters":["hello_tests::returns_greeting"]'
     The stdout should include '/test/batches/'
     The contents of file "$WORKSPACE/.once/out/hello_tests/test/batches/"*/test_results.json should include '"total":1'
     The contents of file "$WORKSPACE/.once/out/hello_tests/test/batches/"*/test_results.json should include 'hello_tests::returns_greeting'
@@ -875,11 +953,11 @@ PY
     The contents of file "$WORKSPACE/complete-manifest.json" should include 'hello_tests::other_greeting'
   End
 
-  It 'rejects an unknown Rust test unit while planning'
+  It 'rejects an unknown Rust test unit before execution'
     create_multi_rust_test_workspace
     once --format json test hello_tests >/dev/null
 
-    When call once --format json query test-plan --target hello_tests --test-unit 'hello_tests::missing'
+    When call once --format json test hello_tests --test-unit 'hello_tests::missing'
     The status should be failure
     The stderr should include '"schema":"once.error.v1"'
     The stderr should include 'is not present in the current manifest'
@@ -896,11 +974,11 @@ PY
     The stderr should include 'session failed'
   End
 
-  It 'rejects unsupported test-unit filtering while planning'
+  It 'rejects unsupported test-unit filtering before execution'
     create_shellspec_test_workspace
     once --format json test cli_e2e >/dev/null
 
-    When call once --format json query test-plan --target cli_e2e --test-unit 'spec/cli_surface_spec.sh::lists commands'
+    When call once --format json test cli_e2e --test-unit 'spec/cli_surface_spec.sh::lists commands'
     The status should be failure
     The stderr should include '"schema":"once.error.v1"'
     The stderr should include 'does not support explicit test-unit filtering'
@@ -954,19 +1032,17 @@ PY
     The contents of file "$WORKSPACE/.once/out/libs/greeting/GreetingDeviceTests/test/test_results.json" should include 'GreetingInstrumentedTest.useAppContext'
   End
 
-  It 'plans and runs one stable Android instrumentation test unit'
+  It 'runs one stable Android instrumentation test unit'
     Skip if 'Java toolchain unavailable on this host' java_toolchain_unavailable
     create_android_instrumentation_test_workspace
     once --format json test libs/greeting/GreetingDeviceTests >/dev/null
 
     When call /bin/sh -c '
       unit="libs/greeting/GreetingDeviceTests::dev.once.greeting.GreetingInstrumentedTest.useAppContext"
-      "$1" -C "$2" --format json query test-plan --target libs/greeting/GreetingDeviceTests --test-unit "$unit" > "$2/plan.json" &&
       "$1" -C "$2" --format json test libs/greeting/GreetingDeviceTests --test-unit "$unit"
     ' sh "$ONCE_BIN" "$WORKSPACE"
     The status should be success
     The stdout should include 'once.test_schedule.v1'
-    The contents of file "$WORKSPACE/plan.json" should include '"test_filters":["libs/greeting/GreetingDeviceTests::dev.once.greeting.GreetingInstrumentedTest.useAppContext"]'
     The stdout should include '/test/batches/'
     The contents of file "$WORKSPACE/.once/out/libs/greeting/GreetingDeviceTests/test/batches/"*/native_results.txt should include '-e class dev.once.greeting.GreetingInstrumentedTest#useAppContext'
     The contents of file "$WORKSPACE/.once/out/libs/greeting/GreetingDeviceTests/test/batches/"*/test_results.json should include '"total":1'

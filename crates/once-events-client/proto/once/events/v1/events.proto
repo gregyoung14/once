@@ -182,6 +182,20 @@ message RunStarted {
   // "HEAD" rather than a name, so the provider's own branch variable is
   // preferred over asking git.
   string git_branch = 15;
+  // Attribution only. When external_group_id is nonempty, its coordinator
+  // owns the consolidated partition report; this run is diagnostic evidence.
+  TestRunContext test_context = 16;
+}
+
+message TestRunContext {
+  // Coordinator-owned UUID, empty for native portable execution.
+  string external_group_id = 1;
+  // Nonnegative coordinator partition, meaningful only with an external group.
+  uint32 partition_index = 2;
+  // Original portable Once plan identity, shared by all assigned partitions.
+  string plan_id = 3;
+  // Native semantic batch identity, never a case identity or worker number.
+  string batch_id = 4;
 }
 
 message ArgvToken {

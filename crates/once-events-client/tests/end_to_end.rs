@@ -525,6 +525,12 @@ async fn authenticated_shutdown_drains_individual_actions_and_metadata() {
     let client = client
         .with_metadata(RunStarted {
             once_version: "test-version".into(),
+            test_context: Some(once_events_client::proto::TestRunContext {
+                external_group_id: "01900000-0000-7000-8000-000000000001".into(),
+                partition_index: 3,
+                plan_id: "portable-plan".into(),
+                batch_id: "native-batch".into(),
+            }),
             ..Default::default()
         })
         .with_source_files(once_events_client::SourceFileSnapshot::from_committed_paths(committed));
@@ -630,9 +636,13 @@ async fn authenticated_shutdown_drains_individual_actions_and_metadata() {
         .map(|e| (e.seq, e))
         .collect();
     let events: Vec<_> = unique.values().filter_map(|e| e.payload.as_ref()).collect();
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, Payload::RunStarted(s) if s.once_version == "test-version")));
+    assert!(events.iter().any(
+        |e| matches!(e, Payload::RunStarted(s) if s.once_version == "test-version"
+            && s.test_context.as_ref().is_some_and(|context|
+                context.external_group_id == "01900000-0000-7000-8000-000000000001"
+                && context.partition_index == 3 && context.plan_id == "portable-plan"
+                && context.batch_id == "native-batch"))
+    ));
     let actions: Vec<_> = events
         .iter()
         .filter_map(|e| match e {

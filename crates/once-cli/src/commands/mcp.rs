@@ -51,9 +51,10 @@ const SERVER_INSTRUCTIONS: &str = concat!(
     "completely once, then inspect next_plan in the completed once_run_tests response to see the ",
     "automatic file or case batches established for later runs. The plan field always describes ",
     "the work that just ran. Before change-scoped testing, inspect conservative selection, ",
-    "unmatched paths, and stable batches with once_query_test_plan; once_run_tests returns that ",
-    "execution plan, the refreshed next plan, a duration-informed dynamic schedule, and execution ",
-    "results. Pass one listed unit with one explicit target to plan or run an exact filtered test ",
+    "unmatched paths, and stable batches with once_query_test_plan, which always exports a ",
+    "replayable plan. once_run_tests returns executed scopes, refreshed next scopes, a ",
+    "duration-informed dynamic schedule, and results. Pass one listed unit with one explicit ",
+    "target to run an exact filtered test ",
     "when the target kind declares filtering support. Use jobs only to cap local concurrency; it ",
     "does not change plan or batch identity. For annotated automation, call once_validate_script ",
     "before once_exec_script. Stateful tools require --allow-run. Evidence subjects are target ids ",
@@ -491,12 +492,10 @@ impl Server {
 
     fn tool_query_test_plan(&self, args: &Value) -> Result<Value> {
         let args: TestPlanQueryArgs = serde_json::from_value(tool_args(args))?;
-        let plan = crate::commands::query::test_plan_selection(
+        let plan = crate::commands::query::test_plan_record(
             &self.workspace,
             &args.changed_paths,
             args.target.as_deref(),
-            args.test_unit.as_deref(),
-            args.test_batch.as_deref(),
         )?;
         Ok(serde_json::to_value(plan)?)
     }
@@ -1071,10 +1070,6 @@ struct TestPlanQueryArgs {
     changed_paths: Vec<String>,
     #[serde(default)]
     target: Option<String>,
-    #[serde(default)]
-    test_unit: Option<String>,
-    #[serde(default)]
-    test_batch: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

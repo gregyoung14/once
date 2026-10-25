@@ -894,7 +894,8 @@ fn enqueue_event(
             if matches!(payload, crate::proto::run_event::Payload::RunStarted(_)) {
                 *started_at_ms = Some(epoch_ms);
                 if let Some(metadata) = metadata {
-                    payload = crate::proto::run_event::Payload::RunStarted(metadata.clone());
+                    payload =
+                        crate::proto::run_event::Payload::RunStarted(Box::new(metadata.clone()));
                 }
             }
             session.push_ordinary(payload, epoch_ms, mono_ns);

@@ -305,6 +305,11 @@ async fn run_command(
             sandbox,
             config,
             jobs,
+            plan,
+            batches,
+            external_group,
+            partition_index,
+            internal_test_batch,
             all,
             changed_paths,
             test_unit,
@@ -321,6 +326,13 @@ async fn run_command(
                     target,
                     sandbox,
                     jobs,
+                    portable: plan.map(|path| commands::test_schedule::portable::Invocation {
+                        path,
+                        external_group,
+                        partition_index,
+                    }),
+                    batches,
+                    internal_test_batch,
                     all,
                     changed_paths,
                     test_unit,
@@ -456,6 +468,9 @@ struct TestDispatchArgs {
     target: Option<String>,
     sandbox: SandboxMode,
     jobs: Option<usize>,
+    portable: Option<commands::test_schedule::portable::Invocation>,
+    batches: Vec<String>,
+    internal_test_batch: bool,
     all: bool,
     changed_paths: Vec<String>,
     test_unit: Option<String>,
@@ -466,7 +481,38 @@ struct TestDispatchArgs {
     resolved: commands::graph::ResolvedConfiguration,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_test(workspace: &Path, xdg: &Xdg, args: TestDispatchArgs) -> Result<ExitCode> {
+    if let Some(mut invocation) = args.portable {
+        if invocation.path.is_relative() {
+            invocation.path = std::env::current_dir()?.join(&invocation.path);
+        }
+        let graph = args.resolved.load_graph(workspace)?;
+        if args.internal_test_batch {
+            return invocation
+                .run_batch(
+                    workspace,
+                    &graph,
+                    args.output,
+                    &args.batches,
+                    args.sandbox,
+                    args.resource_limits,
+                    &args.resolved,
+                )
+                .await;
+        }
+        return commands::test_schedule::portable::run(
+            workspace,
+            graph,
+            args.output,
+            invocation,
+            &args.batches,
+            args.jobs,
+            args.sandbox,
+            args.resource_limits,
+        )
+        .await;
+    }
     if !args.batch_test_units.is_empty() {
         let target = resolve_required_target(workspace, args.target)?;
         let cache = crate::cache_provider::resolve(workspace, xdg)?;
@@ -480,6 +526,8 @@ async fn dispatch_test(workspace: &Path, xdg: &Xdg, args: TestDispatchArgs) -> R
             args.test_batch_id.as_deref(),
             args.resource_limits,
             &args.resolved,
+            None,
+            None,
         ))
         .await;
     }
@@ -652,18 +700,10 @@ async fn run_query_command(
         Some(cli::QueryCmd::TestPlan {
             changed_paths,
             target,
-            test_unit,
-            test_batch,
         }) => {
-            run_test_plan_query(
-                workspace,
-                output,
-                &changed_paths,
-                target,
-                test_unit,
-                test_batch,
-            )
-            .await
+            commands::query::test_plan_request(workspace, output, &changed_paths, target.as_deref())
+                .await
+                .map(|()| ExitCode::SUCCESS)
         }
         Some(cli::QueryCmd::TestResults {
             target,
@@ -723,26 +763,6 @@ async fn run_query_command(
         }
         None => anyhow::bail!("query subcommand required"),
     }
-}
-
-async fn run_test_plan_query(
-    workspace: &Path,
-    output: Output,
-    changed_paths: &[String],
-    target: Option<String>,
-    test_unit: Option<String>,
-    test_batch: Option<String>,
-) -> Result<ExitCode> {
-    commands::query::test_plan_request(
-        workspace,
-        output,
-        changed_paths,
-        target.as_deref(),
-        test_unit.as_deref(),
-        test_batch.as_deref(),
-    )
-    .await
-    .map(|()| ExitCode::SUCCESS)
 }
 
 async fn run_edit_command(

@@ -15,8 +15,8 @@ use crate::proto::{
     log_scope::Scope as LogScopeVariant, run_event::Payload, ActionAttemptCompleted,
     ActionAttemptStarted, ActionCompleted, CacheDownload, CacheUpload, ContentRef, HashAlgorithm,
     LogChunk, LogScope, Phase as WirePhase, ResourceScope, RunCompleted, RunHeartbeat,
-    RunResult as WireRunResult, RunStarted, Stream as WireStream, SystemSampled, TargetCompleted,
-    TargetPhase, TargetQueued, TargetResult as WireResult, TargetStarted, TestCaseCompleted,
+    RunResult as WireRunResult, Stream as WireStream, SystemSampled, TargetCompleted, TargetPhase,
+    TargetQueued, TargetResult as WireResult, TargetStarted, TestCaseCompleted,
     TestCaseResult as WireCaseResult, TestCaseStarted, TestFailure, TestSuiteCompleted,
     TestSuiteStarted, TestTotals as WireTestTotals,
 };
@@ -47,7 +47,7 @@ pub enum Translated {
 pub fn translate(event: CoreEvent, mono_ns: i64) -> Translated {
     match event {
         CoreEvent::RunStarted { at_epoch_ms } => Translated::Ordinary {
-            payload: Payload::RunStarted(RunStarted::default()),
+            payload: Payload::RunStarted(Box::default()),
             epoch_ms: at_epoch_ms,
             mono_ns,
         },

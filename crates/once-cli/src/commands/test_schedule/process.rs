@@ -11,6 +11,7 @@ pub(super) fn run_test_target(
     batch: &TestBatch,
     sandbox: SandboxMode,
     limits: super::executor::ChildLimits,
+    portable: Option<&super::portable::Invocation>,
 ) -> Result<Value> {
     if super::cancellation::cancelled() {
         anyhow::bail!(
@@ -33,16 +34,25 @@ pub(super) fn run_test_target(
     command
         .arg("--cpu-limit")
         .arg(limits.cpu_slots.max(1).to_string());
-    command
-        .arg("test")
-        .arg("--sandbox")
-        .arg(sandbox)
-        .arg(&batch.target);
-    for test_filter in &batch.test_filters {
-        command.arg("--batch-test-unit").arg(test_filter);
-    }
-    if !batch.test_filters.is_empty() {
-        command.arg("--test-batch-id").arg(&batch.id);
+    command.arg("test").arg("--sandbox").arg(sandbox);
+    if let Some(portable) = portable {
+        portable.add_to_command(&mut command, &batch.id);
+        let path = workspace
+            .join(results_directory(batch)?)
+            .join("test_results.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("removing prior portable batch evidence"),
+        }
+    } else {
+        command.arg(&batch.target);
+        for test_filter in &batch.test_filters {
+            command.arg("--batch-test-unit").arg(test_filter);
+        }
+        if !batch.test_filters.is_empty() {
+            command.arg("--test-batch-id").arg(&batch.id);
+        }
     }
     let output = crate::commands::util::capture_command_output_observed(
         &mut command,
@@ -56,10 +66,7 @@ pub(super) fn run_test_target(
         None
     } else {
         Some(
-            std::path::PathBuf::from(".once/out")
-                .join(crate::commands::query::target_id_path(&batch.target)?)
-                .join("test/batches")
-                .join(&batch.id)
+            results_directory(batch)?
                 .join("test_results.json")
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/"),
@@ -109,6 +116,17 @@ pub(super) fn run_test_target(
     }))
 }
 
+fn results_directory(batch: &TestBatch) -> Result<std::path::PathBuf> {
+    let directory = std::path::PathBuf::from(".once/out")
+        .join(crate::commands::query::target_id_path(&batch.target)?)
+        .join("test");
+    Ok(if batch.test_filters.is_empty() {
+        directory
+    } else {
+        directory.join("batches").join(&batch.id)
+    })
+}
+
 fn load_batch_results(
     workspace: &Path,
     batch: &TestBatch,
@@ -118,10 +136,7 @@ fn load_batch_results(
         let path = once_core::WorkspacePath::try_from(
             results_path.context("exact batch did not declare a result path")?,
         )?;
-        let directory = std::path::PathBuf::from(".once/out")
-            .join(crate::commands::query::target_id_path(&batch.target)?)
-            .join("test/batches")
-            .join(&batch.id);
+        let directory = results_directory(batch)?;
         anyhow::ensure!(
             std::path::Path::new(path.as_str()).starts_with(&directory),
             "exact batch result must be inside `{}`; the runner must isolate batch outputs",

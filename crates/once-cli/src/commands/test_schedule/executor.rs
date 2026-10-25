@@ -16,6 +16,7 @@ pub(super) struct CompletedSchedule {
     pub runs: Vec<Value>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn execute(
     executable: &Path,
     workspace: &Path,
@@ -24,6 +25,7 @@ pub(super) fn execute(
     requested_workers: Option<usize>,
     sandbox: SandboxMode,
     resource_limits: &ResourceLimits,
+    portable: Option<&super::portable::Invocation>,
 ) -> Result<CompletedSchedule> {
     let requested_workers = bounded_worker_request(requested_workers, resource_limits);
     let workers = worker_count(Some(requested_workers), plan.batches.len());
@@ -32,7 +34,14 @@ pub(super) fn execute(
         cpu_slots: worker_cpu_limit(resource_limits.cpu_slots, workers),
     };
     execute_with(plan, estimates, Some(workers), |batch| {
-        run_test_target(executable, workspace, batch, sandbox, child_limits)
+        run_test_target(
+            executable,
+            workspace,
+            batch,
+            sandbox,
+            child_limits,
+            portable,
+        )
     })
 }
 

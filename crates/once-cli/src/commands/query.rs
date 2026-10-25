@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use once_core::{
-    EvidenceRecord, EvidenceStore, InputDigestBuilder, TestBatchAttempt, TestManifest,
-    TestTimingStore, TestUnit, WorkspacePath,
+    EvidenceRecord, EvidenceStore, TestBatchAttempt, TestManifest, TestTimingStore, TestUnit,
 };
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
@@ -716,35 +715,26 @@ pub async fn test_plan_request(
     output: Output,
     changed_paths: &[String],
     target: Option<&str>,
-    test_unit: Option<&str>,
-    test_batch: Option<&str>,
 ) -> Result<()> {
-    let plan = test_plan_selection(workspace, changed_paths, target, test_unit, test_batch)?;
-    write_body(output, || render_test_plan_human(&plan), &plan).await
+    let plan = test_plan_record(workspace, changed_paths, target)?;
+    write_body(output, || render_test_plan_human(&plan.plan), &plan).await
 }
 
-pub(crate) fn test_plan_selection(
+pub(crate) fn test_plan_record(
     workspace: &Path,
     changed_paths: &[String],
     target: Option<&str>,
-    test_unit: Option<&str>,
-    test_batch: Option<&str>,
-) -> Result<test_plan::TestPlan> {
+) -> Result<test_plan::portable::PortableTestPlan> {
     anyhow::ensure!(
-        test_unit.is_none() || test_batch.is_none(),
-        "`test_unit` and `test_batch` are mutually exclusive"
+        target.is_none() || changed_paths.is_empty(),
+        "`target` and `changed_paths` are mutually exclusive"
     );
-    anyhow::ensure!(
-        (test_unit.is_none() && test_batch.is_none()) || changed_paths.is_empty(),
-        "exact unit or batch requests and `changed_paths` are mutually exclusive"
-    );
-    match (target, test_unit, test_batch) {
-        (Some(target), Some(unit), None) => explicit_test_unit_plan(workspace, target, unit),
-        (Some(target), None, Some(batch)) => explicit_test_batch_plan(workspace, target, batch),
-        (Some(target), None, None) => explicit_test_plan(workspace, &[target.to_string()]),
-        (None, None, None) => test_plan_for_paths(workspace, changed_paths),
-        _ => anyhow::bail!("a test unit or batch requires exactly one explicit target"),
-    }
+    let graph = once_frontend::load_graph_workspace(workspace).context("loading graph")?;
+    let plan = match target {
+        Some(target) => test_plan::explicit_plan(workspace, &graph, &[target.to_string()])?,
+        None => test_plan::plan(workspace, &graph, changed_paths)?,
+    };
+    test_plan::portable::PortableTestPlan::export(workspace, &graph, plan)
 }
 
 pub(crate) fn explicit_test_batch_plan(
@@ -811,13 +801,13 @@ pub(crate) fn explicit_test_unit_plan_with_graph(
     target: &str,
     test_unit: &str,
 ) -> Result<test_plan::TestPlan> {
-    let manifest = test_manifest_record(workspace, target)?;
-    if !test_manifest_is_current(workspace, target, &manifest) {
+    let manifest = test_manifest_record_with_graph(workspace, target, graph)?;
+    validate_test_unit(&manifest, target, test_unit)?;
+    if !test_manifest_is_current_with_graph(workspace, target, &manifest, graph) {
         anyhow::bail!(
             "the test manifest for `{target}` is stale; run the whole target to refresh discovery"
         );
     }
-    validate_test_unit(&manifest, target, test_unit)?;
     test_plan::explicit_unit_plan(graph, target, test_unit)
 }
 
@@ -900,8 +890,21 @@ pub(crate) fn stored_test_manifest_record(
 pub(crate) fn refresh_test_manifest_for_target(
     workspace: &Path,
     target: &once_frontend::GraphTarget,
+    discovery_before: Option<&str>,
 ) -> Result<TestManifest> {
     let manifest = derive_test_manifest_for_target(workspace, target)?;
+    let fingerprint = once_frontend::load_graph_workspace(workspace)
+        .map_err(anyhow::Error::from)
+        .and_then(|graph| {
+            test_plan::portable::discovery_fingerprint(workspace, &graph, &target.label.id)
+        });
+    if let Err(error) = &fingerprint {
+        tracing::debug!(target = %target.label.id, %error, "discovery binding unavailable");
+    }
+    let fingerprint = fingerprint
+        .ok()
+        .filter(|actual| discovery_before == Some(actual.as_str()));
+    let manifest = manifest.with_discovery_fingerprint(fingerprint)?;
     write_test_manifest(workspace, &manifest)?;
     Ok(manifest)
 }
@@ -995,25 +998,6 @@ fn derive_test_manifest_for_target(
         sharding,
         units,
     )
-    .and_then(|manifest| {
-        manifest.with_discovery_fingerprint(
-            provider
-                .as_ref()
-                .map(|provider| test_discovery_fingerprint(workspace, target, provider))
-                .transpose()?,
-        )
-    })
-}
-
-pub(crate) fn test_manifest_is_current(
-    workspace: &Path,
-    target_id: &str,
-    manifest: &TestManifest,
-) -> bool {
-    let Ok(graph) = once_frontend::load_graph_workspace(workspace) else {
-        return false;
-    };
-    test_manifest_is_current_with_graph(workspace, target_id, manifest, &graph)
 }
 
 pub(crate) fn test_manifest_is_current_with_graph(
@@ -1025,13 +1009,7 @@ pub(crate) fn test_manifest_is_current_with_graph(
     let Some(expected) = manifest.discovery_fingerprint.as_deref() else {
         return false;
     };
-    let Some(target) = graph.iter().find(|target| target.label.id == target_id) else {
-        return false;
-    };
-    let Some(provider) = metadata_provider(workspace, target) else {
-        return false;
-    };
-    let Ok(actual) = test_discovery_fingerprint(workspace, target, &provider) else {
+    let Ok(actual) = test_plan::portable::discovery_fingerprint(workspace, graph, target_id) else {
         return false;
     };
     let current = actual == expected;
@@ -1043,36 +1021,6 @@ pub(crate) fn test_manifest_is_current_with_graph(
         "checked test manifest freshness"
     );
     current
-}
-
-fn test_discovery_fingerprint(
-    workspace: &Path,
-    target: &once_frontend::GraphTarget,
-    provider: &serde_json::Value,
-) -> Result<String> {
-    let mut digest = InputDigestBuilder::new(b"once.test-discovery.v1");
-    digest.push_bytes(&serde_json::to_vec(target).context("serializing test target")?);
-    digest.push_bytes(&serde_json::to_vec(provider).context("serializing test provider")?);
-    let mut inputs = provider
-        .get("test_discovery_inputs")
-        .or_else(|| provider.get("affected_inputs"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    inputs.sort();
-    inputs.dedup();
-    for input in inputs {
-        let path = WorkspacePath::try_from(input.as_str())
-            .with_context(|| format!("invalid affected test input `{input}`"))?;
-        digest.push_bytes(path.as_str().as_bytes());
-        digest
-            .push_source(workspace, path.as_str())
-            .with_context(|| format!("hashing affected test input `{input}`"))?;
-    }
-    Ok(digest.finish().to_string())
 }
 
 fn test_manifest_path(target_id: &str) -> Result<PathBuf> {
@@ -1739,7 +1687,7 @@ fn render_targets_human(records: &[TargetRecord]) -> String {
     out
 }
 
-async fn write_body<T: Serialize>(
+pub(crate) async fn write_body<T: Serialize>(
     output: Output,
     human: impl FnOnce() -> String,
     value: &T,
@@ -1979,39 +1927,5 @@ mod tests {
         assert!(error
             .to_string()
             .contains("run the whole target to refresh discovery"));
-    }
-
-    #[test]
-    fn discovery_fingerprint_changes_with_declared_discovery_input_content() {
-        let workspace = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(workspace.path().join("tests")).unwrap();
-        std::fs::write(workspace.path().join("tests/example.py"), "first").unwrap();
-        let target = once_frontend::GraphTarget {
-            label: once_frontend::TargetLabel {
-                package: String::new(),
-                name: "tests".to_string(),
-                id: "tests".to_string(),
-            },
-            kind: "example_test".to_string(),
-            deps: Vec::new(),
-            dependency_edges: std::collections::BTreeMap::new(),
-            srcs: vec!["tests/*.py".to_string()],
-            visibility: Vec::new(),
-            attrs: std::collections::BTreeMap::new(),
-            capabilities: Vec::new(),
-            providers: Vec::new(),
-            tools: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        let provider = serde_json::json!({
-            "test_discovery_inputs": ["tests/example.py"],
-            "affected_inputs": ["tests/example.py"]
-        });
-
-        let first = test_discovery_fingerprint(workspace.path(), &target, &provider).unwrap();
-        std::fs::write(workspace.path().join("tests/example.py"), "second").unwrap();
-        let second = test_discovery_fingerprint(workspace.path(), &target, &provider).unwrap();
-
-        assert_ne!(first, second);
     }
 }

@@ -206,6 +206,10 @@ def _python_pytest_impl(ctx):
         "metadata": {},
     }
     provider = {"label_id": ctx["label"]["id"], "target_kind": "pytest_test", "affected_inputs": inputs, "test_discovery_inputs": inputs, "test_info": info}
+    provider["portable_test_configuration"] = _portable_test_configuration(ctx, ["python"], [
+        host_command([python, "--version"], merge_stderr = True).strip(),
+        host_command([python, "-c", "import pytest; print(pytest.__version__)"]).strip(),
+    ], _python_env(ctx, test_dir))
     if ctx["capability"] != "test":
         return provider
     write_path(adapter, _python_pytest_adapter())

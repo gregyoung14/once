@@ -421,6 +421,10 @@ pub fn module_authoring_contract() -> ModuleAuthoringContract {
                 "Optionally list the workspace files whose contents can change discovered test identities. Once fingerprints them before reusing a manifest.",
             ),
             entry(
+                "provider[\"portable_test_configuration\"]",
+                "Optionally return resolved discovery configuration, environment, and semantic tool identities without installation paths. Use `_portable_test_configuration(ctx, tool_attributes, tool_identity, env)` to retain all non-tool attributes. Keep workspace runner programs and dependencies in declared inputs. Portable replay otherwise binds complete metadata conservatively.",
+            ),
+            entry(
                 "ctx[\"build_dir\"] + \"/test[/batches/<batch_id>]/test_results.json\"",
                 "Write normalized results under a batch-isolated directory when batch_id is present. The record uses schema `once.test_results.v1` and contains target, runner, status, summary, cases, and artifacts.",
             ),

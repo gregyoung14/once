@@ -449,10 +449,10 @@ pub use crate::proto::AckDisposition;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{RunFinalization, RunHeartbeat, RunStarted};
+    use crate::proto::{RunFinalization, RunHeartbeat};
 
     fn started() -> Payload {
-        Payload::RunStarted(RunStarted::default())
+        Payload::RunStarted(Box::default())
     }
 
     fn heartbeat() -> Payload {

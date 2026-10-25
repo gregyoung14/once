@@ -407,3 +407,11 @@ def _json_encode(value):
 
 def _run_result_json(target_id):
     return "{\"schema\":\"once.run_result.v1\",\"target\":" + _json_string(target_id) + ",\"exit_code\":0}\n"
+
+def _portable_test_configuration(ctx, tool_attributes, tool_identity, env):
+    return {
+        "attributes": {key: value for key, value in ctx["attr"].items() if key not in tool_attributes},
+        "sources": ctx["srcs"],
+        "tools": tool_identity,
+        "environment": env,
+    }
