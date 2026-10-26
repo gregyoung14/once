@@ -1368,6 +1368,7 @@ def _rust_build_script(ctx, rustc, identity, target, host_triple, edition, dep_a
     run_env = _rust_build_script_env(ctx, rustc, target, host_triple, out_dir, script_path, tool_paths)
     status = out_dir + "/.once-build-script-status"
     metadata_exports, metadata_inputs = _rust_dep_metadata_exports(metadata_deps)
+    metadata_inputs = _unique(metadata_inputs + _rust_dep_build_script_native_inputs(metadata_deps))
     run_script = _rust_build_script_run_shell(runner, stdout, run_env, metadata_exports)
     # Cargo's default: a build script that prints no `rerun-if` directive
     # depends on every file in its package. Narrowing to a script's declared
@@ -1401,15 +1402,7 @@ def _rust_build_script(ctx, rustc, identity, target, host_triple, edition, dep_a
     )
     compile_env = _rust_compile_action_env(ctx, target, host_triple)
     compile_env["OUT_DIR"] = execution_path(out_dir)
-    # The build script's output directory is not itself an input to the
-    # downstream rustc compile: build scripts routinely emit timestamps
-    # and other non-deterministic bytes into `OUT_DIR`, and hashing the
-    # directory into the compile digest turned every subsequent build
-    # into a cache miss even when nothing observable had changed. The
-    # `stdout` file still captures the `cargo:rustc-*` directives that
-    # actually influence the compile, so any real change to the build
-    # script's contract still flows into the digest through it.
-    return (out_dir, [script_path, stdout], compile_env, stdout)
+    return (out_dir, [out_dir, stdout], compile_env, stdout)
 
 def _rustc_unix_read_dependency_link_searches(stdout):
     return """while IFS= read -r line; do
@@ -1817,6 +1810,8 @@ def _rust_compile(ctx, crate_type, default_root, output_name, test = False, prov
         outputs = [output],
         env = compile_env,
         cwd = compile_cwd,
+        # Only consumed bytes matter, not which generator inputs produced them.
+        depends_on_prior_actions = False,
         toolchain_identity = identity + linker_identity,
         identifier = _rust_action_identifier(ctx, "rustc"),
     )
@@ -1832,7 +1827,7 @@ def _rust_compile(ctx, crate_type, default_root, output_name, test = False, prov
         own_android_native_libraries.append({"abi": android_abi, "path": output})
     own_native_archives = [output] if crate_type == "staticlib" else []
     own_build_script_outputs = [build_stdout] if build_stdout else []
-    own_build_script_inputs = build_script_inputs if build_stdout else []
+    own_build_script_inputs = [build_out_dir] if build_out_dir else []
     provider = {
         "label_id": ctx["label"]["id"],
         "target_kind": provider_kind,

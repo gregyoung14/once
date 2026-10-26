@@ -189,6 +189,17 @@ consumers. Changing one workspace package invalidates that package and its
 dependants. Changing only a test file reruns the affected test without
 recompiling an unchanged library.
 
+Rust compilation hashes build-script directives and the contents of the
+generated output directory, including native libraries needed by downstream
+crates. Rebuilding a generator does not force recompilation when its generated
+files, directives, and every other compiler input remain identical. Changed
+generated files invalidate their consumers even when the directives stay the
+same. Outputs that embed timestamps or other changing bytes still invalidate
+the cache.
+
+Build scripts retain conservative package-wide input tracking. Once does not
+narrow their inputs using a previous run's `rerun-if-changed` directives.
+
 Once caches compilation after Cargo resolves and materializes the sources
 selected by `Cargo.lock`. Continue with [Caching](/guide/scripted/caching) to
 configure a shared remote cache.

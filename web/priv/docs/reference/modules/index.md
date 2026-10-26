@@ -869,6 +869,12 @@ and includes its identity in the action's cache key.
   output needs them. Declared filesystem changes that overlap cached outputs,
   including uncertain path aliases, retain conservative restoration before
   execution. This does not change action keys.
+  Built-in Rust crate compilation uses this content-based mode: its declared
+  inputs include its own build-script output directory and stdout directives,
+  plus dependency-generated directories and directives. Rust providers carry
+  generated output directories in `transitive_build_script_inputs`, not the
+  source files that produced them, so downstream linking and build scripts
+  consuming dependency metadata hash and materialize those generated files.
 - `intermediate`: `False` by default. Set `True` on an action whose outputs only
   later actions of the same target read, such as a step that feeds the next
   one. When the action is a cache hit, its outputs stay in the cache instead of
