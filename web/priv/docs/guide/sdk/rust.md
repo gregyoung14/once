@@ -118,6 +118,17 @@ the guard on a blocking worker thread after the calling future has been dropped.
 The existing cache selection, remote retrieval and publication defaults are
 unchanged. These APIs do not execute actions or create runtime sessions.
 
+When a caller already knows a collection of required digests,
+`cache.provider().prefetch_blobs(&digests).await` fetches missing remote content
+into the local tier before staging. It submits bounded, deduplicated windows
+and packs small blobs into size-limited requests; large blobs still stream.
+A local-only provider does nothing. Prefetch does not pin content or verify
+existing local copies, so reads and staging still verify and recover from
+eviction or corruption. `prefetch_blobs_guarded(&digests, guard)` retains a
+`Send + 'static` owner through active ingestion if the caller is cancelled.
+All transfers share the provider's existing memory, staging and concurrency
+budgets, and persistent CAS writes retain their durability guarantees.
+
 ### Owned Blob Producers
 
 The lower-level provider also offers `put_produced(guard, producer)` for

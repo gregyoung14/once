@@ -14,6 +14,12 @@ pub(super) async fn restore(
     cache: &CacheProvider,
     staging: &Arc<StagingDir>,
 ) -> Result<Vec<PrefetchedOutput>> {
+    cache
+        .prefetch_blobs_guarded(
+            &result.outputs.values().copied().collect::<Vec<_>>(),
+            (Arc::clone(staging), crate::resource_scope::current()),
+        )
+        .await?;
     run(result, |_, rel, digest, owner| {
         let cache = cache.clone();
         let staging = Arc::clone(staging);

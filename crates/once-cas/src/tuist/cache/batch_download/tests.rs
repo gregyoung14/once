@@ -3,6 +3,8 @@ use crate::tuist::cache::fault_server::{connected_cache, FaultServer};
 use crate::{CacheProvider, MIN_TRANSFER_MEMORY_BYTES};
 use futures::future::join_all;
 
+mod collections;
+
 async fn fixture(
     count: usize,
     limit: u64,

@@ -149,6 +149,29 @@ impl CacheProvider {
         }
     }
 
+    /// Fetch missing remote blobs into the local tier in bounded collections.
+    ///
+    /// A local-only provider does nothing. This does not pin or verify existing
+    /// local content; subsequent reads still verify and recover from eviction.
+    pub async fn prefetch_blobs(&self, digests: &[Digest]) -> Result<()> {
+        self.prefetch_blobs_guarded(digests, ()).await
+    }
+
+    /// Prefetch while retaining an owner through any active ingestion work.
+    pub async fn prefetch_blobs_guarded<G: Send + 'static>(
+        &self,
+        digests: &[Digest],
+        guard: G,
+    ) -> Result<()> {
+        match self {
+            Self::Local(_) => Ok(()),
+            Self::Tuist(cache) => {
+                let owner = std::sync::Arc::new(std::sync::Mutex::new(guard));
+                cache.prefetch_blobs_guarded(digests, owner).await
+            }
+        }
+    }
+
     /// Stage a blob for opaque read-only access under an existing directory.
     ///
     /// Raw immutable storage can be pinned without copying. Compressed storage

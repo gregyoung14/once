@@ -13,6 +13,7 @@ impl TuistCache {
         digests: Vec<reapi::Digest>,
         bytes: u64,
     ) -> Result<Option<BatchResponse>> {
+        let admitted = Instant::now();
         let largest = digests
             .iter()
             .map(|digest| u64::try_from(digest.size_bytes).unwrap_or_default())
@@ -46,6 +47,8 @@ impl TuistCache {
             acceptable_compressors,
             digest_function: SHA256_DIGEST_FUNCTION,
         };
+        let rpc_started = Instant::now();
+        let admission_seconds = admitted.elapsed().as_secs_f64();
         let response = retry::grpc("get blobs", || {
             let channel = channel.clone();
             let request = request.clone();
@@ -81,6 +84,9 @@ impl TuistCache {
         tracing::debug!(
             blobs = blobs.len(),
             decoded_bytes = bytes,
+            payload_bytes = blobs.iter().map(|blob| blob.data.len()).sum::<usize>(),
+            admission_seconds,
+            rpc_seconds = rpc_started.elapsed().as_secs_f64(),
             "fetched remote blob batch"
         );
         Ok(Some(BatchResponse {

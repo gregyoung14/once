@@ -4,8 +4,9 @@ date: 2026-10-26
 ---
 
 Remote cache hits reuse the blob availability established by their lookup,
-avoiding redundant requests. Small output downloads can share bounded batch
-requests, while large blobs and servers without batching support keep streaming.
+avoiding redundant requests. Output restoration submits known digest collections
+in bounded, deduplicated windows, packing small blobs into size-limited batch
+requests. Large blobs and servers without batching support keep streaming.
 
 Read-only staging pins raw blobs with a file handle and avoids synchronizing
 ephemeral decoded scratch files. Persistent cache contents and mutable output

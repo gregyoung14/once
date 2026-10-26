@@ -5,6 +5,7 @@ use tokio::sync::{oneshot, OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::*;
 
+mod enqueue;
 mod rpc;
 use rpc::BatchResponse;
 
@@ -81,44 +82,6 @@ impl TuistCache {
         let staging = self.budget.staging_bytes().saturating_sub(FRAMING_BYTES) / 2;
         Some(server.min(BATCH_BLOB_LIMIT as u64).min(memory).min(staging))
             .filter(|limit| *limit > 0)
-    }
-
-    pub(super) async fn enqueue_download<G: Send + 'static>(
-        &self,
-        digest: Digest,
-        remote: reapi::Digest,
-        flight: OwnedMutexGuard<()>,
-        guard: G,
-        limit: u64,
-    ) -> Result<()> {
-        let slot = Arc::clone(&self.batch_downloads.slots)
-            .acquire_owned()
-            .await
-            .expect("batch queue remains open");
-        let (response, ready) = oneshot::channel();
-        let mut pending = self.batch_downloads.pending.lock().await;
-        let start = pending.is_empty();
-        pending.push_back(PendingDownload {
-            digest,
-            remote,
-            response,
-            observer: transfer::current_observer(),
-            started: Instant::now(),
-            _flight: flight,
-            _slot: slot,
-            owner: Arc::new(std::sync::Mutex::new(Box::new(guard))),
-        });
-        if start {
-            self.start_download_batch(limit);
-        }
-        drop(pending);
-        ready.await.map_err(|_| {
-            status::remote(
-                "get blob",
-                ErrorKind::Unavailable,
-                "batch download worker stopped",
-            )
-        })?
     }
 
     fn start_download_batch(&self, limit: u64) {
@@ -202,6 +165,8 @@ impl TuistCache {
             staging,
             permit,
         } = batch;
+        let ingest_started = Instant::now();
+        let count = blobs.len();
         for (request, blob) in requests.into_iter().zip(blobs) {
             let Some(request) = request else {
                 continue;
@@ -227,6 +192,11 @@ impl TuistCache {
             };
             request.complete(result);
         }
+        tracing::debug!(
+            blobs = count,
+            ingest_seconds = ingest_started.elapsed().as_secs_f64(),
+            "ingested remote blob batch"
+        );
         drop((memory, staging, permit));
         self.retry_downloads(retries).await;
     }
