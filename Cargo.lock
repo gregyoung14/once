@@ -3721,6 +3721,7 @@ dependencies = [
  "base64 0.23.1",
  "bazel-remote-apis",
  "blake3",
+ "chrono",
  "console",
  "fd-lock",
  "futures",
