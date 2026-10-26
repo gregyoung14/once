@@ -55,7 +55,7 @@ Describe 'real-world native graph shapes'
 
     graph_build SwiftPackage_VaporGraph_Development || return
     graph_once query evidence > "$WORKSPACE/evidence-cold.json" || return
-    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Development")" = 16 ] || return 1
+    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Contents/MacOS/Development")" = 16 ] || return 1
     [ ! -e "$WORKSPACE/.once/out/SwiftPackage_VaporGraph_VaporTests" ] || return 1
     [ ! -e "$WORKSPACE/.once/out/SwiftPackage_VaporGraph_XCTVapor" ] || return 1
     [ ! -e "$WORKSPACE/.once/out/SwiftPackage_swift-nio_NIOTransportServices" ] || return 1
@@ -66,17 +66,17 @@ Describe 'real-world native graph shapes'
     mv "$WORKSPACE/.once/out" "$WORKSPACE/saved-outputs"
     graph_build SwiftPackage_VaporGraph_Development || return
     jq -e '.cache == "hit"' "$WORKSPACE/build.json" >/dev/null || return
-    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Development")" = 16 ] || return 1
+    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Contents/MacOS/Development")" = 16 ] || return 1
 
     perl -pi -e 's/GRAPH_VALUE 7/GRAPH_VALUE 9/' "$WORKSPACE/Sources/CVaporBcrypt/include/CVaporBcrypt.h"
     graph_build SwiftPackage_VaporGraph_Development || return
     jq -e '.cache == "miss"' "$WORKSPACE/build.json" >/dev/null || return
-    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Development")" = 18 ] || return 1
+    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Contents/MacOS/Development")" = 18 ] || return 1
 
     perl -pi -e 's/logValue = 2/logValue = 3/' "$WORKSPACE/Dependencies/swift-log/Sources/Logging/Logging.swift"
     graph_build SwiftPackage_VaporGraph_Development || return
     jq -e '.cache == "miss"' "$WORKSPACE/build.json" >/dev/null || return
-    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Development")" = 21 ] || return 1
+    [ "$("$WORKSPACE/.once/out/SwiftPackage_VaporGraph_Development/Development.app/Contents/MacOS/Development")" = 21 ] || return 1
   }
 
   exercise_netnewswire_graph() {
@@ -89,7 +89,7 @@ Describe 'real-world native graph shapes'
 
     graph_build NetNewsWire || return
     graph_once query evidence > "$WORKSPACE/evidence-cold.json" || return
-    [ "$("$WORKSPACE/.once/out/NetNewsWire/NetNewsWire.app/NetNewsWire")" = 11 ] || return 1
+    [ "$("$WORKSPACE/.once/out/NetNewsWire/NetNewsWire.app/Contents/MacOS/NetNewsWire")" = 11 ] || return 1
     [ ! -e "$WORKSPACE/.once/out/NetNewsWire-iOS" ] || return 1
     [ ! -e "$WORKSPACE/.once/out/XcodePackage_xcode_ios_Account_Account" ] || return 1
     [ ! -e "$WORKSPACE/.once/out/NetNewsWireTests" ] || return 1
@@ -100,7 +100,7 @@ Describe 'real-world native graph shapes'
     perl -pi -e 's/CORE_VALUE 5/CORE_VALUE 8/' "$WORKSPACE/Modules/RSCore/Sources/RSCoreObjC/include/RSCoreObjC.h"
     graph_build NetNewsWire || return
     jq -e '.cache == "miss"' "$WORKSPACE/build.json" >/dev/null || return
-    [ "$("$WORKSPACE/.once/out/NetNewsWire/NetNewsWire.app/NetNewsWire")" = 17 ] || return 1
+    [ "$("$WORKSPACE/.once/out/NetNewsWire/NetNewsWire.app/Contents/MacOS/NetNewsWire")" = 17 ] || return 1
 
     perl -pi -e 's/GRAPH_MAC/GRAPH_CHANGED/' "$WORKSPACE/Config/macOS.xcconfig"
     graph_snapshot || return

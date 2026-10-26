@@ -16,6 +16,14 @@ application imports directly. Once links the direct dynamic boundary, embeds
 its complete framework closure, removes duplicate paths, signs every embedded
 framework, and then signs the application.
 
+macOS applications use the native `Contents` layout: executables in
+`Contents/MacOS`, resources and dependency resource bundles in
+`Contents/Resources`, and frameworks in `Contents/Frameworks`. The linker
+includes `@executable_path/../Frameworks` automatically. Generated macOS
+property lists use `LSMinimumSystemVersion` and omit iOS device-family keys.
+The `macosx` platform alias uses the same layout. Other Apple platforms retain
+their flat bundle layout.
+
 Linux builds use Swift, xtool's Darwin SDK, and `rcodesign`. iOS device builds
 use ARM64 even on x86_64 Linux hosts. The output remains ad-hoc signed and must
 be provisioned and re-signed before installation on a physical device. The
@@ -93,7 +101,8 @@ for mapped build settings and file-list variables.
 | --- | --- | --- |
 | `deps` | `apple_linkable`, `apple_framework`, `apple_resource`, `apple_swift_plugin`, `native_linkable` | Libraries, frameworks, resources, native linkables, and Swift compiler plugins embedded in the app |
 
-Transitive library resource bundles are embedded at the application root.
+Transitive library resource bundles are embedded at the application root on
+iOS and in `Contents/Resources` on macOS.
 Interface files and managed object models are compiled before each resource
 bundle and the outer application are signed.
 
@@ -129,6 +138,15 @@ can use it as the linker's bundle loader.
 | Run record | `.once/out/<target>/run/run.json` after `once run` |
 | Run log | `.once/out/<target>/run/run.log` after `once run` |
 
+The executable, property list, framework, resource bundle, and signature
+locations above describe flat bundles. On macOS their respective paths are
+`<product_name>.app/Contents/MacOS/<product_name>`,
+`<product_name>.app/Contents/Info.plist`,
+`<product_name>.app/Contents/Frameworks`,
+`<product_name>.app/Contents/Resources/*.bundle`, and
+`<product_name>.app/Contents/_CodeSignature/CodeResources`. Compiled asset
+catalogs also live in `Contents/Resources`.
+
 ## Running
 
 `once run` launches macOS apps with the host app launcher and iOS
@@ -145,6 +163,11 @@ action-cache hit. Physical-device launch is unsupported.
 Provisioning profiles, signing identities, and signing modes other than
 `ad_hoc` are unsupported. The target rejects unsupported values instead of
 ignoring them.
+
+For Developer ID distribution, sign and notarize a separate copy, outside
+Once's cached actions. See [macOS applications and distribution](/guide/graph/apple#macos-applications-and-distribution)
+for a runnable starter and a credential-isolated release workflow. Never sign
+or staple the cached application in place.
 
 ## Example
 

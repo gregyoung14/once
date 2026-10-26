@@ -28,23 +28,23 @@ Describe 'native script phase execution'
       ($new | length > 2) and
       ($new | map(select(.cache == "hit")) | length > 2) and
       ($new | all(.cache == "hit" or .cache == "bypass" or
-        (.cache == "miss" and (.outputs | has(".once/out/Script_App/Script App.app/_CodeSignature/CodeResources") or has(".once/out/Script_App/Script App.app/observed.txt"))))) and
+        (.cache == "miss" and (.outputs | has(".once/out/Script_App/Script App.app/Contents/_CodeSignature/CodeResources") or has(".once/out/Script_App/Script App.app/Contents/Resources/observed.txt"))))) and
       ($new | any(.cache == "bypass" and (.outputs | has(".once/out/Script_App/Script App.app"))))
     ' "$WORKSPACE/evidence-warm.json" >/dev/null || return
     [ "$(wc -l < "$WORKSPACE/.once/out/Script_App/Intermediates/runs.txt" | tr -d ' ')" = 2 ] || return 1
-    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/undeclared.txt")" = 2 ] || return 1
-    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/observed.txt")" = 2 ] || return 1
-    [ ! -e "$WORKSPACE/.once/out/Script_App/Script App.app/generated-resource.txt" ] || return 1
-    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$WORKSPACE/.once/out/Script_App/Script App.app/Info.plist")" = 42 ] || return 1
-    [ "$("$WORKSPACE/.once/out/Script_App/Script App.app/Script App")" = 'script graph' ] || return 1
+    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/undeclared.txt")" = 2 ] || return 1
+    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/observed.txt")" = 2 ] || return 1
+    [ ! -e "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/generated-resource.txt" ] || return 1
+    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Info.plist")" = 42 ] || return 1
+    [ "$("$WORKSPACE/.once/out/Script_App/Script App.app/Contents/MacOS/Script App")" = 'script graph' ] || return 1
     codesign --verify "$WORKSPACE/.once/out/Script_App/Script App.app" 2> "$WORKSPACE/signature.err" || { cat "$WORKSPACE/signature.err"; return 1; }
     mv "$WORKSPACE/.once/out" "$WORKSPACE/saved-outputs"
     script_once build Script_App > "$WORKSPACE/restore.json" 2> "$WORKSPACE/build.err" || { cat "$WORKSPACE/build.err"; return 1; }
-    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$WORKSPACE/.once/out/Script_App/Script App.app/Info.plist")" = 42 ] || return 1
-    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/from-script.txt")" = 'native graph inputs' ] || return 1
-    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/undeclared.txt")" = 1 ] || return 1
-    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/observed.txt")" = 1 ] || return 1
-    [ ! -e "$WORKSPACE/.once/out/Script_App/Script App.app/generated-resource.txt" ] || return 1
+    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Info.plist")" = 42 ] || return 1
+    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/from-script.txt")" = 'native graph inputs' ] || return 1
+    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/undeclared.txt")" = 1 ] || return 1
+    [ "$(cat "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/observed.txt")" = 1 ] || return 1
+    [ ! -e "$WORKSPACE/.once/out/Script_App/Script App.app/Contents/Resources/generated-resource.txt" ] || return 1
     codesign --verify "$WORKSPACE/.once/out/Script_App/Script App.app" 2> "$WORKSPACE/signature.err" || return
     mv "$WORKSPACE/.once/out" "$WORKSPACE/saved-restored-outputs"
     script_once build Script_App --config token=alternate > "$WORKSPACE/configured.json" 2> "$WORKSPACE/build.err" || { cat "$WORKSPACE/build.err"; return 1; }

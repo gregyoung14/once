@@ -1007,6 +1007,117 @@ EOF
     End
   End
 
+  Describe 'native macOS application bundles'
+    It 'loads resources and a versioned framework after building, rebuilding, and restoring from cache'
+      Skip if 'apple toolchain unavailable on this host' apple_toolchain_unavailable
+
+      verify_macos_bundle() {
+        mkdir -p "$WORKSPACE/Vendor/Boundary.xcframework/macos/Boundary.framework/Versions/A/Resources" \
+          "$WORKSPACE/Vendor/Boundary.xcframework/macos/Boundary.framework/Versions/A/Headers" \
+          "$WORKSPACE/Vendor/Boundary.xcframework/macos/Boundary.framework/Versions/A/Modules"
+        framework="$WORKSPACE/Vendor/Boundary.xcframework/macos/Boundary.framework"
+        printf '%s\n' 'int boundary_value(void) { return 37; }' > "$WORKSPACE/boundary.c"
+        xcrun clang -dynamiclib "$WORKSPACE/boundary.c" -o "$framework/Versions/A/Boundary" \
+          -install_name @rpath/Boundary.framework/Versions/A/Boundary || return
+        printf '%s\n' 'int boundary_value(void);' > "$framework/Versions/A/Headers/Boundary.h"
+        printf '%s\n' 'framework module Boundary { umbrella header "Boundary.h" export * }' > "$framework/Versions/A/Modules/module.modulemap"
+        cat > "$framework/Versions/A/Resources/Info.plist" <<'PLIST'
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.once.Boundary</string><key>CFBundleExecutable</key><string>Boundary</string><key>CFBundlePackageType</key><string>FMWK</string><key>CFBundleVersion</key><string>1</string></dict></plist>
+PLIST
+        ln -s A "$framework/Versions/Current"
+        for entry in Boundary Resources Headers Modules; do
+          ln -s "Versions/Current/$entry" "$framework/$entry"
+        done
+        codesign --force --sign - --timestamp=none "$framework" 2> "$WORKSPACE/sign.err" || return
+        codesign --verify --deep --strict "$framework" 2> "$WORKSPACE/sign.err" || return
+        find "$framework" -type f -exec shasum -a 256 {} + | sort > "$WORKSPACE/source-before"
+
+        ditto "$framework" "$WORKSPACE/Broken.framework"
+        mkdir "$WORKSPACE/Broken.framework/_CodeSignature"
+        if codesign --force --sign - --timestamp=none "$WORKSPACE/Broken.framework" 2> "$WORKSPACE/rejection"; then return 1; fi
+        grep -q 'unsealed contents present in the root directory of an embedded framework' "$WORKSPACE/rejection" || return
+
+        cat > "$WORKSPACE/Vendor/Boundary.xcframework/Info.plist" <<PLIST
+<plist version="1.0"><dict><key>AvailableLibraries</key><array><dict><key>LibraryIdentifier</key><string>macos</string><key>LibraryPath</key><string>Boundary.framework</string><key>SupportedArchitectures</key><array><string>$(uname -m)</string></array><key>SupportedPlatform</key><string>macos</string></dict></array></dict></plist>
+PLIST
+        cat > "$WORKSPACE/once.toml" <<'TOML'
+[[target]]
+name = "Boundary"
+kind = "apple_xcframework_import"
+[target.attrs]
+platform = "macos"
+bundle = "Vendor/Boundary.xcframework"
+
+[[target]]
+name = "SharedResources"
+kind = "apple_resource_bundle"
+[target.attrs]
+platform = "macos"
+bundle_name = "SharedResources"
+resources = ["shared.txt"]
+
+[[target]]
+name = "App"
+kind = "apple_application"
+srcs = ["main.swift"]
+deps = ["Boundary", "SharedResources"]
+[target.attrs]
+platform = "macos"
+bundle_id = "dev.once.macos.bundle"
+minimum_os = "14.0"
+resources = ["message.txt"]
+asset_catalogs = ["Assets.xcassets"]
+TOML
+        printf app-resource > "$WORKSPACE/message.txt"
+        printf shared-resource > "$WORKSPACE/shared.txt"
+        mkdir -p "$WORKSPACE/Assets.xcassets/AccentColor.colorset"
+        printf '%s\n' '{"info":{"author":"xcode","version":1}}' > "$WORKSPACE/Assets.xcassets/Contents.json"
+        printf '%s\n' '{"colors":[{"idiom":"universal","color":{"color-space":"srgb","components":{"red":"0.2","green":"0.5","blue":"0.8","alpha":"1.0"}}}],"info":{"author":"xcode","version":1}}' > "$WORKSPACE/Assets.xcassets/AccentColor.colorset/Contents.json"
+        cat > "$WORKSPACE/main.swift" <<'SWIFT'
+import AppKit
+import Foundation
+import Boundary
+let main = Bundle.main
+precondition(main.bundleIdentifier == "dev.once.macos.bundle")
+precondition(NSColor(named: "AccentColor", bundle: main) != nil)
+let message = try String(contentsOf: main.url(forResource: "message", withExtension: "txt")!, encoding: .utf8)
+let shared = Bundle(url: main.resourceURL!.appendingPathComponent("SharedResources.bundle"))!
+let resource = try String(contentsOf: shared.url(forResource: "shared", withExtension: "txt")!, encoding: .utf8)
+print("\(boundary_value()):\(message):\(resource)")
+SWIFT
+        app="$WORKSPACE/.once/out/App/App.app"
+        embedded="$app/Contents/Frameworks/Boundary.framework"
+        mkdir -p "$app"
+        printf legacy > "$app/Info.plist"
+        printf obsolete > "$app/obsolete.txt"
+        for stage in migration cold warm restored alias; do
+          if [ "$stage" = restored ]; then rm -rf "$WORKSPACE/.once/out"; fi
+          if [ "$stage" = alias ]; then perl -pi -e 's/platform = "macos"/platform = "macosx"/' "$WORKSPACE/once.toml"; fi
+          once --format json build App > "$WORKSPACE/$stage.json" 2> "$WORKSPACE/build.err" || { cat "$WORKSPACE/build.err"; return 1; }
+          case "$stage" in
+            warm|restored) grep -q '"cache":"hit"' "$WORKSPACE/$stage.json" || return ;;
+          esac
+          [ "$("$app/Contents/MacOS/App")" = '37:app-resource:shared-resource' ] || return 1
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 14.0 ] || return 1
+          ! /usr/libexec/PlistBuddy -c 'Print :LSRequiresIPhoneOS' "$app/Contents/Info.plist" >/dev/null 2>&1 || return 1
+          [ -f "$app/Contents/_CodeSignature/CodeResources" ] || return 1
+          [ -f "$app/Contents/Resources/Assets.car" ] || return 1
+          [ ! -e "$app/Info.plist" ] && [ ! -e "$embedded/_CodeSignature" ] || return 1
+          [ ! -e "$app/obsolete.txt" ] || return 1
+          [ "$(readlink "$embedded/Versions/Current")" = A ] || return 1
+          codesign --verify --deep --strict "$app" 2> "$WORKSPACE/sign.err" || { cat "$WORKSPACE/sign.err"; return 1; }
+        done
+        find "$framework" -type f -exec shasum -a 256 {} + | sort > "$WORKSPACE/source-after"
+        cmp "$WORKSPACE/source-before" "$WORKSPACE/source-after" || return
+        codesign --verify --deep --strict "$framework" 2> "$WORKSPACE/sign.err"
+      }
+
+      When call verify_macos_bundle
+      The status should be success
+      The output should equal ''
+    End
+  End
+
   Describe 'apple_thinned_package end-to-end'
     It 'creates a signed device-specific archive and stable manifest'
       Skip if 'apple toolchain unavailable on this host' apple_toolchain_unavailable

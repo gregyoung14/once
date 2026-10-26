@@ -5104,11 +5104,12 @@ def _xcode_lower_target(ctx, objects, target, project_settings, name_to_id, dep_
         subs["CONTENTS_FOLDER_PATH"] = wrapper_name
         subs["UNLOCALIZED_RESOURCES_FOLDER_PATH"] = wrapper_name
         subs["EXECUTABLE_NAME"] = product_name_seed
-        contents = wrapper_name + "/Contents" if kind == "test" and platform == "macos" else wrapper_name
+        macos_contents = platform == "macos" and kind in ["test", "application", "extension", "watch_app"]
+        contents = wrapper_name + "/Contents" if macos_contents else wrapper_name
         subs["CONTENTS_FOLDER_PATH"] = contents
-        subs["UNLOCALIZED_RESOURCES_FOLDER_PATH"] = contents + "/Resources" if kind == "test" and platform == "macos" else contents
+        subs["UNLOCALIZED_RESOURCES_FOLDER_PATH"] = contents + "/Resources" if macos_contents else contents
         subs["INFOPLIST_PATH"] = contents + "/Info.plist"
-        subs["EXECUTABLE_FOLDER_PATH"] = contents + "/MacOS" if kind == "test" and platform == "macos" else contents
+        subs["EXECUTABLE_FOLDER_PATH"] = contents + "/MacOS" if macos_contents else contents
         subs["EXECUTABLE_PATH"] = subs["EXECUTABLE_FOLDER_PATH"] + "/" + product_name_seed
         subs["FRAMEWORKS_FOLDER_PATH"] = contents + "/Frameworks"
         subs["PLUGINS_FOLDER_PATH"] = contents + "/PlugIns"

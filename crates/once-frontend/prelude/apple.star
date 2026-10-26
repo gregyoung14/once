@@ -4786,6 +4786,16 @@ def _apple_application_impl(ctx):
     if enable_testing:
         swift_flags = list(swift_flags) + ["-enable-testing"]
 
+    is_macos = platform in ["macos", "macosx"]
+    app_dir = product_name + ".app"
+    app_path = ctx["build_dir"] + "/" + app_dir
+    contents_dir = app_dir + "/Contents" if is_macos else app_dir
+    resources_dir = contents_dir + "/Resources" if is_macos else app_dir
+    executable_dir = contents_dir + "/MacOS" if is_macos else app_dir
+    # Legacy flat products leave unsealed files beside the native Contents tree.
+    if is_macos and ctx["capability"] != "run" and host_path_exists(_apple_workspace_absolute(app_path + "/Info.plist")):
+        prepare_path(app_path, kind = "remove", identifier = "apple_application_remove_flat_bundle_" + product_name)
+
     generated_srcs = _apple_run_prebuild_actions(ctx, attrs)
     all_srcs = _unique(glob(ctx["srcs"]) + _apple_declared_source_paths(ctx) + generated_srcs)
     swift_srcs = _filter_swift_sources(all_srcs)
@@ -4841,12 +4851,11 @@ def _apple_application_impl(ctx):
         )
         swift_srcs = swift_srcs + [asset_symbols]
 
-        app_dir = product_name + ".app"
-        asset_car = declare_output(app_dir + "/Assets.car")
+        asset_car = declare_output(resources_dir + "/Assets.car")
         car_partial_plist = declare_output("assets-partial.plist")
         car_argv = [actool["actool_path"]] + asset_catalogs + [
             "--compile",
-            ctx["build_dir"] + "/" + app_dir,
+            ctx["build_dir"] + "/" + resources_dir,
             "--platform",
             actool_platform,
             "--minimum-deployment-target",
@@ -4871,8 +4880,6 @@ def _apple_application_impl(ctx):
     swiftc = _resolve_swiftc(platform, sdk_variant, xcode_developer_dir)
     triple = _apple_triple(platform, target_sdk_version, sdk_variant, arch, False)
 
-    app_dir = product_name + ".app"
-    app_path = ctx["build_dir"] + "/" + app_dir
     if ctx["capability"] == "run":
         if host_os() == "linux":
             fail(ctx["label"]["id"] + ": Linux builds produce an ad-hoc signed application; provision, re-sign, install and launch it with xtool or omarchy-apple-dev's device-run.sh. Simulator execution requires macOS")
@@ -4904,8 +4911,8 @@ def _apple_application_impl(ctx):
             "product_name": product_name,
         }
 
-    executable = declare_output(app_dir + "/" + product_name)
-    info_plist = declare_output(app_dir + "/Info.plist")
+    executable = declare_output(executable_dir + "/" + product_name)
+    info_plist = declare_output(contents_dir + "/Info.plist")
     compile_module_cache = ctx["build_dir"] + "/ModuleCache/Compile"
     testable_module_cache = ctx["build_dir"] + "/ModuleCache/TestableModule"
 
@@ -4971,7 +4978,7 @@ def _apple_application_impl(ctx):
         "-Xlinker",
         "-rpath",
         "-Xlinker",
-        "@executable_path/Frameworks",
+        "@executable_path/../Frameworks" if is_macos else "@executable_path/Frameworks",
         "-o",
         executable,
         # Actions run with a cleared environment, so give the Clang importer an
@@ -5341,13 +5348,18 @@ def _apple_application_impl(ctx):
             "CFBundleSupportedPlatforms": [_apple_supported_platform(swiftc["sdk_name"])],
             "UIDeviceFamily": device_family_codes,
         }
+        if is_macos:
+            plist_entries.pop("MinimumOSVersion")
+            plist_entries["LSMinimumSystemVersion"] = minimum_os
+            bool_entries = {}
+            array_entries.pop("UIDeviceFamily")
         write_path(info_plist, _render_plist(plist_entries, bool_entries, array_entries))
 
     prepackage_outputs = _apple_run_prepackage_actions(ctx, attrs, [executable, info_plist], app_path)
     resource_files = _apple_materialize_resources(
         ctx,
         resources,
-        app_dir,
+        resources_dir,
         platform,
         minimum_os,
         xcode_developer_dir,
@@ -5361,7 +5373,7 @@ def _apple_application_impl(ctx):
     embedded_frameworks = _apple_embed_framework_bundles(
         ctx,
         deps,
-        app_dir,
+        contents_dir,
         "Frameworks",
         codesign,
         "apple_application_embed",
@@ -5369,7 +5381,7 @@ def _apple_application_impl(ctx):
     embedded_resource_bundles = _apple_embed_resource_bundles(
         ctx,
         deps,
-        app_dir,
+        resources_dir,
         codesign,
         "apple_application_embed_resource",
     )
@@ -5377,7 +5389,7 @@ def _apple_application_impl(ctx):
     # Ad-hoc codesign the .app bundle itself. Must run after embedded
     # frameworks land so their signature is included in the bundle's
     # resource envelope.
-    app_cs_stamp = declare_output(app_dir + "/_CodeSignature/CodeResources")
+    app_cs_stamp = declare_output(contents_dir + "/_CodeSignature/CodeResources")
     cs_inputs = [executable, info_plist]
     if asset_car:
         cs_inputs.append(asset_car)
@@ -7661,7 +7673,7 @@ apple_executable = target_kind(
 )
 
 apple_application = target_kind(
-    docs = "Builds an Apple application bundle (`Foo.app`) with the Mach-O executable, embedded frameworks, Info.plist, and ad-hoc codesign.",
+    docs = "Builds an ad-hoc signed Apple application bundle (`Foo.app`). macOS uses Contents/MacOS, Contents/Resources, and Contents/Frameworks; other platforms use a flat bundle. Distribution signing and notarization belong in a separate credential-isolated workflow operating on a copy of the bundle.",
     impl = _apple_application_impl,
     attrs = [
         attr("prepackage_actions", "list<string>", default = "[]", docs = "Ordered serialized scripts run after linking and before resource packaging.", configurable = False),
@@ -7724,6 +7736,12 @@ apple_application = target_kind(
             "apple-application-minimal",
             name = "Minimal iOS application",
             use_when = "You want the smallest viable iOS app target wired into a Once workspace.",
+        ),
+        example(
+            "apple-application-macos",
+            name = "Runnable macOS application",
+            use_when = "You want a native macOS app bundle with resources, ad-hoc signing, and host launch through once run; copy the bundle for separate Developer ID signing and notarization.",
+            platforms = ["macos"],
         ),
         example(
             "apple-application-linux",
