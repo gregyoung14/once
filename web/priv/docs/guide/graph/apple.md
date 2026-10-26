@@ -297,6 +297,107 @@ Apple targets can consume native outputs from other ecosystems through normal
 Add these only after the application builds on its own, then query the
 consumer again to confirm that the dependency contract is satisfied.
 
+## macOS Applications and Distribution
+
+Materialize the macOS starter in an empty directory:
+
+```sh
+once edit materialize-example apple_application apple-application-macos
+once build Hello
+once run Hello
+```
+
+The starter loads a text resource through `Bundle.main`. macOS applications
+use the native `Contents/MacOS`, `Contents/Resources`, and `Contents/Frameworks`
+layout. Framework dependencies automatically receive the
+`@executable_path/../Frameworks` runpath. Declare system frameworks with
+`sdk_frameworks`, not custom linker or SDK search-path scripts.
+
+Existing scripts that assumed a flat macOS bundle must use the new paths.
+Native Xcode script phases receive the corresponding `EXECUTABLE_PATH`,
+`INFOPLIST_PATH`, and `UNLOCALIZED_RESOURCES_FOLDER_PATH` settings. iOS bundle
+paths are unchanged. When an existing generated macOS bundle has a root
+`Info.plist`, Once removes that legacy product before rebuilding so obsolete
+flat files do not invalidate the new bundle's signature.
+
+Versioned prebuilt frameworks retain their symlinks and nested code. Once
+copies and ad-hoc signs the embedded copy, without changing the imported
+framework. Do not add a root `_CodeSignature` directory or signature-forwarding
+symlink: signing captures the complete framework tree, including the version's
+actual signature. `apple_xcframework_import` selects a matching slice from an
+XCFramework. Other archive layouts still require a project module; the built-in
+`archive_download` currently accepts ZIP, not tar archives.
+
+### Keep Release Credentials Outside Cached Builds
+
+`once build` produces an ad-hoc signed bundle for local use. Developer ID
+signing and notarization are separate release steps, not `postbuild_actions`,
+annotated `once exec` scripts, or remotely cached target actions. Keep private
+keys, keychain passwords, provisioning profiles, and notary credentials outside
+the workspace and Once's declared inputs, environment, outputs, and logs.
+
+Build first without release credentials. In a separate release job, copy the
+bundle into a private temporary directory. Import the authorized Developer ID
+Application certificate into an isolated keychain and store notarization
+credentials in a `notarytool` keychain profile. Avoid changing the machine's
+default keychain or search list. Disable shell tracing, delete temporary
+keychains on failure as well as success, and never publish the temporary
+directory as a build artifact.
+
+For the starter, which has no nested code or restricted entitlements, the
+following release script signs and notarizes only its private copy. Supply
+`DEVELOPER_ID_SHA1` as the selected certificate fingerprint, `SIGNING_KEYCHAIN`
+as the isolated keychain path, and `NOTARY_PROFILE` as its credential profile
+name. These selectors are not passwords. The final ZIP is written to a new
+`dist` directory, after notarization and local policy checks succeed:
+
+```sh
+#!/bin/sh
+set -eu
+umask 077
+: "${DEVELOPER_ID_SHA1:?Select a Developer ID Application certificate}"
+: "${SIGNING_KEYCHAIN:?Provide an isolated signing keychain}"
+: "${NOTARY_PROFILE:?Provide a notarytool credential profile}"
+test ! -e dist
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+app="$work/Hello.app"
+ditto .once/out/Hello/Hello.app "$app"
+codesign --force --sign "$DEVELOPER_ID_SHA1" --keychain "$SIGNING_KEYCHAIN" \
+  --options runtime --timestamp "$app"
+codesign --verify --deep --strict "$app"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$work/submission.zip"
+xcrun notarytool submit "$work/submission.zip" --wait \
+  --keychain "$SIGNING_KEYCHAIN" --keychain-profile "$NOTARY_PROFILE" \
+  --output-format json > "$work/notarization.json"
+test "$(plutil -extract status raw -o - "$work/notarization.json")" = Accepted
+xcrun stapler staple "$app"
+xcrun stapler validate "$app"
+codesign --verify --deep --strict "$app"
+spctl --assess --type execute "$app"
+mkdir dist
+ditto -c -k --sequesterRsrc --keepParent "$app" dist/Hello-macos.zip
+```
+
+Run this as an ordinary shell script, outside Once. Its caller owns keychain
+creation and cleanup. Never sign, change a property list, or staple the bundle
+under `.once/out` in place. Create update signatures and checksums from the
+final stapled ZIP, not the submission archive.
+
+For applications with nested helpers, frameworks, XPC services, or extensions,
+sign each nested executable and bundle inside out before the enclosing
+application. Use application-specific entitlements for each component, and do
+not use `codesign --deep` to sign. Apps with restricted capabilities such as
+push notifications must validate the profile's team, application identifier,
+expiration, signing certificate, and authorized entitlements before signing.
+Do not strip these entitlements or replace them with ad-hoc signing to make
+validation pass. The minimal starter script does not implement provisioning or
+nested-code signing. See Apple's [code signing guidance](https://developer.apple.com/library/archive/technotes/tn2206/_index.html)
+and [notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
+for distribution requirements.
+
 ## Supported Target Kinds and Limitations
 
 Use the target kind reference for the contract that matches the artifact:

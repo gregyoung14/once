@@ -28,8 +28,20 @@ unsupported macOS runtime and resolver workflows.
 
 Apple bundle target kinds preserve embedded framework trees, including versioned
 macOS frameworks. Framework signing declares the complete signed tree as its
-output instead of assuming where the signature lives. Dependency resource bundles
-inside macOS test bundles use `Contents/Resources`.
+output instead of assuming where the signature lives. macOS applications expose
+`app_executable` under `Contents/MacOS`, place their property list and signature
+under `Contents`, and embed frameworks under `Contents/Frameworks`. Application
+resources, asset catalogs, and dependency resource bundles use
+`Contents/Resources`, as do dependency resource bundles inside macOS test bundles.
+The `macosx` platform alias uses the same application layout. Native Xcode
+application script settings describe these paths too. iOS application paths
+are unchanged. `app_files` retains the selected platform's paths, so consumers
+should use the provider rather than constructing an executable path.
+An existing generated macOS application with a root `Info.plist` is removed
+before rebuilding, preventing legacy flat files from invalidating its signature.
+The `apple-application-macos` starter is available through target-kind example
+discovery. Builds remain ad-hoc signed; Developer ID signing and notarization
+must operate on a private copy outside the cached graph.
 Resource `.bundle` and `.help` directories retain their complete trees, including
 when discovered inside synchronized Xcode groups. Synchronized groups also
 include CSS, HTML, and JavaScript files as bundle resources. Explicit folder

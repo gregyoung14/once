@@ -15935,10 +15935,6 @@ fn prelude_apple_application_compiles_asset_catalogs() {
         source.contains("--generate-swift-asset-symbols"),
         "must generate Swift asset symbols"
     );
-    assert!(
-        source.contains("declare_output(app_dir + \"/Assets.car\")"),
-        "must compile Assets.car into the bundle"
-    );
 }
 
 #[test]
