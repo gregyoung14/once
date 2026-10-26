@@ -1813,7 +1813,7 @@ def _rust_compile(ctx, crate_type, default_root, output_name, test = False, prov
         presentation = _rust_action_metadata(ctx, target or host_triple, _rust_platform_usage(ctx, target, host_triple, crate_type), crate_type),
         source_files = _action_source_files(srcs),
         argv = argv,
-        inputs = _unique(srcs + dep_inputs + dep_search_inputs + build_inputs + dependency_build_outputs + dependency_build_inputs + linker_script_inputs + (_rust_native_dep_link_inputs(deps) if crate_type != "rlib" else []) + _rust_extra_inputs(ctx)),
+        inputs = _unique(srcs + source_inputs + dep_inputs + dep_search_inputs + build_inputs + dependency_build_outputs + dependency_build_inputs + linker_script_inputs + (_rust_native_dep_link_inputs(deps) if crate_type != "rlib" else []) + _rust_extra_inputs(ctx)),
         outputs = [output],
         env = compile_env,
         cwd = compile_cwd,

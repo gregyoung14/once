@@ -64,4 +64,45 @@ RS
     The stdout should include '"stdout"'
     The stdout should include '"stderr"'
   End
+
+  rebuild_embedded_source() {
+    mkdir -p "$WORKSPACE/src"
+    cat > "$WORKSPACE/once.toml" <<'TOML'
+[[target]]
+name = "embedded"
+kind = "rust_library"
+srcs = ["src/**"]
+
+[target.attrs]
+crate_name = "embedded"
+
+[[target]]
+name = "app"
+kind = "rust_binary"
+srcs = ["main.rs"]
+deps = ["./embedded"]
+
+[target.attrs]
+crate_root = "main.rs"
+TOML
+    cat > "$WORKSPACE/src/lib.rs" <<'RS'
+pub fn message() -> &'static str { include_str!("message.txt") }
+RS
+    printf 'fn main() { print!("{}", embedded::message()); }\n' > "$WORKSPACE/main.rs"
+    printf 'original payload\n' > "$WORKSPACE/src/message.txt"
+    once build app > "$WORKSPACE/first-build.log" 2>&1 || { cat "$WORKSPACE/first-build.log" >&2; return 1; }
+    "$WORKSPACE/.once/out/app/app" || return 1
+    printf 'updated payload\n' > "$WORKSPACE/src/message.txt"
+    once build app > "$WORKSPACE/second-build.log" 2>&1 || { cat "$WORKSPACE/second-build.log" >&2; return 1; }
+    "$WORKSPACE/.once/out/app/app"
+  }
+
+  It 'rebuilds consumers when a non-Rust source embedded by a library changes'
+    Skip if 'Rust toolchain is unavailable' rust_toolchain_unavailable
+
+    When call rebuild_embedded_source
+    The status should be success
+    The line 1 of stdout should equal 'original payload'
+    The line 2 of stdout should equal 'updated payload'
+  End
 End
