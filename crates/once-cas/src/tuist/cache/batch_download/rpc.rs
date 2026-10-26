@@ -36,8 +36,6 @@ impl TuistCache {
             .expect("transfer semaphore remains open");
         let capabilities = self.remote_capabilities().await;
         let channel = self.grpc_channel().await?;
-        let client =
-            ContentAddressableStorageClient::new(channel).max_decoding_message_size(response_limit);
         let mut acceptable_compressors = vec![reapi::compressor::Value::Identity as i32];
         if capabilities.zstd_batches {
             acceptable_compressors.push(reapi::compressor::Value::Zstd as i32);
@@ -49,12 +47,16 @@ impl TuistCache {
             digest_function: SHA256_DIGEST_FUNCTION,
         };
         let response = retry::grpc("get blobs", || {
-            let mut client = client.clone();
+            let channel = channel.clone();
             let request = request.clone();
             async move {
-                match client
-                    .batch_read_blobs(self.authorized_grpc_request(request, "get blobs").await?)
-                    .await
+                match batch_rpc::read(
+                    channel,
+                    self.authorized_grpc_request(request, "get blobs").await?,
+                    response_limit,
+                    self.stream_stall_timeout,
+                )
+                .await
                 {
                     Ok(response) => Ok(Some(response.into_inner())),
                     Err(status) if status.code() == Code::Unimplemented => Ok(None),

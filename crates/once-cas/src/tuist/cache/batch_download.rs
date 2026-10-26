@@ -152,14 +152,24 @@ impl TuistCache {
         });
     }
 
-    async fn download_batch(&self, mut requests: Vec<PendingDownload>, bytes: u64) {
+    async fn download_batch(&self, requests: Vec<PendingDownload>, bytes: u64) {
         let digests = requests
             .iter()
             .map(|request| request.remote.clone())
             .collect::<Vec<_>>();
-        let fetched = tokio::select! {
-            result = self.read_download_batch(digests, bytes) => result,
-            _ = futures::future::join_all(requests.iter_mut().map(|request| request.response.closed())) => return,
+        let mut requests = requests.into_iter().map(Some).collect::<Vec<_>>();
+        let fetched = self.read_download_batch(digests, bytes);
+        tokio::pin!(fetched);
+        let fetched = loop {
+            tokio::select! {
+                result = &mut fetched => break result,
+                index = next_cancelled(&mut requests) => {
+                    requests[index] = None;
+                    if requests.iter().all(Option::is_none) {
+                        return;
+                    }
+                }
+            }
         };
         let batch = match fetched {
             Ok(Some(batch)) => batch,
@@ -167,6 +177,7 @@ impl TuistCache {
                 self.retry_downloads(
                     requests
                         .into_iter()
+                        .flatten()
                         .map(|request| (request, None))
                         .collect(),
                 )
@@ -174,7 +185,7 @@ impl TuistCache {
                 return;
             }
             Err(error) => {
-                for request in requests {
+                for request in requests.into_iter().flatten() {
                     request.complete(Err(status::remote(
                         "get blob",
                         error.kind(),
@@ -192,6 +203,9 @@ impl TuistCache {
             permit,
         } = batch;
         for (request, blob) in requests.into_iter().zip(blobs) {
+            let Some(request) = request else {
+                continue;
+            };
             if request.response.is_closed() {
                 continue;
             }
@@ -218,33 +232,45 @@ impl TuistCache {
     }
 
     async fn retry_downloads(&self, requests: Vec<(PendingDownload, Option<tonic::Status>)>) {
+        // Poll every reader's cancellation; transfer admission still bounds physical I/O.
         stream::iter(requests)
-            .for_each_concurrent(
-                MAX_PARALLEL_TRANSFERS,
-                |(mut request, mut first)| async move {
-                    if request.response.is_closed() {
-                        return;
-                    }
-                    let digest = &request.digest;
-                    let remote = &request.remote;
-                    let result = tokio::select! {
-                        result = retry::grpc("get blob", || {
-                            let first = first.take();
-                            let owner = Arc::clone(&request.owner);
-                            async move {
-                                if let Some(status) = first {
-                                    return Err(status.into());
-                                }
-                                self.stream_remote_blob(digest, remote, owner).await
+            .for_each_concurrent(None, |(mut request, mut first)| async move {
+                if request.response.is_closed() {
+                    return;
+                }
+                let digest = &request.digest;
+                let remote = &request.remote;
+                let result = tokio::select! {
+                    result = retry::grpc("get blob", || {
+                        let first = first.take();
+                        let owner = Arc::clone(&request.owner);
+                        async move {
+                            if let Some(status) = first {
+                                return Err(status.into());
                             }
-                        }) => result,
-                        () = request.response.closed() => return,
-                    };
-                    request.complete(result);
-                },
-            )
+                            self.stream_remote_blob(digest, remote, owner).await
+                        }
+                    }) => result,
+                    () = request.response.closed() => return,
+                };
+                request.complete(result);
+            })
             .await;
     }
+}
+
+async fn next_cancelled(requests: &mut [Option<PendingDownload>]) -> usize {
+    std::future::poll_fn(|context| {
+        for (index, request) in requests.iter_mut().enumerate() {
+            if let Some(request) = request {
+                if request.response.poll_closed(context).is_ready() {
+                    return std::task::Poll::Ready(index);
+                }
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 #[cfg(test)]

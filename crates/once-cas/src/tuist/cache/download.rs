@@ -38,7 +38,7 @@ const _: () = {
     let min = crate::budget::MIN_TRANSFER_MEMORY_BYTES;
     let batch = BATCH_BLOB_LIMIT as u64;
     assert!(METADATA_RESPONSE_LIMIT as u64 <= min);
-    assert!(batch + batch / 64 + FRAMING_SLACK as u64 + batch <= min);
+    assert!(batch + batch / 64 + FRAMING_SLACK as u64 + batch + stream_limits::CODEC_MEMORY <= min);
     assert!(3 * BYTE_STREAM_CHUNK_SIZE as u64 <= min);
     assert!((BYTE_STREAM_MESSAGE_LIMIT + DUPLEX_BUFFER) as u64 == min);
 };
@@ -176,14 +176,12 @@ impl TuistCache {
                 ),
             ));
         }
-        // The encoded response, capped by the client's decoding limit, and the
-        // decoded blob, capped at its declared size. Both limits are derived
-        // from the blob before reserving, and the reservation is exactly them.
+        // Reserve wire and decoded bytes plus bounded codec and message metadata.
         let declared = declared_size(digest, operation)?;
         let response_limit = batch_response_limit(declared);
         let _memory = self
             .budget
-            .reserve_memory(response_limit as u64 + declared)
+            .reserve_memory(response_limit as u64 + declared + stream_limits::CODEC_MEMORY)
             .await?;
         let _permit = self
             .transfer_limit
@@ -192,8 +190,6 @@ impl TuistCache {
             .expect("transfer semaphore remains open");
         let capabilities = self.remote_capabilities().await;
         let channel = self.grpc_channel().await?;
-        let client =
-            ContentAddressableStorageClient::new(channel).max_decoding_message_size(response_limit);
         let mut acceptable_compressors = vec![reapi::compressor::Value::Identity as i32];
         if capabilities.zstd_batches {
             acceptable_compressors.push(reapi::compressor::Value::Zstd as i32);
@@ -205,13 +201,17 @@ impl TuistCache {
             digest_function: SHA256_DIGEST_FUNCTION,
         };
         retry::grpc(operation, || {
-            let mut client = client.clone();
+            let channel = channel.clone();
             let request = request.clone();
             async move {
-                let response = client
-                    .batch_read_blobs(self.authorized_grpc_request(request, operation).await?)
-                    .await?
-                    .into_inner();
+                let response = batch_rpc::read(
+                    channel,
+                    self.authorized_grpc_request(request, operation).await?,
+                    response_limit,
+                    self.stream_stall_timeout,
+                )
+                .await?
+                .into_inner();
                 batch_read_outcome(response, digest, operation)
             }
         })

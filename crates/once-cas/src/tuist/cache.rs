@@ -35,6 +35,7 @@ use crate::transfer::{self, TransferDirection};
 use crate::{ActionCacheHit, ActionResult, Cas, Digest, Error, ErrorKind, Result, TransferBudget};
 
 mod batch_download;
+mod batch_rpc;
 mod download;
 mod stream_limits;
 

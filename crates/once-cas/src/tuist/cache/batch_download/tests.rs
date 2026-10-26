@@ -280,6 +280,76 @@ async fn cancelling_batched_readers_releases_capacity_owners_and_download_flight
 }
 
 #[tokio::test]
+async fn cancelling_one_reader_releases_its_owner_and_flight_while_the_batch_remains_live() {
+    let (_temp, server, cache, bodies) = fixture(2, 0).await;
+    server.0.lock().await.batch_stalls = true;
+    let owners = [Arc::new(()), Arc::new(())];
+    let digests = bodies
+        .iter()
+        .map(|body| Digest::of_bytes(body))
+        .collect::<Vec<_>>();
+    let flights = [
+        cache.download_flights.acquire(digests[0]).await,
+        cache.download_flights.acquire(digests[1]).await,
+    ];
+    let (cancel, registration) = futures::future::AbortHandle::new_pair();
+    let task = {
+        let cache = cache.clone();
+        let owners = owners.clone();
+        let digests = digests.clone();
+        tokio::spawn(async move {
+            let [a, b] = flights;
+            let [owner_a, owner_b] = owners;
+            tokio::join!(
+                futures::future::Abortable::new(
+                    cache.enqueue_download(
+                        digests[0],
+                        sha256_digest(&bodies[0]).unwrap(),
+                        a,
+                        owner_a,
+                        64 * 1024
+                    ),
+                    registration
+                ),
+                cache.enqueue_download(
+                    digests[1],
+                    sha256_digest(&bodies[1]).unwrap(),
+                    b,
+                    owner_b,
+                    64 * 1024
+                ),
+            )
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.calls("batch_read").await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.0.lock().await.batch_requests[0].len(), 2);
+    cancel.abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&owners[0]) != 1 {
+            tokio::task::yield_now().await;
+        }
+        let _flight = cache.download_flights.acquire(digests[0]).await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(Arc::strong_count(&owners[1]), 2);
+    assert!(!task.is_finished());
+    assert_eq!(
+        cache.batch_downloads.slots.available_permits(),
+        MAX_PENDING - 1
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    released(&cache).await;
+}
+
+#[tokio::test]
 async fn cancelling_a_streaming_fallback_releases_its_owner_and_transfer_capacity() {
     let (_temp, server, cache, bodies) = fixture(1, 0).await;
     server
@@ -318,6 +388,95 @@ async fn cancelling_a_streaming_fallback_releases_its_owner_and_transfer_capacit
         .unwrap();
     assert_eq!(cache.local.get_blob(&digest).await.unwrap(), bodies[0]);
     released(&cache).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_fallback_reader_does_not_wait_for_active_transfers() {
+    let count = MAX_PARALLEL_TRANSFERS + 1;
+    let (_temp, server, cache, bodies) = fixture(count, 0).await;
+    for body in &bodies {
+        server.0.lock().await.batch_overrides.insert(
+            sha256_digest(body).unwrap().hash,
+            reply(body, Code::Unavailable),
+        );
+    }
+    server.0.lock().await.read_stalls = true;
+    let owners = (0..count).map(|_| Arc::new(())).collect::<Vec<_>>();
+    let digests = bodies
+        .iter()
+        .map(|body| Digest::of_bytes(body))
+        .collect::<Vec<_>>();
+    let flights = join_all(
+        digests
+            .iter()
+            .map(|digest| cache.download_flights.acquire(*digest)),
+    )
+    .await;
+    let (cancel, registrations): (Vec<_>, Vec<_>) = (0..count)
+        .map(|_| futures::future::AbortHandle::new_pair())
+        .unzip();
+    let task = {
+        let cache = cache.clone();
+        let owners = owners.clone();
+        tokio::spawn(async move {
+            join_all(
+                bodies
+                    .into_iter()
+                    .zip(flights)
+                    .zip(owners)
+                    .zip(registrations)
+                    .map(|(((body, flight), owner), registration)| {
+                        futures::future::Abortable::new(
+                            cache.enqueue_download(
+                                Digest::of_bytes(&body),
+                                sha256_digest(&body).unwrap(),
+                                flight,
+                                owner,
+                                BATCH_BLOB_LIMIT as u64,
+                            ),
+                            registration,
+                        )
+                    }),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.calls("read").await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.0.lock().await.batch_requests[0].len(), count);
+    cancel[count - 1].abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&owners[count - 1]) != 1 {
+            tokio::task::yield_now().await;
+        }
+        let _flight = cache.download_flights.acquire(digests[count - 1]).await;
+    })
+    .await
+    .unwrap();
+    assert!(owners[..count - 1]
+        .iter()
+        .all(|owner| Arc::strong_count(owner) == 2));
+    assert_eq!(
+        cache.batch_downloads.slots.available_permits(),
+        MAX_PENDING - count + 1
+    );
+    assert!(!task.is_finished());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    released(&cache).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owners.iter().any(|owner| Arc::strong_count(owner) != 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cache.batch_downloads.slots.available_permits(), MAX_PENDING);
 }
 
 #[tokio::test]
