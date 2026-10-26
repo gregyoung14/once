@@ -81,7 +81,24 @@ pub(crate) fn decode_file<T>(
     stop: &AtomicBool,
     copy: impl FnOnce(&mut dyn Read, &mut dyn io::Write) -> io::Result<T>,
 ) -> io::Result<T> {
-    let mut input = File::open(stored_path)?;
+    decode_open_file(
+        File::open(stored_path)?,
+        output_path,
+        expected,
+        stop,
+        true,
+        copy,
+    )
+}
+
+pub(crate) fn decode_open_file<T>(
+    mut input: File,
+    output_path: &Path,
+    expected: &Digest,
+    stop: &AtomicBool,
+    durable: bool,
+    copy: impl FnOnce(&mut dyn Read, &mut dyn io::Write) -> io::Result<T>,
+) -> io::Result<T> {
     let mut header = vec![0_u8; ZSTD_BLOB_HEADER_LEN];
     let mut header_len = 0;
     while header_len < header.len() {
@@ -132,7 +149,9 @@ pub(crate) fn decode_file<T>(
             "zstd blob decoded size mismatch",
         ));
     }
-    output.as_file().sync_all()?;
+    if durable {
+        output.as_file().sync_all()?;
+    }
     if stop.load(Ordering::Acquire) {
         return Err(cancelled());
     }
