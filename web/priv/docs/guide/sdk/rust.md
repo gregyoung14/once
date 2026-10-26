@@ -96,11 +96,15 @@ that ownership to a `StagedBlobReader` implementing synchronous `Read` and
 `Seek`. Neither type exposes a mutable file handle or storage path. Dropping
 the lease or its reader removes temporary storage.
 
-Raw immutable blobs can be pinned without copying on compatible filesystems.
-All staged blobs are verified before a reader is returned, including pinned raw
-files. Compressed blobs and filesystems without hardlink support use bounded
-decoding. Corrupt local content is removed; a remote provider refetches it once
-before returning a staging failure.
+Raw immutable blobs can be pinned with a read-only file handle without creating
+temporary files or requiring hardlink support. Open pins have a process-wide
+budget: excess leases use bounded copying rather than waiting for earlier
+leases to close. Compressed blobs also use private temporary storage and open
+their reader only when requested. All staged blobs are verified before a reader
+is returned, including pinned raw files. Ephemeral decoded staging does not
+require a durability sync; persistent cache writes and mutable file copies
+retain their durability checks. Corrupt local content is removed; a remote
+provider refetches it once before returning a staging failure.
 A successful lease remains readable if the cache subsequently removes the
 original blob. Ordinary `get_blob_to_file` and `copy_blob_to_file` destinations
 remain independent, mutable copies.
