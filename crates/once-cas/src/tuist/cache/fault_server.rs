@@ -29,6 +29,10 @@ pub(super) struct State {
     pub(super) read_replacement: Option<Vec<u8>>,
     /// Byte stream reads send their first chunk and then never finish.
     pub(super) read_stalls: bool,
+    pub(super) batch_requests: Vec<Vec<reapi::Digest>>,
+    pub(super) batch_overrides: HashMap<String, reapi::batch_read_blobs_response::Response>,
+    pub(super) batch_stalls: bool,
+    pub(super) batch_duplicate_response: bool,
 }
 
 #[derive(Clone, Default)]
@@ -167,12 +171,20 @@ impl ContentAddressableStorage for FaultServer {
         request: Request<reapi::BatchReadBlobsRequest>,
     ) -> RpcResult<reapi::BatchReadBlobsResponse> {
         self.enter("batch_read").await?;
-        let state = self.0.lock().await;
-        let responses = request
-            .into_inner()
-            .digests
+        let mut state = self.0.lock().await;
+        let digests = request.into_inner().digests;
+        state.batch_requests.push(digests.clone());
+        if state.batch_stalls {
+            drop(state);
+            return std::future::pending().await;
+        }
+        let mut responses = digests
             .into_iter()
+            .rev()
             .map(|digest| {
+                if let Some(response) = state.batch_overrides.get(&digest.hash) {
+                    return response.clone();
+                }
                 let found = state.blobs.get(&digest.hash).cloned();
                 reapi::batch_read_blobs_response::Response {
                     digest: Some(digest),
@@ -187,7 +199,10 @@ impl ContentAddressableStorage for FaultServer {
                     compressor: reapi::compressor::Value::Identity as i32,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if state.batch_duplicate_response {
+            responses.push(responses[0].clone());
+        }
         Ok(Response::new(reapi::BatchReadBlobsResponse { responses }))
     }
 

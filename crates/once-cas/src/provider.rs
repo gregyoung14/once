@@ -25,6 +25,18 @@ pub enum CacheProvider {
     Tuist(TuistCache),
 }
 
+/// An action result and the availability established by this lookup.
+#[derive(Debug)]
+pub struct ActionCacheHit {
+    /// The cached result, without changing its serialized representation.
+    pub result: ActionResult,
+    /// All referenced blobs were available when this lookup completed.
+    ///
+    /// Persisted local records do not establish this. Even when true, a
+    /// restore must verify content and recover from subsequent eviction.
+    pub blobs_available: bool,
+}
+
 impl CacheProvider {
     /// Open a purely local store rooted at `root`.
     pub fn open_local(root: impl Into<PathBuf>) -> Self {
@@ -289,9 +301,26 @@ impl CacheProvider {
     /// error; use [`Error::kind`](crate::Error::kind) to tell them apart. A
     /// local record that fails to decode is reported as corrupt.
     pub async fn get_action_result(&self, action: &Digest) -> Result<Option<ActionResult>> {
+        Ok(self
+            .lookup_action_result(action)
+            .await?
+            .map(|hit| hit.result))
+    }
+
+    /// Look up an action result, retaining any provider-side availability check
+    /// so execution does not have to repeat it once per referenced blob.
+    pub async fn lookup_action_result(&self, action: &Digest) -> Result<Option<ActionCacheHit>> {
         match self {
-            Self::Local(cas) => cas.get_action_result(action).await,
-            Self::Tuist(cache) => cache.get_action_result(action).await,
+            Self::Local(cas) => {
+                Ok(cas
+                    .get_action_result(action)
+                    .await?
+                    .map(|result| ActionCacheHit {
+                        result,
+                        blobs_available: false,
+                    }))
+            }
+            Self::Tuist(cache) => cache.lookup_action_result(action).await,
         }
     }
 

@@ -25,7 +25,7 @@ const DUPLEX_BUFFER: usize = crate::budget::STREAM_PIPE_BYTES as usize;
 
 /// Largest `BatchReadBlobs` response accepted for one blob of `declared`
 /// bytes, allowing for a zstd frame that is slightly larger than its input.
-fn batch_response_limit(declared: u64) -> usize {
+pub(super) fn batch_response_limit(declared: u64) -> usize {
     let declared = usize::try_from(declared).unwrap_or(usize::MAX);
     declared
         .saturating_add(declared / 64)
@@ -226,14 +226,25 @@ fn batch_read_outcome(
     digest: &reapi::Digest,
     operation: &'static str,
 ) -> std::result::Result<Option<Vec<u8>>, retry::Failure> {
-    let Some(blob) = response.responses.into_iter().next() else {
+    let [blob]: [_; 1] = response.responses.try_into().map_err(|_| {
+        status::remote(operation, ErrorKind::Protocol, "expected one blob response")
+    })?;
+    blob_read_outcome(blob, digest, operation)
+}
+
+pub(super) fn blob_read_outcome(
+    blob: reapi::batch_read_blobs_response::Response,
+    digest: &reapi::Digest,
+    operation: &'static str,
+) -> std::result::Result<Option<Vec<u8>>, retry::Failure> {
+    if blob.digest.as_ref() != Some(digest) {
         return Err(status::remote(
             operation,
             ErrorKind::Protocol,
-            "Kura returned no blob response",
+            "unexpected blob response digest",
         )
         .into());
-    };
+    }
     let Some(rpc) = blob.status.as_ref().filter(|s| s.code != REAPI_STATUS_OK) else {
         return Ok(Some(decode_reapi_blob(
             blob.data,

@@ -35,7 +35,7 @@ pub use digest::Digest;
 pub use error::{Error, ErrorKind, Result};
 pub use gc::GcReport;
 pub use model::{ActionResult, Stats};
-pub use provider::CacheProvider;
+pub use provider::{ActionCacheHit, CacheProvider};
 pub use store::{Cas, StagedBlob, StagedBlobReader};
 pub use tuist::{
     ProjectCreateError, RemoteProject, TuistAuth, TuistAuthPrompt, TuistCacheConfig, TuistProjects,
