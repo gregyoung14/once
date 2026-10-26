@@ -132,6 +132,28 @@ async fn an_entry_whose_blobs_are_confirmed_evicted_is_a_miss() {
 }
 
 #[tokio::test]
+async fn availability_belongs_to_the_lookup_not_the_persisted_action_record() {
+    let (_temp, server, _url, published, reader) = setup().await;
+    let provider = crate::CacheProvider::Tuist(reader);
+    let remote = provider
+        .lookup_action_result(&published.action)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(remote.blobs_available);
+    assert_eq!(remote.result, published.result);
+    server.evict_all_blobs().await;
+    let local = provider
+        .lookup_action_result(&published.action)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!local.blobs_available);
+    assert_eq!(local.result, published.result);
+    assert!(!provider.has_blob(&published.output).await.unwrap());
+}
+
+#[tokio::test]
 async fn an_entry_whose_blob_check_cannot_complete_is_an_error() {
     let (_temp, server, _url, published, reader) = setup().await;
     server

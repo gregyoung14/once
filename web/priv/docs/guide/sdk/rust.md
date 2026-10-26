@@ -96,11 +96,15 @@ that ownership to a `StagedBlobReader` implementing synchronous `Read` and
 `Seek`. Neither type exposes a mutable file handle or storage path. Dropping
 the lease or its reader removes temporary storage.
 
-Raw immutable blobs can be pinned without copying on compatible filesystems.
-All staged blobs are verified before a reader is returned, including pinned raw
-files. Compressed blobs and filesystems without hardlink support use bounded
-decoding. Corrupt local content is removed; a remote provider refetches it once
-before returning a staging failure.
+Raw immutable blobs can be pinned with a read-only file handle without creating
+temporary files or requiring hardlink support. Open pins have a process-wide
+budget: excess leases use bounded copying rather than waiting for earlier
+leases to close. Compressed blobs also use private temporary storage and open
+their reader only when requested. All staged blobs are verified before a reader
+is returned, including pinned raw files. Ephemeral decoded staging does not
+require a durability sync; persistent cache writes and mutable file copies
+retain their durability checks. Corrupt local content is removed; a remote
+provider refetches it once before returning a staging failure.
 A successful lease remains readable if the cache subsequently removes the
 original blob. Ordinary `get_blob_to_file` and `copy_blob_to_file` destinations
 remain independent, mutable copies.
@@ -113,6 +117,17 @@ The completed lease does not retain the guard. A cancelled operation can drop
 the guard on a blocking worker thread after the calling future has been dropped.
 The existing cache selection, remote retrieval and publication defaults are
 unchanged. These APIs do not execute actions or create runtime sessions.
+
+When a caller already knows a collection of required digests,
+`cache.provider().prefetch_blobs(&digests).await` fetches missing remote content
+into the local tier before staging. It submits bounded, deduplicated windows
+and packs small blobs into size-limited requests; large blobs still stream.
+A local-only provider does nothing. Prefetch does not pin content or verify
+existing local copies, so reads and staging still verify and recover from
+eviction or corruption. `prefetch_blobs_guarded(&digests, guard)` retains a
+`Send + 'static` owner through active ingestion if the caller is cancelled.
+All transfers share the provider's existing memory, staging and concurrency
+budgets, and persistent CAS writes retain their durability guarantees.
 
 ### Owned Blob Producers
 

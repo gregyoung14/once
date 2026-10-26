@@ -355,7 +355,8 @@ async fn lookup_cached_available(
     key: &Digest,
     resources: Option<&ExecutorResources>,
 ) -> Result<Option<Outcome>> {
-    if let Some(result) = cache.get_action_result(key).await? {
+    if let Some(hit) = cache.lookup_action_result(key).await? {
+        let result = hit.result;
         // A partially-evicted or partially-synced entry can have its
         // action result present while a blob it points at is gone. The
         // captured stdout/stderr blobs are not restored to the workspace
@@ -363,7 +364,7 @@ async fn lookup_cached_available(
         // so a "hit" that references a missing stream blob would crash
         // them. Verify those blobs exist before reporting a hit, and if
         // either is gone treat the entry as absent and re-execute.
-        if !stream_blobs_present(&result, cache).await? {
+        if !hit.blobs_available && !stream_blobs_present(&result, cache).await? {
             warn!("cached action is missing a captured stdout/stderr blob; re-executing");
             return Ok(None);
         }

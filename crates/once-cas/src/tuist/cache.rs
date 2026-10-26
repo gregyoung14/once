@@ -32,8 +32,10 @@ use super::{
     TuistCacheConfig, ENDPOINTS_PATH, PROVIDER_NAME,
 };
 use crate::transfer::{self, TransferDirection};
-use crate::{ActionResult, Cas, Digest, Error, ErrorKind, Result, TransferBudget};
+use crate::{ActionCacheHit, ActionResult, Cas, Digest, Error, ErrorKind, Result, TransferBudget};
 
+mod batch_download;
+mod batch_rpc;
 mod download;
 mod stream_limits;
 
@@ -100,6 +102,7 @@ pub struct TuistCache {
     known_remote_blobs: Arc<Mutex<HashMap<Digest, reapi::Digest>>>,
     publication_flights: Arc<Flights>,
     download_flights: Arc<Flights>,
+    batch_downloads: Arc<batch_download::BatchDownloads>,
     transfer_limit: Arc<Semaphore>,
     budget: TransferBudget,
     auth: TuistAuth,
@@ -120,6 +123,7 @@ struct GrpcChannels {
 struct RemoteCapabilities {
     zstd_streams: bool,
     zstd_batches: bool,
+    batch_read_limit: Option<u64>,
 }
 
 impl TuistCache {
@@ -153,6 +157,7 @@ impl TuistCache {
             known_remote_blobs: Arc::new(Mutex::new(HashMap::new())),
             publication_flights: Arc::new(Flights::default()),
             download_flights: Arc::new(Flights::default()),
+            batch_downloads: Arc::default(),
             transfer_limit: Arc::new(Semaphore::new(MAX_PARALLEL_TRANSFERS)),
             budget: TransferBudget::default(),
             auth,
@@ -168,6 +173,7 @@ impl TuistCache {
     /// Draw remote transfers from `budget` instead of this cache's own.
     pub fn set_transfer_budget(&mut self, budget: TransferBudget) {
         self.budget = budget;
+        self.batch_downloads = Arc::default();
     }
 
     pub fn transfer_budget(&self) -> &TransferBudget {
@@ -275,11 +281,19 @@ impl TuistCache {
             self.local.mirror_blob(digest, &[]).await?;
             return Ok(());
         }
-        let _flight = self.download_flights.acquire(*digest).await;
+        let flight = self.download_flights.acquire(*digest).await;
         if self.local.has_blob(digest).await? {
             return Ok(());
         }
         let remote_digest = self.remote_blob_digest(digest).await?;
+        if let Some(limit) = self.batch_download_limit().await {
+            if u64::try_from(remote_digest.size_bytes).is_ok_and(|size| size <= limit) {
+                return self
+                    .enqueue_download(*digest, remote_digest, flight, guard, limit)
+                    .await;
+            }
+        }
+        let _flight = flight;
         let started = Instant::now();
         retry::grpc("get blob", || {
             self.stream_remote_blob(digest, &remote_digest, guard.clone())
@@ -332,9 +346,22 @@ impl TuistCache {
     /// references is confirmed gone. Outages, refusals, and malformed entries
     /// are errors.
     pub async fn get_action_result(&self, action: &Digest) -> Result<Option<ActionResult>> {
+        Ok(self
+            .lookup_action_result(action)
+            .await?
+            .map(|hit| hit.result))
+    }
+
+    pub(crate) async fn lookup_action_result(
+        &self,
+        action: &Digest,
+    ) -> Result<Option<ActionCacheHit>> {
         if let Some(result) = self.local.get_action_result(action).await? {
             tracing::debug!(action_digest = %action, tier = "local", "action cache hit");
-            return Ok(Some(result));
+            return Ok(Some(ActionCacheHit {
+                result,
+                blobs_available: false,
+            }));
         }
 
         let Some(result) = self.get_action_result_remote(action).await? else {
@@ -348,7 +375,10 @@ impl TuistCache {
                 "failed to persist remote action result locally"
             );
         }
-        Ok(Some(result))
+        Ok(Some(ActionCacheHit {
+            result,
+            blobs_available: true,
+        }))
     }
 
     pub async fn put_action_result(&self, action: &Digest, result: &ActionResult) -> Result<()> {
@@ -1088,6 +1118,7 @@ impl TuistCache {
             zstd_batches: capabilities
                 .supported_batch_update_compressors
                 .contains(&zstd),
+            batch_read_limit: u64::try_from(capabilities.max_batch_total_size_bytes).ok(),
         })
     }
 
@@ -1832,7 +1863,7 @@ fn decode_reapi_blob(
             let limit = u64::try_from(expected)
                 .unwrap_or(u64::MAX)
                 .saturating_add(1);
-            let decompressor =
+            let mut decompressor =
                 zstd::stream::read::Decoder::new(data.as_slice()).map_err(|source| {
                     status::remote(
                         operation,
@@ -1840,6 +1871,13 @@ fn decode_reapi_blob(
                         format!("opening compressed blob: {source}"),
                     )
                 })?;
+            decompressor.window_log_max(23).map_err(|source| {
+                status::remote(
+                    operation,
+                    ErrorKind::Corrupt,
+                    format!("limiting compressed blob window: {source}"),
+                )
+            })?;
             let mut uncompressed = Vec::with_capacity(expected.min(BYTE_STREAM_MESSAGE_LIMIT));
             decompressor
                 .take(limit)

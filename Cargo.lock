@@ -3695,6 +3695,7 @@ dependencies = [
  "blake3",
  "futures",
  "hex",
+ "http-body",
  "prost",
  "reqwest 0.13.5",
  "schlussel",

@@ -9,23 +9,8 @@ async fn staged_raw_storage_is_pinned_and_reader_owns_its_lease() {
     let payload = b"immutable raw payload";
     let digest = cas.put_blob(payload).await.unwrap();
     let lease = cas.stage_blob(&digest, &parent).await.unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        assert_eq!(
-            std::fs::metadata(&lease.path).unwrap().ino(),
-            std::fs::metadata(cas.blob_path(&digest)).unwrap().ino()
-        );
-        assert_eq!(
-            std::fs::metadata(lease.directory.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-    }
     std::fs::remove_file(cas.blob_path(&digest)).unwrap();
+    std::fs::write(cas.blob_path(&digest), b"replacement inode").unwrap();
     let mut reader = lease.into_reader().unwrap();
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).unwrap();
@@ -34,8 +19,37 @@ async fn staged_raw_storage_is_pinned_and_reader_owns_its_lease() {
     bytes.clear();
     reader.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, payload);
-    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
     drop(reader);
+    assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn many_retained_leases_spill_without_waiting_for_open_file_pins() {
+    let temp = tempfile::tempdir().unwrap();
+    let cas = Cas::open(temp.path().join("cas"));
+    let parent = temp.path().join("staging");
+    std::fs::create_dir(&parent).unwrap();
+    let payload = b"retained raw blob";
+    let digest = cas.put_blob(payload).await.unwrap();
+    let mut leases = Vec::new();
+    for _ in 0..MAX_RAW_PINS + 5 {
+        leases.push(cas.stage_blob(&digest, &parent).await.unwrap());
+    }
+    assert!(
+        leases
+            .iter()
+            .filter(|lease| matches!(lease.backing, Backing::Raw(_, _)))
+            .count()
+            <= MAX_RAW_PINS
+    );
+    assert!(std::fs::read_dir(&parent).unwrap().count() >= 5);
+    std::fs::remove_file(cas.blob_path(&digest)).unwrap();
+    for lease in leases {
+        let mut reader = lease.into_reader().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, payload);
+    }
     assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
 }
 
@@ -57,6 +71,7 @@ async fn staged_decoding_covers_compression_literal_magic_empty_and_corruption()
             .unwrap()
             .into_reader()
             .unwrap();
+        std::fs::remove_file(cas.blob_path(&digest)).unwrap();
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, payload);
@@ -109,71 +124,57 @@ async fn decode_write_and_publication_failures_remove_every_lease() {
     let parent = temp.path().join("staging");
     std::fs::create_dir(&parent).unwrap();
     let failed = cas
-        .stage_blob_with(&digest, &parent, (), link_source, |reader, writer| {
-            io::copy(&mut reader.take(1024), writer)?;
-            Err(io::Error::other("injected copy failure"))
-        })
+        .stage_blob_with(
+            &digest,
+            &parent,
+            (),
+            |path| std::fs::File::open(path),
+            |reader, writer| {
+                io::copy(&mut reader.take(1024), writer)?;
+                Err(io::Error::other("injected copy failure"))
+            },
+        )
         .await;
     assert!(failed.is_err());
     assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
     let owned_parent = parent.clone();
     let failed = cas
-        .stage_blob_with(&digest, &parent, (), link_source, move |reader, writer| {
-            let mut reader = io::BufReader::with_capacity(512 * 1024, reader);
-            io::copy(&mut reader, writer)?;
-            let directory = std::fs::read_dir(owned_parent)?.next().unwrap()?.path();
-            std::fs::create_dir(directory.join("decoded"))
-        })
+        .stage_blob_with(
+            &digest,
+            &parent,
+            (),
+            |path| std::fs::File::open(path),
+            move |reader, writer| {
+                let mut reader = io::BufReader::with_capacity(512 * 1024, reader);
+                io::copy(&mut reader, writer)?;
+                let directory = std::fs::read_dir(owned_parent)?.next().unwrap()?.path();
+                std::fs::create_dir(directory.join("decoded"))
+            },
+        )
         .await;
     assert!(failed.is_err());
     assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
 }
 
 #[tokio::test]
-async fn unsupported_links_fall_back_to_independent_bounded_decoding() {
-    let temp = tempfile::tempdir().unwrap();
-    let cas = Cas::open(temp.path().join("cas"));
-    let parent = temp.path().join("staging");
-    std::fs::create_dir(&parent).unwrap();
-    for payload in [b"raw".to_vec(), vec![b'x'; 1024 * 1024]] {
-        let digest = cas.put_blob(&payload).await.unwrap();
-        let lease = cas
-            .stage_blob_with(
-                &digest,
-                &parent,
-                (),
-                |_, _| Err(io::Error::other("links unsupported")),
-                |reader, writer| {
-                    let mut reader = io::BufReader::with_capacity(512 * 1024, reader);
-                    io::copy(&mut reader, writer).map(|_| ())
-                },
-            )
-            .await
-            .unwrap();
-        std::fs::remove_file(cas.blob_path(&digest)).unwrap();
-        let mut reader = lease.into_reader().unwrap();
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, payload);
-        drop(reader);
-        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
-    }
-}
-
-#[tokio::test]
 async fn representation_is_classified_on_the_pinned_inode_after_republication() {
-    fn replacing_link(source: &Path, destination: &Path) -> io::Result<()> {
-        link_source(source, destination)?;
+    fn replacing_open(source: &Path) -> io::Result<std::fs::File> {
+        let file = std::fs::File::open(source)?;
         std::fs::remove_file(source)?;
-        std::fs::write(source, blob::ZSTD_BLOB_MAGIC)
+        std::fs::write(source, blob::ZSTD_BLOB_MAGIC)?;
+        Ok(file)
     }
     let temp = tempfile::tempdir().unwrap();
     let cas = Cas::open(temp.path().join("cas"));
     let digest = cas.put_blob(b"original raw").await.unwrap();
     let lease = cas
-        .stage_blob_with(&digest, temp.path(), (), replacing_link, |_, _| {
-            panic!("the pinned raw blob does not need decoding")
-        })
+        .stage_blob_with(
+            &digest,
+            temp.path(),
+            (),
+            replacing_open,
+            |reader, writer| io::copy(reader, writer).map(|_| ()),
+        )
         .await
         .unwrap();
     let mut reader = lease.into_reader().unwrap();
@@ -205,7 +206,7 @@ async fn cancellation_retains_decoder_owner_and_private_lease_until_worker_finis
             &digest,
             &task_parent,
             (parent_owner, Guard(marker)),
-            link_source,
+            |path| std::fs::File::open(path),
             move |reader, writer| {
                 let mut reader = io::BufReader::with_capacity(512 * 1024, reader);
                 io::copy(&mut reader, writer)?;

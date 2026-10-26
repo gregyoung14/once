@@ -68,6 +68,10 @@ where
     }
 }
 
+pub(crate) fn current_observer() -> Option<Arc<dyn TransferObserver>> {
+    OBSERVER.try_with(Arc::clone).ok()
+}
+
 pub(crate) fn record(
     direction: TransferDirection,
     digest: Digest,

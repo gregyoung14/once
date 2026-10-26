@@ -5,13 +5,22 @@ use std::sync::Arc;
 use super::Cas;
 use crate::{blob, Digest, Error, Result};
 
+const MAX_RAW_PINS: usize = 64;
+// Prefetch can retain many completed leases, so excess pins spill rather than wait.
+static RAW_PINS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_RAW_PINS);
+
 /// An owned, read-only staging lease for a decoded blob.
 ///
 /// Raw storage may be pinned without copying. No mutable file handle or path is
 /// exposed, and dropping the lease removes its temporary storage.
 pub struct StagedBlob {
-    directory: Arc<tempfile::TempDir>,
-    path: PathBuf,
+    backing: Backing,
+    directory: Option<tempfile::TempDir>,
+}
+
+enum Backing {
+    Raw(std::fs::File, tokio::sync::SemaphorePermit<'static>),
+    Temporary(PathBuf),
 }
 
 impl std::fmt::Debug for StagedBlob {
@@ -23,18 +32,27 @@ impl std::fmt::Debug for StagedBlob {
 impl StagedBlob {
     /// Open a bounded-memory reader, retaining the lease until it is dropped.
     pub fn into_reader(self) -> Result<StagedBlobReader> {
-        let file = std::fs::File::open(&self.path).map_err(|source| Error::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(StagedBlobReader { file, _lease: self })
+        let (file, pin) = match self.backing {
+            Backing::Raw(file, pin) => (file, Some(pin)),
+            Backing::Temporary(path) => {
+                let file =
+                    std::fs::File::open(&path).map_err(|source| Error::Io { path, source })?;
+                (file, None)
+            }
+        };
+        Ok(StagedBlobReader {
+            file,
+            _directory: self.directory,
+            _pin: pin,
+        })
     }
 }
 
 /// Read and seek within a staged blob without exposing mutable storage access.
 pub struct StagedBlobReader {
     file: std::fs::File,
-    _lease: StagedBlob,
+    _directory: Option<tempfile::TempDir>,
+    _pin: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
 impl Read for StagedBlobReader {
@@ -52,7 +70,7 @@ impl Seek for StagedBlobReader {
 impl Cas {
     /// Stage a blob for read-only access under `parent`.
     ///
-    /// Uses bounded decoding when raw storage cannot be pinned on this filesystem.
+    /// Pins raw storage with a read-only handle and decodes compressed storage.
     pub async fn stage_blob(&self, digest: &Digest, parent: &Path) -> Result<StagedBlob> {
         self.stage_blob_guarded(digest, parent, ()).await
     }
@@ -67,10 +85,16 @@ impl Cas {
         parent: &Path,
         guard: G,
     ) -> Result<StagedBlob> {
-        self.stage_blob_with(digest, parent, guard, link_source, |reader, writer| {
-            let mut reader = io::BufReader::with_capacity(512 * 1024, reader);
-            io::copy(&mut reader, writer).map(|_| ())
-        })
+        self.stage_blob_with(
+            digest,
+            parent,
+            guard,
+            |path| std::fs::File::open(path),
+            |reader, writer| {
+                let mut reader = io::BufReader::with_capacity(512 * 1024, reader);
+                io::copy(&mut reader, writer).map(|_| ())
+            },
+        )
         .await
     }
 
@@ -79,52 +103,26 @@ impl Cas {
         digest: &Digest,
         parent: &Path,
         guard: G,
-        link: fn(&Path, &Path) -> io::Result<()>,
+        open: fn(&Path) -> io::Result<std::fs::File>,
         copy: impl FnOnce(&mut dyn Read, &mut dyn io::Write) -> io::Result<()> + Send + 'static,
     ) -> Result<StagedBlob> {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(".once-blob-");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(std::fs::Permissions::from_mode(0o700));
-        }
-        let directory = Arc::new(builder.tempdir_in(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?);
         let expected = *digest;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _stop = blob::StopOnDrop(Arc::clone(&stop));
         let original = self.blob_path(digest);
-        let linked = directory.path().join("stored");
-        let pinned = match link(&original, &linked) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(Error::BlobNotFound(*digest));
-            }
-            Err(_) => false,
-        };
-        let source = if pinned { linked } else { original };
-        if pinned {
-            let file = std::fs::File::open(&source).map_err(|source_error| Error::Io {
-                path: source.clone(),
-                source: source_error,
-            })?;
+        let error_path = original.clone();
+        let parent = parent.to_path_buf();
+        let staged = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let mut file = open(&original)?;
             let mut prefix = Vec::with_capacity(blob::ZSTD_BLOB_MAGIC.len());
-            file.take(u64::try_from(blob::ZSTD_BLOB_MAGIC.len()).unwrap_or(u64::MAX))
-                .read_to_end(&mut prefix)
-                .map_err(|source_error| Error::Io {
-                    path: source.clone(),
-                    source: source_error,
-                })?;
+            (&mut file)
+                .take(blob::ZSTD_BLOB_MAGIC.len() as u64)
+                .read_to_end(&mut prefix)?;
+            file.rewind()?;
             if prefix != blob::ZSTD_BLOB_MAGIC {
-                let path = source.clone();
-                let owner = Arc::clone(&directory);
-                let checked = tokio::task::spawn_blocking(move || {
-                    let _owners = (owner, guard);
-                    let file = std::fs::File::open(&path)?;
-                    let actual = Digest::of_reader(std::io::BufReader::new(file))?;
+                if let Ok(pin) = RAW_PINS.try_acquire() {
+                    let actual = Digest::of_reader(io::BufReader::new(&mut file))?;
                     crate::integrity::verify(&expected, &actual)?;
                     if stop.load(std::sync::atomic::Ordering::Acquire) {
                         return Err(io::Error::new(
@@ -132,59 +130,50 @@ impl Cas {
                             "blob staging was cancelled",
                         ));
                     }
-                    Ok::<_, io::Error>(())
-                })
-                .await
-                .map_err(|error| Error::Io {
-                    path: source.clone(),
-                    source: io::Error::other(error.to_string()),
-                })?;
-                if let Err(source_error) = checked {
-                    if crate::integrity::CorruptBlob::is(&source_error) {
-                        self.quarantine(digest, &self.blob_path(digest)).await;
-                    }
-                    return Err(Error::Io {
-                        path: source,
-                        source: source_error,
+                    file.rewind()?;
+                    return Ok(StagedBlob {
+                        backing: Backing::Raw(file, pin),
+                        directory: None,
                     });
                 }
-                return Ok(StagedBlob {
-                    directory,
-                    path: source,
-                });
             }
-        }
-        let destination = directory.path().join("decoded");
-        let error_path = destination.clone();
-        let lease = StagedBlob {
-            directory,
-            path: destination.clone(),
-        };
-        let owner = Arc::clone(&lease.directory);
-        let decoded = tokio::task::spawn_blocking(move || {
-            let _owners = (owner, guard);
-            blob::decode_file(&source, &destination, &expected, &stop, copy)
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".once-blob-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let directory = builder.tempdir_in(parent)?;
+            let destination = directory.path().join("decoded");
+            blob::decode_open_file(file, &destination, &expected, &stop, false, copy)?;
+            Ok(StagedBlob {
+                backing: Backing::Temporary(destination),
+                directory: Some(directory),
+            })
         })
         .await
         .map_err(|source| Error::Io {
             path: error_path.clone(),
             source: io::Error::other(source.to_string()),
         })?;
-        if let Err(source) = decoded {
-            if crate::integrity::CorruptBlob::is(&source) {
-                self.quarantine(digest, &self.blob_path(digest)).await;
+        match staged {
+            Ok(lease) => Ok(lease),
+            Err(source) => {
+                if crate::integrity::CorruptBlob::is(&source) {
+                    self.quarantine(digest, &self.blob_path(digest)).await;
+                }
+                if source.kind() == io::ErrorKind::NotFound {
+                    Err(Error::BlobNotFound(*digest))
+                } else {
+                    Err(Error::Io {
+                        path: error_path,
+                        source,
+                    })
+                }
             }
-            return Err(Error::Io {
-                path: error_path,
-                source,
-            });
         }
-        Ok(lease)
     }
-}
-
-fn link_source(source: &Path, destination: &Path) -> io::Result<()> {
-    std::fs::hard_link(source, destination)
 }
 
 #[cfg(test)]

@@ -577,6 +577,11 @@ The implementation returns a dictionary of provider fields. Downstream
 target kinds should read provider fields from `ctx["deps"]` or
 `ctx["deps_by_role"]` instead of inspecting target identities.
 
+Rust target kinds declare every file matched by `srcs` as a compiler action
+input, including non-Rust files embedded at compile time. `compile_data` adds
+compile-time files outside those source patterns. Source-file presentation
+remains limited to Rust sources.
+
 A resolver or implementation reports an actionable failure by calling `fail` with the text
 `once.diagnostic.v1 ` followed by one JSON object holding `code`, `message`,
 and optionally `attribute` and `repairs`. The engine attaches the target and
@@ -1369,7 +1374,7 @@ export falls back to a whole-target batch when that binding is absent or stale.
 Filtered execution never refreshes complete discovery. Workers validate the
 exported inventory and full batch partition before selecting assigned IDs;
 file fixtures cannot be subdivided through portable replay. See the
-[portable execution contract](/guide/graph/testing#distribute-portable-batches-to-ci-workers).
+[portable execution contract](/guide/graph/testing#replay-saved-plans-on-ci-workers).
 
 The adapter writes [JavaScript Object Notation](https://www.json.org/json-en.html)
 results below the target test directory. When `ctx["test"]["batch_id"]` is

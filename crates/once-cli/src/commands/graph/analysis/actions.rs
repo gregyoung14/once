@@ -1225,16 +1225,18 @@ async fn probe_cached_action(
         )
     };
     let cached: once_cas::Result<_> = async {
-        let Some(result) = context.cache.get_action_result(&action_digest).await? else {
+        let Some(hit) = context.cache.lookup_action_result(&action_digest).await? else {
             return Ok(None);
         };
-        if !action_result_blobs_present(
-            &result,
-            context.workspace,
-            context.cache,
-            context.source_digest_cache,
-        )
-        .await?
+        let result = hit.result;
+        if !hit.blobs_available
+            && !action_result_blobs_present(
+                &result,
+                context.workspace,
+                context.cache,
+                context.source_digest_cache,
+            )
+            .await?
         {
             return Ok(None);
         }
