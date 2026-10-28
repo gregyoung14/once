@@ -8,6 +8,15 @@ Once works locally without configuration. Infrastructure becomes useful when
 you want to run an action on another machine or share a cached result with
 another developer or coding agent.
 
+## Build an Integration
+
+If you operate an infrastructure service, start with
+[Become an Infrastructure Provider](/guide/infrastructure/providers). It
+walks through shared caching, the adapter work required in Once,
+authentication, validation, and the customer handoff. The
+[provider contracts](/reference/infrastructure/) give exact behavior and links
+to the implementations and tests.
+
 ## Create And Connect A Project
 
 Provision a remote project and bind this repository to it in one command:

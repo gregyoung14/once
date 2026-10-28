@@ -6,6 +6,9 @@ workflow for the first time.
 
 - The [`once.toml` Manifest](/reference/manifest) covers workspace discovery,
   root-only configuration, target declarations, and path resolution.
+- The [Infrastructure Provider Contracts](/reference/infrastructure/) cover
+  shared caching and remote execution, including the existing transports,
+  failure semantics, acceptance checks, and implementation links.
 - The [Command-line Reference](/reference/cli/) covers every subcommand the
   `once` binary exposes, with its synopsis, options, and arguments.
 - The [Modules Reference](/reference/modules/) documents how projects define

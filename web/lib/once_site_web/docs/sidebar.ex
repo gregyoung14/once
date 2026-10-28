@@ -157,6 +157,10 @@ defmodule OnceSiteWeb.Docs.Sidebar do
         label: "Infrastructure",
         items: [
           %Item{label: "Overview", slug: "/docs/guide/infrastructure"},
+          %Item{
+            label: "Become a Provider",
+            slug: "/docs/guide/infrastructure/providers"
+          },
           %Item{label: "Connect A Project", slug: "/docs/guide/infrastructure/connect"},
           %Item{label: "Remote Execution", slug: "/docs/guide/infrastructure/remote-execution"},
           %Item{label: "Triggers (Experimental)", slug: "/docs/guide/infrastructure/triggers"},
@@ -203,6 +207,14 @@ defmodule OnceSiteWeb.Docs.Sidebar do
         items: [
           %Item{label: "Overview", slug: "/docs/reference"},
           %Item{label: "Manifest", slug: "/docs/reference/manifest"},
+          %Item{
+            label: "Infrastructure Providers",
+            slug: "/docs/reference/infrastructure",
+            items: [
+              %Item{label: "Cache Contract", slug: "/docs/reference/infrastructure/cache"},
+              %Item{label: "Execution Contract", slug: "/docs/reference/infrastructure/execution"}
+            ]
+          },
           %Item{
             label: "Modules",
             slug: "/docs/reference/modules",

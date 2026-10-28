@@ -51,6 +51,7 @@ defmodule OnceSiteWeb.Docs.SidebarTest do
       |> Enum.find(&(&1.label == "Infrastructure"))
 
     assert Map.new(infrastructure.items, &{&1.label, &1.icon}) == %{
+             "Become a Provider" => nil,
              "Buildkite" => nil,
              "Connect A Project" => nil,
              "Daytona" => "daytona",

@@ -40,6 +40,18 @@ defmodule OnceSiteWeb.DocsLiveTest do
     assert html =~ "apple_library"
   end
 
+  test "serves infrastructure provider guides and contracts", %{conn: conn} do
+    for {path, title} <- [
+          {"/docs/guide/infrastructure/providers", "Become an Infrastructure Provider"},
+          {"/docs/reference/infrastructure", "Infrastructure Provider Contracts"},
+          {"/docs/reference/infrastructure/cache", "Cache Provider Contract"},
+          {"/docs/reference/infrastructure/execution", "Execution Provider Contract"}
+        ] do
+      {:ok, view, _html} = live(conn, path)
+      assert has_element?(view, "article h1", title)
+    end
+  end
+
   test "documents explicit modules, dependency checks, and deferred planning", %{conn: conn} do
     {:ok, _view, html} = live(conn, ~p"/docs/guide/graph/apple")
     assert html =~ "Explicit Modules and Dependency Checks"
