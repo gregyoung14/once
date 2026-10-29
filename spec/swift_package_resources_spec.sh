@@ -8,15 +8,27 @@ Describe 'Swift package resource catalogs'
     [ "$(uname -s)" != Darwin ] || ! xcrun --find actool >/dev/null 2>&1
   }
 
+  check_package_resources() {
+    local output line
+    output="$("$app/Contents/MacOS/ResourceProbe" 2> "$WORKSPACE/runtime.err")" || return
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" != "sandbox_extension_issue_file_to_process failed for $app: 1 (Operation not permitted)" ]; then
+        cat "$WORKSPACE/runtime.err" >&2
+        return 1
+      fi
+    done < "$WORKSPACE/runtime.err"
+    [ "$output" = 'package resources loaded' ]
+  }
+
   exercise_package_resources() {
     cp -R "$REPO_ROOT/fixtures/swift_package_resources/." "$WORKSPACE/"
     once build SwiftPackage_ResourceFixtures_ResourceProbe --format json > "$WORKSPACE/build.json" 2> "$WORKSPACE/build.err" || { cat "$WORKSPACE/build.err"; return 1; }
     app="$WORKSPACE/.once/out/SwiftPackage_ResourceFixtures_ResourceProbe/ResourceProbe.app"
-    [ "$("$app/Contents/MacOS/ResourceProbe")" = 'package resources loaded' ] || return 1
+    check_package_resources || return 1
     [ "$(find "$app" -name Assets.car | wc -l | tr -d ' ')" = 2 ] || return 1
     mv "$WORKSPACE/.once/out" "$SPEC_ROOT/saved-outputs"
     once build SwiftPackage_ResourceFixtures_ResourceProbe --format json > "$WORKSPACE/restored.json" 2> "$WORKSPACE/build.err" || { cat "$WORKSPACE/build.err"; return 1; }
-    [ "$("$app/Contents/MacOS/ResourceProbe")" = 'package resources loaded' ]
+    check_package_resources
   }
 
   It 'loads compiled colors and copied resources through Bundle.module after a build and cache restore'
