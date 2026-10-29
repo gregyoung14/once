@@ -44,6 +44,9 @@ mod apple_modules;
 #[path = "prelude/apple_linux.rs"]
 mod apple_linux;
 
+#[path = "prelude/apple_resources.rs"]
+mod apple_resources;
+
 #[path = "prelude/native_graphs.rs"]
 mod native_graphs;
 

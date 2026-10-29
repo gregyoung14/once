@@ -3282,7 +3282,7 @@ def _apple_materialize_resources(ctx, raw_resources, destination, platform, mini
     if not resources:
         return []
 
-    resource_trees = {resource: True for resource in resources if resource.endswith(".bundle") or resource.endswith(".help")}
+    resource_trees = {resource: True for resource in resources if resource.endswith(".bundle") or resource.endswith(".help") or resource in structured_resources or (resource.endswith(".nib") and _apple_is_directory(resource))}
     for key in ["prebuild_actions", "prepackage_actions"]:
         for encoded in (ctx.get("attr") or {}).get(key) or []:
             for output in json_decode(encoded).get("outputs") or []:
@@ -3317,14 +3317,6 @@ def _apple_materialize_resources(ctx, raw_resources, destination, platform, mini
         return False
 
     catalogs = []
-    for resource in resources:
-        if resource in resource_trees:
-            continue
-        for source in _apple_resource_tree_files(resource) if _apple_is_directory(resource) else [resource]:
-            catalog = _apple_asset_catalog_root(source)
-            if catalog and source != catalog + "/Contents.json" and catalog not in catalogs:
-                catalogs.append(catalog)
-
     ibtool = None
     xcstringstool = None
     osacompile = None
@@ -3335,7 +3327,12 @@ def _apple_materialize_resources(ctx, raw_resources, destination, platform, mini
             continue
         source_files = _apple_resource_tree_files(resource) if _apple_is_directory(resource) else [resource]
         for source in source_files:
-            if belongs_to_model(source) or _apple_asset_catalog_root(source):
+            catalog = _apple_asset_catalog_root(source)
+            if catalog:
+                if source != catalog + "/Contents.json" and catalog not in catalogs:
+                    catalogs.append(catalog)
+                continue
+            if belongs_to_model(source):
                 continue
             relative = _apple_resource_output_prefix(source, resource, resource in structured_resources)
             if source.endswith(".applescript"):

@@ -2433,17 +2433,19 @@ def _xcode_local_package_products(ctx, wanted, cache = None):
 
 def _xcode_path_is_within(path, roots):
     for root in roots:
-        root = root.rstrip("/")
-        if root and (path == root or path.startswith(root + "/")):
+        root = _xcode_normalize_path(root)
+        if not root or path == root or path.startswith(root + "/"):
             return True
     return False
 
-_XCODE_IMPLICIT_RESOURCE_BUNDLES = [".xcassets", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel"]
+_XCODE_IMPLICIT_RESOURCE_BUNDLES = [".xcassets", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel", ".nib"]
 _XCODE_IMPLICIT_RESOURCE_FILES = [".xib", ".storyboard", ".xcstrings"]
 
 def _xcode_implicit_resource_root(relative):
     parts = relative.split("/")
     for index in range(len(parts)):
+        if parts[index].startswith(".") or any([parts[index].endswith(suffix) for suffix in [".xcodeproj", ".xcworkspace", ".playground"]]):
+            return ""
         if any([parts[index].endswith(suffix) for suffix in _XCODE_IMPLICIT_RESOURCE_BUNDLES]):
             return "/".join(parts[:index + 1])
     if any([relative.endswith(suffix) for suffix in _XCODE_IMPLICIT_RESOURCE_FILES]):
@@ -2471,8 +2473,9 @@ def _xcode_swift_package_implicit_resource_roots(target_path, target_absolute):
     return roots
 
 def _xcode_swift_package_with_implicit_resources(package_dir, absolute, info):
-    # SwiftPM processes these resource types without a `resources` declaration
-    # and still generates `Bundle.module` for the target.
+    tools_version = _xcode_version_key((info.get("toolsVersion") or {}).get("_version") or "5.3")
+    if tools_version < _xcode_version_key("5.3"):
+        return info
     targets = []
     changed = False
     for target in info.get("targets") or []:
@@ -2482,9 +2485,11 @@ def _xcode_swift_package_with_implicit_resources(package_dir, absolute, info):
         relative_target = _xcode_swift_package_target_path(target)
         target_path = _xcode_join(package_dir, relative_target) if package_dir else relative_target
         resources = list(target.get("resources") or [])
-        declared = [resource.get("path") or "" for resource in resources]
-        excluded = target.get("exclude") or []
+        declared = [resource.get("path") for resource in resources if resource.get("path")]
+        excluded = (target.get("exclude") or []) + (target.get("sources") or [])
         for root in _xcode_swift_package_implicit_resource_roots(target_path, absolute + "/" + relative_target):
+            if root.endswith(".xcstrings") and tools_version < _xcode_version_key("5.9"):
+                continue
             if not _xcode_path_is_within(root, declared + excluded):
                 resources.append({"path": root, "rule": {"process": {}}})
                 declared.append(root)
