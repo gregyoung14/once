@@ -2082,6 +2082,7 @@ fn archive_to_action(
         format: match format {
             DeclaredArchiveFormat::Tar => ArchiveFormat::Tar,
             DeclaredArchiveFormat::TarGz => ArchiveFormat::TarGz,
+            DeclaredArchiveFormat::Zip => ArchiveFormat::Zip,
         },
         input_digest: Some(input_digest),
     })

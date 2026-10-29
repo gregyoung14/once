@@ -10,6 +10,8 @@ use crate::{
     ArchiveEntry, ArchiveEntryKind, ArchiveFormat, Error, ExecutionPermit, Result, WorkspacePath,
 };
 
+mod paths;
+
 pub(crate) async fn write(
     entries: &[ArchiveEntry],
     output: &WorkspacePath,
@@ -57,6 +59,16 @@ fn write_blocking(
     format: ArchiveFormat,
     workspace_root: &Path,
 ) -> io::Result<()> {
+    let resolved = resolve_entries(entries, workspace_root)?;
+    paths::reject_output_overlap(
+        entries,
+        &resolved,
+        &std::iter::once(output)
+            .chain(sha256_output)
+            .chain(uncompressed_sha256_output)
+            .collect::<Vec<_>>(),
+        workspace_root,
+    )?;
     match format {
         ArchiveFormat::Tar => {
             if uncompressed_sha256_output.is_some() {
@@ -64,29 +76,71 @@ fn write_blocking(
                     "an uncompressed digest output requires a compressed archive format",
                 ));
             }
-            write_tar(entries, output, sha256_output, workspace_root)
+            write_tar(&resolved, output, sha256_output)
         }
-        ArchiveFormat::TarGz => write_tar_gz(
-            entries,
-            output,
-            sha256_output,
-            uncompressed_sha256_output,
-            workspace_root,
-        ),
+        ArchiveFormat::TarGz => {
+            write_tar_gz(&resolved, output, sha256_output, uncompressed_sha256_output)
+        }
+        ArchiveFormat::Zip => {
+            if uncompressed_sha256_output.is_some() {
+                return Err(invalid_input(
+                    "an uncompressed digest output requires tar.gz",
+                ));
+            }
+            write_zip(&resolved, output, sha256_output)
+        }
     }
 }
 
-fn write_tar_gz(
-    entries: &[ArchiveEntry],
+fn write_zip(
+    resolved: &BTreeMap<String, ResolvedEntry>,
     output: &Path,
     sha256_output: Option<&Path>,
-    uncompressed_sha256_output: Option<&Path>,
-    workspace_root: &Path,
 ) -> io::Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let resolved = resolve_entries(entries, workspace_root)?;
+    let mut archive = zip::ZipWriter::new(File::create(output)?);
+    for entry in resolved.values() {
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(entry.mode);
+        match &entry.source {
+            ResolvedSource::File(source) => {
+                archive.start_file(&entry.path, options.large_file(true))?;
+                io::copy(&mut BufReader::new(File::open(source)?), &mut archive)?;
+            }
+            ResolvedSource::Directory => {
+                archive.add_directory(format!("{}/", entry.path), options)?;
+            }
+            ResolvedSource::Symlink(target) => {
+                let target = target
+                    .to_str()
+                    .ok_or_else(|| invalid_input("non-UTF-8 archive symlink"))?;
+                archive.add_symlink(&entry.path, target, options)?;
+            }
+        }
+    }
+    let file = archive.finish()?;
+    file.sync_all()?;
+    if let Some(path) = sha256_output {
+        let mut input = BufReader::new(File::open(output)?);
+        let mut writer = DigestWriter::new(io::sink());
+        io::copy(&mut input, &mut writer)?;
+        write_digest_file(path, &writer.digest_hex())?;
+    }
+    Ok(())
+}
+
+fn write_tar_gz(
+    resolved: &BTreeMap<String, ResolvedEntry>,
+    output: &Path,
+    sha256_output: Option<&Path>,
+    uncompressed_sha256_output: Option<&Path>,
+) -> io::Result<()> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let compressed = DigestWriter::new(File::create(output)?);
     let frame = GzipFrame::new(compressed)?;
     let mut builder = Builder::new(DigestWriter::new(frame));
@@ -166,15 +220,13 @@ impl<W: Write> Write for GzipFrame<W> {
 }
 
 fn write_tar(
-    entries: &[ArchiveEntry],
+    resolved: &BTreeMap<String, ResolvedEntry>,
     output: &Path,
     sha256_output: Option<&Path>,
-    workspace_root: &Path,
 ) -> io::Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let resolved = resolve_entries(entries, workspace_root)?;
     let writer = DigestWriter::new(File::create(output)?);
     let mut builder = Builder::new(writer);
     for entry in resolved.values() {
@@ -625,6 +677,79 @@ mod tests {
                 mtime: 0,
             },
         ]
+    }
+
+    #[test]
+    fn zip_records_permissions_links_and_stable_bytes() {
+        use std::io::Read as _;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello"), b"executable payload\n").unwrap();
+        let output = root.path().join("artifact.zip");
+        let sha256 = root.path().join("artifact.sha256");
+        let mut entries = sample_entries();
+        write_blocking(
+            &entries,
+            &output,
+            Some(&sha256),
+            None,
+            ArchiveFormat::Zip,
+            root.path(),
+        )
+        .unwrap();
+        let first = std::fs::read(&output).unwrap();
+        entries.reverse();
+        write_blocking(
+            &entries,
+            &output,
+            None,
+            None,
+            ArchiveFormat::Zip,
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(first, std::fs::read(&output).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(sha256).unwrap().trim(),
+            hex_lower(&Sha256::digest(&first))
+        );
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(first)).unwrap();
+        let mut bytes = String::new();
+        let mut executable = archive.by_name("usr/local/bin/hello").unwrap();
+        assert_eq!(executable.unix_mode().unwrap() & 0o777, 0o755);
+        executable.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "executable payload\n");
+        drop(executable);
+        let mut link = archive.by_name("usr/bin/hello").unwrap();
+        assert!(link.is_symlink());
+        bytes.clear();
+        link.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "/usr/local/bin/hello");
+    }
+
+    #[test]
+    #[ignore = "streams more than 4 GiB; run explicitly for ZIP64 validation"]
+    fn zip_supports_entries_larger_than_four_gib() {
+        let root = tempfile::tempdir().unwrap();
+        let size = u64::from(u32::MAX) + 2;
+        File::create(root.path().join("hello"))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let output = root.path().join("large.zip");
+        write_blocking(
+            &sample_entries(),
+            &output,
+            None,
+            None,
+            ArchiveFormat::Zip,
+            root.path(),
+        )
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let mut payload = archive.by_name("usr/local/bin/hello").unwrap();
+        assert_eq!(payload.size(), size);
+        assert_eq!(io::copy(&mut payload, &mut io::sink()).unwrap(), size);
     }
 
     #[test]

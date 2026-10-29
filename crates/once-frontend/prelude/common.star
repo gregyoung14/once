@@ -4,6 +4,12 @@ def _action_history(ctx, ecosystem, step, variants = []):
         return None
     return action_history_key("once." + ecosystem + ".v1", [owner, step] + variants)
 
+def _artifact_info(artifacts):
+    return {"schema": "once.artifact_info.v1", "artifacts": artifacts}
+
+def _artifact_entry(source, path, kind = "file", mode = 420):
+    return {"kind": kind, "source": source, "path": path, "mode": mode, "directory_mode": 493, "owner_id": 0, "group_id": 0, "mtime": 0}
+
 def _action_metadata(package = None, platforms = [], context = []):
     return {"package": package, "platforms": platforms, "context": context}
 

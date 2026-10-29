@@ -142,10 +142,11 @@ fn fake_android_ndk_for_mobile_test(workspace: &Path) -> std::path::PathBuf {
 
 fn apple_prelude_source() -> String {
     format!(
-        "{}\n{}\n{}\n{}\ndef host_os():\n    return \"macos\"\n",
+        "{}\n{}\n{}\n{}\n{}\ndef host_os():\n    return \"macos\"\n",
         include_str!("../prelude/common.star"),
         include_str!("../prelude/apple_modules.star"),
         include_str!("../prelude/apple_linux.star"),
+        include_str!("../prelude/apple_artifacts.star"),
         include_str!("../prelude/apple.star")
     )
 }
@@ -2374,7 +2375,7 @@ fn target_kind_has_impl_returns_true_for_apple_library() {
 }
 
 #[test]
-fn apple_application_exposes_build_and_run() {
+fn apple_application_exposes_build_run_and_artifact() {
     let target = Target {
         package: "apps/ios".to_string(),
         kind: "apple_application".to_string(),
@@ -2397,7 +2398,7 @@ fn apple_application_exposes_build_and_run() {
         .map(|capability| capability.name.as_str())
         .collect::<Vec<_>>();
     names.sort_unstable();
-    assert_eq!(names, vec!["build", "run"]);
+    assert_eq!(names, vec!["artifact", "build", "run"]);
 }
 
 #[test]

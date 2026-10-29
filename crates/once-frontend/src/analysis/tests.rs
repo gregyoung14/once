@@ -1265,7 +1265,11 @@ fn write_archive_rejects_inconsistent_symlinks_and_digests() {
             r#"write_archive([], "out.tar", uncompressed_sha256_output = "d")"#,
             "tar.gz",
         ),
-        (r#"write_archive([], "out.zip", format = "zip")"#, "tar.gz"),
+        (
+            r#"write_archive([], "out.zip", format = "zip", uncompressed_sha256_output = "d")"#,
+            "tar.gz",
+        ),
+        (r#"write_archive([], "out.rar", format = "rar")"#, "zip"),
     ] {
         let tmp = TempDir::new().unwrap();
         let store = store_for(tmp.path(), "p");
@@ -2425,6 +2429,38 @@ fn host_symlink_target_reports_links_and_is_revalidated() {
     let (_, result) =
         with_active_store(store_for(workspace.path(), "test"), || eval_string(&source));
     assert_eq!(result.unwrap(), "real|");
+}
+
+#[cfg(unix)]
+#[test]
+fn host_symlink_target_rejects_non_utf8_targets_and_invalidates_replay() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let workspace = TempDir::new().unwrap();
+    let root = workspace.path();
+    let original = "file-\u{fffd}";
+    std::fs::write(root.join(original), "x").unwrap();
+    std::os::unix::fs::symlink(original, root.join("link")).unwrap();
+    let source = format!("value = host_symlink_target({:?})", root.join("link"));
+    let (_, result) = with_active_store(store_for(root, ""), || eval_string(&source));
+    assert_eq!(result.unwrap(), original);
+    let mut observations = AnalysisObservations::default();
+    observations.push_for_test(Observation::SymlinkTarget {
+        path: root.join("link").to_str().unwrap().to_owned(),
+        target: original.to_owned(),
+    });
+    let target = std::ffi::OsString::from_vec(b"file-\xff".to_vec());
+    std::fs::remove_file(root.join("link")).unwrap();
+    std::os::unix::fs::symlink(target, root.join("link")).unwrap();
+    assert!(!globals::observations_hold(
+        root,
+        &HostCache::default(),
+        &observations,
+        CommandPolicy::Rerun,
+        &globals::UnchangedWorkspace::Unknown,
+    ));
+    let (_, result) = with_active_store(store_for(root, ""), || eval_string(&source));
+    assert!(result.unwrap_err().to_string().contains("non-UTF-8 target"));
 }
 
 #[cfg(unix)]

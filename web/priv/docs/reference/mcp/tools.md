@@ -2,6 +2,111 @@
 
 Every tool the [`once mcp`](/reference/cli/mcp) [Model Context Protocol](https://modelcontextprotocol.io/) server advertises in `tools/list`, with its input schema and a worked return example.
 
+## `once_query_artifacts`
+
+Inspect a target's portable artifact export contract without building.
+
+Matches `once query artifacts <target>`. Returns capability support, provider declaration shape, metadata bounds, and publication commands. Unknown versioned interfaces are preserved as data, never executed automatically.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "target"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"schema":"once.artifact_contract.v1","target":"site","supported":true}
+```
+
+## `once_export_artifacts`
+
+Build and export a self-contained content-addressed artifact set.
+
+Requires `once mcp --allow-run`. Matches `once artifact export <target>`. Packages declared outputs using bounded streaming copies. Does not publish remotely or start compute. The output option selects the parent directory; the package directory is named by immutable root digest. config accepts KEY=VALUE configuration overrides.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string"
+    },
+    "output": {
+      "type": "string"
+    },
+    "config": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "target"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"schema":"once.artifact_export.v1","directory":"/work/project/.once/artifacts/<digest>"}
+```
+
+## `once_publish_artifacts`
+
+Explicitly publish exported artifacts through named infrastructure.
+
+Requires `once mcp --allow-run` and authorization to publish to the selected infrastructure. Matches `once artifact publish <target>`. Defaults to [infrastructure.artifacts]; provider overrides its name. local retains arbitrary artifact types. Tuist currently accepts only one dev.tuist.preview.v1 artifact through its legacy preview API, without atomic set publication or idempotent retries. A cache hit never skips publication. Publishing does not start preview compute. config accepts KEY=VALUE overrides; track is publication context, not content identity.
+
+**Input schema**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "track": {
+      "type": "string"
+    },
+    "config": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "target"
+  ]
+}
+```
+
+**Example return**
+
+```json
+{"schema":"once.artifact_publication.v1","provider":"local","target":"site","url":"file:///work/project/.once/artifacts/<digest>/"}
+```
+
 ## `once_query_workspace`
 
 Return the configured workspace root, root manifest state, graph loading state, and next calls.

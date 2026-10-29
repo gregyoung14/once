@@ -44,6 +44,9 @@ pub enum QueryCmd {
         target: String,
     },
 
+    /// Inspect a target's artifact capability and portable export contract without building.
+    Artifacts { target: String },
+
     /// Inspect a target kind schema.
     Schema {
         /// Target kind to inspect. Discover names with `once query target-kinds`.
@@ -238,6 +241,7 @@ impl QueryCmd {
             Self::ExternalSource { .. } => vec!["external-source"],
             Self::Target { .. } => vec!["target"],
             Self::GraphFingerprint { .. } => vec!["graph-fingerprint"],
+            Self::Artifacts { .. } => vec!["artifacts"],
             Self::Tests => vec!["tests"],
             Self::AffectedTests { .. } => vec!["affected-tests"],
             Self::TestPlan { .. } => vec!["test-plan"],

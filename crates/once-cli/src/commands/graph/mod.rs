@@ -7,6 +7,7 @@
 
 mod action;
 mod analysis;
+pub(crate) mod artifacts;
 mod build_receipt;
 mod capability;
 mod configuration;

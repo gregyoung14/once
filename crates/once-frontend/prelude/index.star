@@ -1,9 +1,11 @@
 PRELUDE_SOURCES = [
     "common.star",
     "archive.star",
+    "artifact.star",
     "lint.star",
     "apple_modules.star",
     "apple_linux.star",
+    "apple_artifacts.star",
     "apple.star",
     "jvm_test_runner.star",
     "android.star",
@@ -33,7 +35,7 @@ PRELUDE_SOURCES = [
 PRELUDE_DEPENDENCIES = {
     "dockerfile.star": ["dockerfile_parser.star", "dockerfile_actions.star", "lint.star"],
     "oci_registry.star": ["oci.star"],
-    "apple.star": ["apple_modules.star", "apple_linux.star"],
+    "apple.star": ["apple_modules.star", "apple_linux.star", "apple_artifacts.star"],
     "android.star": ["jvm_test_runner.star"],
     "kotlin.star": ["jvm_test_runner.star"],
     "xcode.star": ["apple.star", "archive.star"],
@@ -43,6 +45,7 @@ PRELUDE_DEPENDENCIES = {
 
 PRELUDE_TARGET_KINDS = {
     "archive.star": ["archive_download"],
+    "artifact.star": ["artifact"],
     "lint.star": [
         "ruff_lint",
         "golangci_lint",

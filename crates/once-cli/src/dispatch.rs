@@ -141,6 +141,25 @@ async fn run_command(
     }
     match command {
         Cmd::Auth { cmd } => run_auth_command(workspace, xdg, output, cmd).await,
+        Cmd::Artifact { cmd: Some(cmd) } => {
+            let config = match &cmd {
+                cli::ArtifactCmd::Export { config, .. }
+                | cli::ArtifactCmd::Publish { config, .. } => config,
+            };
+            let resolved = resolve_configuration(config)?;
+            let cache = crate::cache_provider::resolve(workspace, xdg)?;
+            let value = commands::artifacts::execute(
+                workspace,
+                &cache,
+                cmd,
+                resource_limits.clone(),
+                &resolved,
+            )
+            .await?;
+            commands::artifacts::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Artifact { cmd: None } => unreachable!("intermediate command handled by help"),
         Cmd::Connect {
             provider,
             account,
@@ -666,6 +685,12 @@ async fn run_query_command(
             commands::query::capabilities(workspace, output, &target)
                 .await
                 .map(|()| ExitCode::SUCCESS)
+        }
+        Some(cli::QueryCmd::Artifacts { target }) => {
+            let target = resolve_target_arg(workspace, &target)?;
+            let value = commands::graph::artifacts::query(workspace, &target)?;
+            commands::artifacts::write(output, &value).await?;
+            Ok(ExitCode::SUCCESS)
         }
         Some(cli::QueryCmd::Schema { kind }) => commands::query::schema(workspace, output, &kind)
             .await

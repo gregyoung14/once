@@ -18,6 +18,7 @@ pub enum CacheProviderConfig {
 pub struct InfrastructureConfig {
     pub cache: Option<CacheProviderConfig>,
     pub execution: Option<ExecutionProviderConfig>,
+    pub artifacts: Option<NamedCacheProviderConfig>,
     pub providers: BTreeMap<String, InfrastructureProviderConfig>,
 }
 
@@ -67,6 +68,7 @@ pub enum InfrastructureProviderConfig {
 pub(crate) struct InfrastructureToml {
     pub cache: Option<CacheProviderToml>,
     pub execution: Option<NamedCacheProviderToml>,
+    pub artifacts: Option<NamedCacheProviderToml>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

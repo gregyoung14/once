@@ -22,6 +22,11 @@ execute the portable starter set against the release command-line interface.
 Platform-specific starters remain covered by their dedicated toolchain setup
 and action tests.
 
+## Artifact target kinds
+
+- [`artifact`](/reference/prelude/artifact): package explicitly selected files
+  with optional versioned consumption contracts for publication.
+
 ## Lint target kinds
 
 - [`ruff_lint`](/reference/prelude/ruff_lint): Python analysis with Ruff

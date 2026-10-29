@@ -8,6 +8,10 @@ Once works locally without configuration. Infrastructure becomes useful when
 you want to run an action on another machine or share a cached result with
 another developer or coding agent.
 
+[Artifacts and previews](/guide/infrastructure/artifacts) describes a third
+independent capability: retain immutable build products for distribution.
+Once publishes the content; infrastructure owns previews and their lifecycle.
+
 ## Build an Integration
 
 If you operate an infrastructure service, start with

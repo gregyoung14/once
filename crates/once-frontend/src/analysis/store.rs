@@ -115,6 +115,7 @@ pub enum DeclaredArchiveEntryKind {
 pub enum DeclaredArchiveFormat {
     Tar,
     TarGz,
+    Zip,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

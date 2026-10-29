@@ -1,0 +1,4 @@
+[[target]]
+name = "data"
+kind = "artifact"
+srcs = ["data.txt"]

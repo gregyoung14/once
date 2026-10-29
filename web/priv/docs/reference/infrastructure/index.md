@@ -5,7 +5,7 @@ shared caching or remote execution to Once. Start with
 [Become an Infrastructure Provider](/guide/infrastructure/providers) for a
 top-to-bottom cache integration guide.
 
-## Two Independent Capabilities
+## Independent Capabilities
 
 - **[Cache](/reference/infrastructure/cache):** store opaque blobs and action
   results; restore verified content across machines. Current implementations
@@ -14,6 +14,9 @@ top-to-bottom cache integration guide.
   in an isolated environment and return declared outputs, streams, and exit
   status. Current implementations are native local execution, Microsandbox,
   E2B, and Daytona.
+- **[Artifacts](/guide/infrastructure/artifacts):** retain immutable build
+  products for distribution. Local publication accepts arbitrary payloads;
+  the Tuist compatibility adapter accepts supported application previews.
 
 Once owns graph analysis, dependency ordering, action identity, and cache
 policy. Providers do not need to interpret target kinds or implement the
