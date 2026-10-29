@@ -14,6 +14,8 @@ pub(super) const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 pub struct ArtifactInfo {
     pub schema: String,
     pub artifacts: Vec<ArtifactDeclaration>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automatic_publication: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,8 +77,12 @@ pub struct ArtifactMember {
 impl ArtifactInfo {
     pub fn validate(&self, declared_outputs: &[String]) -> Result<()> {
         ensure!(
-            self.schema == ARTIFACT_INFO_SCHEMA,
+            self.schema == ARTIFACT_INFO_SCHEMA || self.schema == "once.artifact_info.v2",
             "unsupported artifact provider schema"
+        );
+        ensure!(
+            !self.automatic_publication || self.schema == "once.artifact_info.v2",
+            "automatic publication requires a v2 producer declaration"
         );
         ensure!(
             (1..=128).contains(&self.artifacts.len()),

@@ -313,6 +313,7 @@ pub fn load_infrastructure_toml_str(
         cache,
         execution,
         artifacts,
+        publish_on_build: manifest.infrastructure.publish_on_build,
         providers,
     })
 }

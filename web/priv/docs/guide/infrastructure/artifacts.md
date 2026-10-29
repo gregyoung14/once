@@ -85,14 +85,93 @@ name = "local"
 The built-in `local` provider needs no separate definition. Named provider
 definitions can be reused by the capabilities they support.
 
-Cache, execution and artifact bindings are independent. Publication is explicit,
-never skipped because the build was cached, and does not run the published content.
+Cache, execution and artifact bindings are independent. Publication is explicit
+unless build publication is opted into and authorized. A cache hit does not
+skip publication, and publication does not run the published content.
 An absent artifact binding is an error unless `--provider` selects one.
 `--track` adds distribution context without rebuilding different content.
 
 Provider-specific configuration, authentication, supported formats and limits
 live in each provider's guide. See [Tuist](/guide/infrastructure/tuist#publish-application-previews)
-to publish supported applications to Tuist.
+for an artifact receiver that also projects supported applications into previews.
+
+## Publish after successful builds
+
+Select targets in the workspace configuration:
+
+```toml
+[infrastructure]
+publish_on_build = ["application"]
+```
+
+Then explicitly publish and authorize the configured remote destination:
+
+```sh
+once artifact publish application --allow-on-build
+once build application
+```
+
+Authorization is local machine state, not repository configuration. It binds
+the canonical workspace path, target and exact service endpoint to the stable
+destination returned by the service. Changing any of them requires explicit
+authorization again. A copied checkout or another machine is not authorized
+by the committed policy alone.
+
+After all requested builds succeed, Once considers only requested targets
+listed in `publish_on_build` that expose the artifact capability. The producer
+must also approve automatic publication of its entire exported closure through
+`once.artifact_info.v2`. Older v1 declarations default to no approval.
+Without the policy or local authorization, builds make no artifact-publication
+network requests. A changed stable destination is rejected before content upload.
+
+Remote publication sends the full immutable closure: the artifact set, every
+member manifest and every payload, including unknown interfaces. Its intent
+contains the root descriptor, target, optional track and Git revision. Before
+uploading, Once looks up the intent's remote receipt and verifies its key, root
+and destination. Replaying the same retained intent returns that receipt without
+uploading content again. An unconfirmed completion is an error; replay the same
+intent to recover its receipt rather than assuming success. Retention and expiry
+are receiver policies, not a promise of permanent byte availability.
+
+## Publication service contract
+
+Remote adapters supply an authenticated service endpoint. The protocol is
+independent of consumption interfaces and never interprets application metadata:
+
+- `GET <endpoint>` returns `{"schema":"once.publication_service.v1","destination":"<stable destination>"}`.
+- `GET <endpoint>/publications/<key>` returns a receipt, 404 for an unknown
+  intent, or 410 for an expired intent that cannot be reactivated.
+- `POST <endpoint>/publications/<key>/content/<digest>` streams exact bytes as
+  `application/octet-stream`. The receiver verifies SHA-256 before acknowledging
+  with 204. A committed intent is immutable and rejects further uploads with 409.
+- `POST <endpoint>/publications/<key>` commits this JSON intent only after the
+  complete reachable closure is durably retained:
+
+```json
+{
+  "schema": "once.publication_intent.v1",
+  "root": {"digest": "sha256:<64 lowercase hex digits>", "size_bytes": 123, "media_type": "application/vnd.once.artifact-set.v1+json"},
+  "target": "application",
+  "track": null,
+  "revision": null
+}
+```
+
+`key` is `sha256:` plus the SHA-256 of this complete intent serialized as
+compact UTF-8 JSON with recursively sorted object keys. Both optional values
+are present as strings or `null`; descriptor sizes are nonnegative integers.
+A successful commit or lookup returns exactly `schema`, `key`, `root`,
+`destination` and `url`, with schema `once.publication_receipt.v1`. The URL is
+absolute HTTPS, except same-origin HTTP for local development. It contains no
+embedded credentials. Publication schemas are versioned separately from artifact
+and consumption schemas.
+
+Once uploads each distinct locally exported digest, never server-selected local
+files. Responses are bounded to one mebibyte, and redirects are not followed.
+Other statuses and malformed or mismatching receipts are errors. An upload
+conflict is successful only if a separate lookup confirms the same publication.
+The client does not automatically retry ambiguous writes. Different targets,
+tracks or revisions produce different intents even when their content is equal.
 
 ## Use the same surface from an agent
 

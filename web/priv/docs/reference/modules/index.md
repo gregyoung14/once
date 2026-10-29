@@ -1495,7 +1495,8 @@ Expose `capability("artifact", ["default", "artifact"])` and declare the
 ```python
 {
     "artifact_info": {
-        "schema": "once.artifact_info.v1",
+        "schema": "once.artifact_info.v2",
+        "automatic_publication": False,
         "artifacts": [{
             "name": "product",
             "payloads": {"content": {"path": output, "media_type": "application/zip"}},
@@ -1513,8 +1514,18 @@ underscores or hyphens. A provider exports 1 to 128 artifacts, each with 1 to
 128 payloads and at most 32 interfaces and 32 selectors. Provider metadata
 and each exported metadata document are limited to one mebibyte.
 
-The built-in `artifact` and `apple_application` kinds export one member named
-`product`. Native target names do not become restricted artifact identifiers.
+The built-in `artifact`, `apple_application` and `android_binary` kinds export
+one member named `product`. Native target names do not become restricted
+artifact identifiers.
+
+`automatic_publication` defaults to `False`. Setting it to `True` approves the
+entire exported closure, not one interface or payload, for opted-in build
+publication. It requires `once.artifact_info.v2`; v1 remains accepted without
+automatic approval and rejects `automatic_publication = True`. Producer approval
+does not authorize a destination. Workspace `publish_on_build` policy and local
+authorization through `once artifact publish <target> --allow-on-build` are also
+required for remote build publication. Explicit export and publication remain
+available without producer approval for automatic publication.
 
 Interfaces map namespaced versioned identifiers to
 `{"payload": "content", "spec": {...}}`. The payload must exist. Unknown
@@ -1525,6 +1536,9 @@ Selectors are explicit variant facts, not inferred from names or workers.
 Declare packaging actions only for `ctx["capability"] == "artifact"` when
 ordinary builds should not create distributable packages. Publication runs
 outside the cached action graph, including when packaging is a cache hit.
+Build publication starts only after all requested builds succeed. A remote
+receiver retains the set, all member manifests and all payloads. Publication
+intent and verified receipts are separate from immutable artifact identity.
 See [Artifacts](/guide/infrastructure/artifacts) for content
 identity, consumer responsibilities, configuration and adapter limits.
 

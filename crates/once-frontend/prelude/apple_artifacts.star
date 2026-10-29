@@ -21,18 +21,18 @@ def _apple_export_artifact(ctx, provider, info_plist, minimum_os, architecture):
         metadata = declare_output("artifact/metadata.json")
         expand_actions(
             implementation = "apple_artifact_metadata_plan",
-            inputs = [provider["app_executable"], info_plist],
+            inputs = _unique(provider["app_files"] + [info_plist]),
             outputs = [metadata],
-            args = {"executable": provider["app_executable"], "info_plist": info_plist, "metadata": metadata, "platform": platform, "sdk_variant": sdk_variant, "developer_dir": provider["xcode_developer_dir"]},
+            args = {"application": provider["app_path"], "executable": provider["app_executable"], "info_plist": info_plist, "metadata": metadata, "platform": platform, "sdk_variant": sdk_variant, "developer_dir": provider["xcode_developer_dir"]},
         )
         payloads["metadata"] = {"path": metadata, "media_type": "application/json"}
-        interfaces["dev.tuist.preview.v1"] = {"payload": "bundle", "spec": {"metadata_payload": "metadata"}}
+        interfaces["dev.once.apple-install.v2"] = {"payload": "bundle", "spec": {"metadata_payload": "metadata"}}
     provider["artifact_info"] = _artifact_info([{
         "name": "product",
         "payloads": payloads,
         "interfaces": interfaces,
         "selectors": {"platform": platform, "sdk_variant": sdk_variant, "architecture": architecture},
-    }])
+    }], automatic_publication = host_os() == "macos" and (platform == "macos" or sdk_variant == "simulator"))
     return provider
 
 def apple_artifact_metadata_plan(ctx):
@@ -41,18 +41,21 @@ def apple_artifact_metadata_plan(ctx):
     plist = json_decode(host_command([host_which("plutil"), "-convert", "json", "-o", "-", root + spec["info_plist"]]))
     developer = spec["developer_dir"]
     env = {"DEVELOPER_DIR": developer} if developer else {}
+    host_command([host_which("codesign"), "--verify", "--deep", "--strict", root + spec["application"]], env = env)
     uuid_output = host_command([host_which("xcrun"), "dwarfdump", "--uuid", root + spec["executable"]], env = env)
     uuids = [line.split()[1] for line in uuid_output.split("\n") if line.startswith("UUID: ")]
     if not uuids:
         _diagnostic_fail("artifact_binary_identity_missing", None, "The application has no Mach-O UUID", "Build the application with a linker that emits UUIDs")
     platform = spec["platform"]
-    supported_platform = platform + "_simulator" if platform != "macos" and spec["sdk_variant"] == "simulator" else platform
     write_path(spec["metadata"], _json_encode({
-        "type": "app_bundle",
+        "schema": "once.apple_application.v1",
         "display_name": plist.get("CFBundleDisplayName") or plist.get("CFBundleName") or "",
         "bundle_identifier": plist.get("CFBundleIdentifier") or "",
         "version": plist.get("CFBundleShortVersionString") or "",
         "build_version": plist.get("CFBundleVersion") or "",
-        "binary_id": uuids[0],
-        "supported_platforms": [supported_platform],
+        "mach_o_uuids": uuids,
+        "platform": platform,
+        "sdk_variant": spec["sdk_variant"],
+        "signing": "ad_hoc",
+        "signature_verified": True,
     }))

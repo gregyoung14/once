@@ -16,13 +16,25 @@ application imports directly. Once links the direct dynamic boundary, embeds
 its complete framework closure, removes duplicate paths, signs every embedded
 framework, and then signs the application.
 
-The `artifact` capability packages the completed application as a ZIP without
-publishing it during ordinary builds. On macOS it also exports native
-metadata for [Tuist publication](/guide/infrastructure/tuist#publish-application-previews).
-The provider adds `once_artifact_info`; its interfaces describe the bundle,
-platform, SDK variant, bundle identifier and minimum operating system.
-Packaging records declared executable permissions and preserves symlinks.
-Device signing and provisioning remain the producer's responsibility.
+The `artifact` capability packages the completed application as a ZIP. The
+provider adds `once_artifact_info` with one `product` member and a `bundle`
+payload. `dev.once.apple-install.v1` describes the platform, SDK variant,
+architecture, bundle identifier and minimum operating system. Packaging records
+declared executable permissions and preserves symlinks.
+
+On macOS, `dev.once.apple-install.v2` also points to `bundle` and names a
+`metadata` payload through `spec.metadata_payload`. Its
+`once.apple_application.v1` document records `display_name`, `bundle_identifier`,
+`version`, `build_version`, `mach_o_uuids`, `platform`, `sdk_variant`, `signing`
+and `signature_verified`. The producer verifies the completed bundle with
+`codesign --verify --deep --strict` and collects Mach-O UUIDs with `dwarfdump`.
+
+The v2 producer declaration approves automatic publication of the full closure
+only for ad-hoc signed macOS and simulator applications exported on macOS.
+Physical-device applications and Linux exports do not approve it. Builds do
+not upload without separate workspace policy and local destination
+authorization. See [Artifacts](/guide/infrastructure/artifacts#publish-after-successful-builds).
+Device installation still requires provisioning and re-signing outside this flow.
 
 macOS applications use the native `Contents` layout: executables in
 `Contents/MacOS`, resources and dependency resource bundles in
@@ -131,6 +143,7 @@ can use it as the linker's bundle loader.
 | --- | --- | --- |
 | `build` | `default`, `bundle`, `dsyms` |  |
 | `run` | `default` | `bundle` |
+| `artifact` | `default`, `artifact` |  |
 
 ## Outputs
 
