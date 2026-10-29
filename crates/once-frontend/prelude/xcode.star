@@ -2679,15 +2679,34 @@ def _xcode_remote_swift_package_info(ctx, identity, pin, url = "", checkout_root
         if not _xcode_host_directory_exists(absolute):
             host_command([host_which("mkdir"), "-p", _parent_dir(absolute)])
             host_command([git, "clone", "--no-checkout", url or pin.get("location") or "", absolute])
-        host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision])
+        _xcode_git_ensure_revision(git, absolute, revision)
         host_command([git, "-C", absolute, "checkout", "--detach", revision])
     else:
         current = host_command([git, "-C", absolute, "rev-parse", "HEAD"]).strip()
         if current != revision:
-            host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision])
+            _xcode_git_ensure_revision(git, absolute, revision)
             host_command([git, "-C", absolute, "checkout", "--detach", revision])
     info = _xcode_swift_package_info(ctx, package_dir, identity, cache = cache)
     return info
+
+def _xcode_git_ensure_revision(git, absolute, revision):
+    # A full clone usually already holds the pinned commit. Otherwise prefer a
+    # shallow fetch, but some hosts (Buf's generated-SDK Git endpoints, for
+    # example) reject shallow clients, so fall back to an ordinary fetch.
+    # Host commands are memoized by argv, so each presence check uses a
+    # distinct form.
+    if _xcode_git_has_commit(git, absolute, ["cat-file", "-e", revision + "^{commit}"]):
+        return
+    host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision], merge_stderr = True, check = False)
+    if _xcode_git_has_commit(git, absolute, ["rev-parse", "--verify", "--quiet", revision + "^{commit}"]):
+        return
+    host_command([git, "-C", absolute, "fetch", "origin", revision])
+
+def _xcode_git_has_commit(git, absolute, args):
+    marker = "once-has-commit"
+    script = "git=\"$1\"; dir=\"$2\"; shift 2; \"$git\" -C \"$dir\" \"$@\" >/dev/null 2>&1 && echo " + marker
+    output = host_command([host_which("sh"), "-c", script, "sh", git, absolute] + args, check = False)
+    return output.strip() == marker
 
 def _xcode_package_resolved_pins_at(package_path):
     if not package_path:

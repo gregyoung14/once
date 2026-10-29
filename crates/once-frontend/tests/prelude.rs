@@ -18386,3 +18386,55 @@ result = repr([
         r#"[True, ["./Feature"]]"#
     );
 }
+
+#[test]
+fn prelude_xcode_git_ensure_revision_falls_back_when_shallow_fetch_is_rejected() {
+    let source = format!(
+        r#"{}
+calls = []
+
+def host_which(name):
+    return name
+
+def host_command(argv, env = None, cwd = None, merge_stderr = None, check = None, max_output_bytes = None):
+    calls.append(" ".join(argv[6:]) if argv[0] == "sh" else " ".join(argv[3:]))
+    if "--depth" in argv:
+        return "fatal: Server does not support shallow clients"
+    return ""
+
+_xcode_git_ensure_revision("git", "/pkg", "abc123")
+result = repr(calls)
+"#,
+        xcode_prelude_source()
+    );
+
+    assert_eq!(
+        eval_prelude_source_to_repr(source).unwrap(),
+        r#"["cat-file -e abc123^{commit}", "fetch --depth 1 origin abc123", "rev-parse --verify --quiet abc123^{commit}", "fetch origin abc123"]"#
+    );
+}
+
+#[test]
+fn prelude_xcode_git_ensure_revision_skips_fetching_a_cloned_revision() {
+    let source = format!(
+        r#"{}
+calls = []
+
+def host_which(name):
+    return name
+
+def host_command(argv, env = None, cwd = None, merge_stderr = None, check = None, max_output_bytes = None):
+    calls.append(" ".join(argv[6:]) if argv[0] == "sh" else " ".join(argv[3:]))
+    return "once-has-commit" if argv[0] == "sh" else ""
+
+_xcode_git_ensure_revision("git", "/pkg", "abc123")
+result = repr(calls)
+"#,
+        xcode_prelude_source()
+    );
+
+    assert_eq!(
+        eval_prelude_source_to_repr(source).unwrap(),
+        r#"["cat-file -e abc123^{commit}"]"#
+    );
+}
