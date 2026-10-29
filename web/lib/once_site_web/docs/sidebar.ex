@@ -161,7 +161,7 @@ defmodule OnceSiteWeb.Docs.Sidebar do
             label: "Become a Provider",
             slug: "/docs/guide/infrastructure/providers"
           },
-          %Item{label: "Artifacts and Previews", slug: "/docs/guide/infrastructure/artifacts"},
+          %Item{label: "Artifacts", slug: "/docs/guide/infrastructure/artifacts"},
           %Item{label: "Connect A Project", slug: "/docs/guide/infrastructure/connect"},
           %Item{label: "Remote Execution", slug: "/docs/guide/infrastructure/remote-execution"},
           %Item{label: "Triggers (Experimental)", slug: "/docs/guide/infrastructure/triggers"},

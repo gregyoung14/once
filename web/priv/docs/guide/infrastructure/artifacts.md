@@ -1,8 +1,8 @@
-# Artifacts and previews
+# Artifacts
 
-**Artifacts are immutable build products. Publications put them somewhere.
-Previews let someone use them.** Once owns the first two boundaries;
-infrastructure decides how to distribute, install, serve or run the content.
+**Artifacts are immutable build products. Publishing sends them to your
+configured infrastructure.** Once builds, packages and publishes the content;
+the provider decides how people download, install, serve or run it.
 
 An application, command-line program, server, static site, dataset or report
 can be an artifact. No container runtime or running web server is required.
@@ -58,15 +58,17 @@ An interface has `payload` and `spec` fields. Unknown interfaces survive
 export and remain downloadable; they never grant permission to execute a
 command or dynamically load a handler. Examples of consumption contracts:
 
-| Product | Contract responsibility |
-| --- | --- |
-| Download | No interface required. Retain arbitrary bytes. |
-| Static site | `dev.once.static-http.v1`: explicit archive `root` and `index`. Never serve private sibling files. |
-| CLI | A producer-owned executable contract declares entrypoint, arguments, OS, architecture and required runtime content. |
-| Server | A producer-owned process contract adds ports, readiness and runtime requirements. Secrets and assigned addresses come from infrastructure. |
-| Apple application | `dev.once.apple-install.v1`: application bundle, platform, SDK variant, bundle identifier and minimum OS. Installation requires compatible devices and signing. |
+- **Download:** No interface required. Retain arbitrary bytes.
+- **Static site:** `dev.once.static-http.v1` declares the archive `root` and
+  `index`. Never serve private sibling files.
+- **CLI:** A producer-owned executable contract declares entrypoint, arguments,
+  OS, architecture and required runtime content.
+- **Server:** A producer-owned process contract adds ports, readiness and
+  runtime requirements. Secrets and assigned addresses come from infrastructure.
+- **Application:** A producer-owned installation contract declares the package,
+  platform, runtime compatibility and installation requirements.
 
-Once currently exports declarations; it does not implement static hosting,
+Consumption interfaces are declarations. Once does not implement static hosting,
 CLI installation or server activation. An executable alone is not a complete
 runtime closure. A compatible consumer must validate its supported contract,
 unpack safely, isolate untrusted content, bind secrets with authorization,
@@ -75,52 +77,22 @@ allocate resources, and own routing, access, retention and cleanup.
 ## Choose publication infrastructure
 
 ```toml
-[infrastructures.distribution]
-kind = "local"
-
 [infrastructure.artifacts]
-name = "distribution"
+name = "local"
 ```
 
+`artifacts` is the capability being configured; `name` selects its provider.
+The built-in `local` provider needs no separate definition. Named provider
+definitions can be reused by the capabilities they support.
+
 Cache, execution and artifact bindings are independent. Publication is explicit,
-never skipped because the build was cached, and never starts preview compute.
+never skipped because the build was cached, and does not run the published content.
 An absent artifact binding is an error unless `--provider` selects one.
 `--track` adds distribution context without rebuilding different content.
 
-## Publish an application to Tuist
-
-```toml
-[infrastructures.tuist]
-kind = "tuist"
-account = "acme"
-project = "application"
-
-[infrastructure.artifacts]
-name = "tuist"
-```
-
-```sh
-once auth login --provider tuist
-once artifact publish MyApplication --track review
-```
-
-`apple_application` supplies the bundle and native metadata when exporting on
-macOS. The Tuist adapter uses the existing authentication flow, streams multipart
-uploads, and returns a human preview URL only after completion. No executable
-inspection or toolchain-specific build logic lives in the adapter.
-
-Tuist's current preview API supports app bundles, IPAs and APKs, not arbitrary
-artifact manifests. The adapter requires one artifact with
-`dev.tuist.preview.v1`, pointing to an upload payload and a
-`spec.metadata_payload` containing the native request JSON. Custom producers
-are responsible for making that metadata consistent with their payload.
-
-This compatibility path uploads the selected payload, not the complete Once
-manifest set. It does not promise atomic variant publication, custom retention
-or retry-safe receipts. Duplicate builds fail explicitly, even if the previous
-bytes have expired. An interrupted upload or unconfirmed completion is an
-error; do not blindly retry. The URL identifies the preview, not permanent byte
-availability. Generic Tuist artifact storage needs additional server support.
+Provider-specific configuration, authentication, supported formats and limits
+live in each provider's guide. See [Tuist](/guide/infrastructure/tuist#publish-application-previews)
+to publish supported applications to Tuist.
 
 ## Use the same surface from an agent
 

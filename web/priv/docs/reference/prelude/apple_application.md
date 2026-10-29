@@ -17,8 +17,8 @@ its complete framework closure, removes duplicate paths, signs every embedded
 framework, and then signs the application.
 
 The `artifact` capability packages the completed application as a ZIP without
-publishing it during ordinary builds. On macOS it also exports native preview
-metadata for [Tuist publication](/guide/infrastructure/artifacts#publish-an-application-to-tuist).
+publishing it during ordinary builds. On macOS it also exports native
+metadata for [Tuist publication](/guide/infrastructure/tuist#publish-application-previews).
 The provider adds `once_artifact_info`; its interfaces describe the bundle,
 platform, SDK variant, bundle identifier and minimum operating system.
 Packaging records declared executable permissions and preserves symlinks.
