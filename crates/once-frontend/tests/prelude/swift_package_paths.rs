@@ -63,6 +63,30 @@ fn swift_package_description_failure_keeps_dumped_manifest() {
 }
 
 #[test]
+fn prelude_xcode_swift_package_public_headers_path_keeps_an_explicit_empty_path() {
+    let prelude = xcode_prelude_source();
+    let empty = eval_prelude_function_in(
+        &prelude,
+        "_xcode_swift_package_public_headers_path",
+        r#"({"publicHeadersPath": ""})"#,
+    )
+    .unwrap();
+    let missing =
+        eval_prelude_function_in(&prelude, "_xcode_swift_package_public_headers_path", "({})")
+            .unwrap();
+    let custom = eval_prelude_function_in(
+        &prelude,
+        "_xcode_swift_package_public_headers_path",
+        r#"({"publicHeadersPath": "Sources/include"})"#,
+    )
+    .unwrap();
+
+    assert_eq!(empty, r#""""#);
+    assert_eq!(missing, r#""include""#);
+    assert_eq!(custom, r#""Sources/include""#);
+}
+
+#[test]
 fn swift_package_graph_preserves_public_header_paths() {
     for package_path in ["Packages/Layout", ".once/xcode-packages/layout"] {
         for header_path in ["missing", "null", "", "public"] {
