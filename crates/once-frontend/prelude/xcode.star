@@ -2695,18 +2695,12 @@ def _xcode_git_ensure_revision(git, absolute, revision):
     # example) reject shallow clients, so fall back to an ordinary fetch.
     # Host commands are memoized by argv, so each presence check uses a
     # distinct form.
-    if _xcode_git_has_commit(git, absolute, ["cat-file", "-e", revision + "^{commit}"]):
+    if host_command([git, "-C", absolute, "cat-file", "-t", revision + "^{commit}"], check = False).strip() == "commit":
         return
-    host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision], merge_stderr = True, check = False)
-    if _xcode_git_has_commit(git, absolute, ["rev-parse", "--verify", "--quiet", revision + "^{commit}"]):
+    host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision], check = False)
+    if host_command([git, "-C", absolute, "rev-parse", "--verify", "--quiet", revision + "^{commit}"], check = False).strip():
         return
     host_command([git, "-C", absolute, "fetch", "origin", revision])
-
-def _xcode_git_has_commit(git, absolute, args):
-    marker = "once-has-commit"
-    script = "git=\"$1\"; dir=\"$2\"; shift 2; \"$git\" -C \"$dir\" \"$@\" >/dev/null 2>&1 && echo " + marker
-    output = host_command([host_which("sh"), "-c", script, "sh", git, absolute] + args, check = False)
-    return output.strip() == marker
 
 def _xcode_package_resolved_pins_at(package_path):
     if not package_path:

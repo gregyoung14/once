@@ -53,6 +53,10 @@ mod cargo_paths;
 #[path = "prelude/swift_package_paths.rs"]
 mod swift_package_paths;
 
+#[cfg(unix)]
+#[path = "prelude/swift_package_git.rs"]
+mod swift_package_git;
+
 #[path = "prelude/xcode_scripts.rs"]
 mod xcode_scripts;
 
@@ -18397,7 +18401,7 @@ def host_which(name):
     return name
 
 def host_command(argv, env = None, cwd = None, merge_stderr = None, check = None, max_output_bytes = None):
-    calls.append(" ".join(argv[6:]) if argv[0] == "sh" else " ".join(argv[3:]))
+    calls.append(" ".join(argv[3:]))
     if "--depth" in argv:
         return "fatal: Server does not support shallow clients"
     return ""
@@ -18410,7 +18414,7 @@ result = repr(calls)
 
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"["cat-file -e abc123^{commit}", "fetch --depth 1 origin abc123", "rev-parse --verify --quiet abc123^{commit}", "fetch origin abc123"]"#
+        r#"["cat-file -t abc123^{commit}", "fetch --depth 1 origin abc123", "rev-parse --verify --quiet abc123^{commit}", "fetch origin abc123"]"#
     );
 }
 
@@ -18424,8 +18428,8 @@ def host_which(name):
     return name
 
 def host_command(argv, env = None, cwd = None, merge_stderr = None, check = None, max_output_bytes = None):
-    calls.append(" ".join(argv[6:]) if argv[0] == "sh" else " ".join(argv[3:]))
-    return "once-has-commit" if argv[0] == "sh" else ""
+    calls.append(" ".join(argv[3:]))
+    return "commit" if "cat-file" in argv else ""
 
 _xcode_git_ensure_revision("git", "/pkg", "abc123")
 result = repr(calls)
@@ -18435,6 +18439,6 @@ result = repr(calls)
 
     assert_eq!(
         eval_prelude_source_to_repr(source).unwrap(),
-        r#"["cat-file -e abc123^{commit}"]"#
+        r#"["cat-file -t abc123^{commit}"]"#
     );
 }
