@@ -14,11 +14,19 @@ def _apple_module_scan_argv(argv, cache_path):
             skip = True
         elif arg in remove_flags:
             pass
-        elif not arg.startswith("-") and (arg.endswith(".a") or arg.endswith(".o")):
+        elif not arg.startswith("-") and _apple_module_scan_skips_link_input(arg):
             pass
         else:
             result.append(arg)
     return result + ["-disable-bridging-pch", "-module-cache-path", cache_path]
+
+def _apple_module_scan_skips_link_input(path):
+    # The scanner rejects link inputs; a static framework binary has no extension.
+    for suffix in [".a", ".o", ".dylib", ".tbd"]:
+        if path.endswith(suffix):
+            return True
+    framework = _parent_dir(path)
+    return framework.endswith(".framework") and _basename(framework) == _basename(path) + ".framework"
 
 def _apple_module_host_roots(swiftc):
     if not swiftc.get("sdk_path"):
