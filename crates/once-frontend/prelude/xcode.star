@@ -2462,9 +2462,10 @@ def _xcode_swift_package_implicit_resource_roots(target_path, target_absolute):
             if path.startswith(target_absolute + "/"):
                 paths.append(path[len(target_absolute) + 1:])
     else:
-        for path in glob([target_path + "/**"]):
-            if path.startswith(target_path + "/"):
-                paths.append(path[len(target_path) + 1:])
+        prefix = target_path + "/" if target_path else ""
+        for path in glob([prefix + "**"]):
+            if path.startswith(prefix):
+                paths.append(path[len(prefix):])
     roots = []
     for path in paths:
         root = _xcode_implicit_resource_root(path)
@@ -2483,11 +2484,11 @@ def _xcode_swift_package_with_implicit_resources(package_dir, absolute, info):
             targets.append(target)
             continue
         relative_target = _xcode_swift_package_target_path(target)
-        target_path = _xcode_join(package_dir, relative_target) if package_dir else relative_target
+        target_path = _xcode_join(package_dir, relative_target)
         resources = list(target.get("resources") or [])
         declared = [resource.get("path") for resource in resources if resource.get("path")]
         excluded = (target.get("exclude") or []) + (target.get("sources") or [])
-        for root in _xcode_swift_package_implicit_resource_roots(target_path, absolute + "/" + relative_target):
+        for root in _xcode_swift_package_implicit_resource_roots(target_path, _xcode_join(absolute, relative_target)):
             if root.endswith(".xcstrings") and tools_version < _xcode_version_key("5.9"):
                 continue
             if not _xcode_path_is_within(root, declared + excluded):

@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn implicit_catalog_discovery_supports_a_package_root_target() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir(workspace.path().join("Assets.xcassets")).unwrap();
+    std::fs::write(workspace.path().join("Assets.xcassets/Contents.json"), "{}").unwrap();
+    let source = format!(
+        r#"{}
+info = _xcode_swift_package_with_implicit_resources("", workspace_root(), {{"targets": [{{
+    "type": "regular", "name": "Root", "path": ".",
+}}]}})
+result = repr(info["targets"][0].get("resources"))
+"#,
+        xcode_prelude_source()
+    );
+    let (_, result) = with_active_store(store_for(workspace.path(), ""), || {
+        eval_prelude_source_to_repr(source)
+    });
+    assert_eq!(
+        result.unwrap(),
+        r#"[{"path": "Assets.xcassets", "rule": {"process": {}}}]"#
+    );
+}
+
+#[test]
 fn native_package_root_generates_bundle_accessors_for_implicit_catalogs() {
     let workspace = TempDir::new().unwrap();
     let sources = workspace.path().join("Sources/Lib");
