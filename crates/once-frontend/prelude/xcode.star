@@ -3052,12 +3052,11 @@ def _xcode_swift_package_dependency_aliases(info):
     # for `AppAuth-iOS`.
     aliases = {}
     for dependency in info.get("dependencies") or []:
-        for kind in ["sourceControl", "registry"]:
-            for entry in dependency.get(kind) or []:
-                name = entry.get("nameForTargetDependencyResolutionOnly") or ""
-                identity = entry.get("identity") or ""
-                if name and identity and name.lower() != identity.lower():
-                    aliases[name.lower()] = identity
+        for entry in dependency.get("sourceControl") or []:
+            name = entry.get("nameForTargetDependencyResolutionOnly") or ""
+            identity = entry.get("identity") or ""
+            if name and identity and name.lower() != identity.lower():
+                aliases[name.lower()] = identity
     return aliases
 
 def _xcode_swift_package_depends_on_macro(target, identity, target_ids, product_ids, platform, macro_target_ids, enabled_traits = [], lazy_products = {}, lazy_dependency = "", package_aliases = {}):
