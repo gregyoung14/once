@@ -15700,6 +15700,72 @@ result = repr([
 }
 
 #[test]
+fn prelude_xcode_package_configuration_matches_defines_and_conditional_settings() {
+    let prelude = xcode_prelude_source();
+    for (configuration, debug) in [
+        ("Debug", true),
+        ("dEbUg", true),
+        ("Development", true),
+        ("App-DEBUG-Staging", true),
+        ("Release-dEvElOpMeNt", true),
+        ("Release", false),
+        ("Staging", false),
+        ("Develop", false),
+        ("App Store", false),
+    ] {
+        let source = format!(
+            r#"{prelude}
+def glob(patterns):
+    return ["Sources/Support.swift"]
+
+def host_file_read(path):
+    return ""
+
+settings = [
+    {{"tool": tool, "kind": {{"define": {{"_0": name}}}}, "condition": {{"config": config}}}}
+    for tool, name, config in [
+        ("swift", "DEBUG_SETTING", "debug"),
+        ("swift", "RELEASE_SETTING", "release"),
+        ("c", "C_DEBUG_SETTING", "debug"),
+        ("cxx", "C_RELEASE_SETTING", "release"),
+    ]
+]
+settings.extend([
+    {{"tool": "swift", "kind": {{"define": {{"_0": "IOS_DEBUG"}}}}, "condition": {{"config": "debug", "platformNames": ["ios"]}}}},
+    {{"tool": "swift", "kind": {{"define": {{"_0": "INACTIVE_TRAIT"}}}}, "condition": {{"config": "debug", "traits": ["Disabled"]}}}},
+])
+info = {{"identity": "Example", "path": ".", "info": {{"targets": [
+    {{"name": "Support", "type": "regular", "settings": settings}},
+    {{"name": "Macro", "type": "macro", "settings": settings}},
+]}}}}
+graph = _xcode_local_swift_package_specs({{"label": {{"package": ""}}}}, [info], "ios", "17.0", "simulator", configuration = "{configuration}")
+result = repr([
+    [
+        "DEBUG" in (spec["attrs"].get("defines") or spec["attrs"]["swift_flags"]),
+        "DEBUG_SETTING" in spec["attrs"]["swift_flags"],
+        "RELEASE_SETTING" in spec["attrs"]["swift_flags"],
+        "-DC_DEBUG_SETTING" in spec["attrs"].get("clang_flags", []),
+        "-DC_RELEASE_SETTING" in spec["attrs"].get("clang_flags", []),
+        "IOS_DEBUG" in spec["attrs"]["swift_flags"],
+        "INACTIVE_TRAIT" in spec["attrs"]["swift_flags"],
+    ] for spec in graph["specs"]
+])
+"#
+        );
+        let expected = if debug {
+            "[[True, True, False, True, False, True, False], [True, True, False, True, False, False, False], [True, True, False, False, False, False, False]]"
+        } else {
+            "[[False, False, True, False, True, False, False], [False, False, True, False, True, False, False], [False, False, True, False, False, False, False]]"
+        };
+        assert_eq!(
+            eval_prelude_source_to_repr(source).unwrap(),
+            expected,
+            "configuration {configuration}"
+        );
+    }
+}
+
+#[test]
 fn prelude_xcode_reconciles_cross_package_product_dependencies() {
     let prelude = xcode_prelude_source();
     let source = format!(
@@ -18322,7 +18388,7 @@ def host_file_exists(path):
 def host_file_read(path):
     return ""
 
-def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {{}}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None, debug = None):
+def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {{}}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None):
     return {{
         "specs": [{{
             "name": "XcodePackage_swift-argument-parser_changelog-authors",
@@ -18384,29 +18450,5 @@ result = repr([
     assert_eq!(
         eval_prelude_source_to_repr(explicit).unwrap(),
         r#"[True, ["./Feature"]]"#
-    );
-}
-
-#[test]
-fn prelude_xcode_configuration_is_debug_reads_project_settings() {
-    let prelude = xcode_prelude_source();
-    let is_debug = |call: &str| {
-        eval_prelude_function_in(&prelude, "_xcode_configuration_is_debug", call).unwrap()
-    };
-
-    assert_eq!(is_debug(r#"("Debug", {})"#), "True");
-    assert_eq!(
-        is_debug(
-            r#"("Development", {"SWIFT_ACTIVE_COMPILATION_CONDITIONS": "DEBUG SWIFT_MOCKING_ENABLED"})"#
-        ),
-        "True"
-    );
-    assert_eq!(
-        is_debug(r#"("Staging", {"SWIFT_OPTIMIZATION_LEVEL": "-Onone"})"#),
-        "True"
-    );
-    assert_eq!(
-        is_debug(r#"("App Store", {"SWIFT_ACTIVE_COMPILATION_CONDITIONS": "RELEASE"})"#),
-        "False"
     );
 }
