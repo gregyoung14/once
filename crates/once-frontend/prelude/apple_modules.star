@@ -71,6 +71,15 @@ def _apple_swift_action(ctx, attrs, swiftc, deps, **action):
     if not attrs.get("explicit_modules"):
         run_action(**action)
         return
+    # Textual interfaces retain their own Swift deployment target, but must
+    # import the same Clang modules as the main compilation.
+    for target_flag, clang_flag in [("-target", "-clang-target"), ("-target-variant", "-clang-target-variant")]:
+        target = ""
+        for index in range(len(action["argv"]) - 1):
+            if action["argv"][index] == target_flag:
+                target = action["argv"][index + 1]
+        if target and clang_flag not in action["argv"]:
+            action["argv"] = action["argv"] + ["-Xfrontend", clang_flag, "-Xfrontend", target]
     identity = _apple_module_toolchain_identity(swiftc)
     cache_path = ".once/out/modules/" + content_sha256(identity)
     scan = declare_output("ModuleScans/" + action["identifier"] + ".json")
