@@ -202,6 +202,8 @@ def _apple_check_module_inputs(ctx, records):
         if record.get("modulePath"):
             paths.append(record["modulePath"])
         for path in paths:
+            if path.startswith("/"):
+                path = _apple_normalize_absolute_path(path)
             if not _apple_module_input(path) and path.startswith("/"):
                 if not any([path.startswith(root + "/") or (host_path_exists(path) and host_path_exists(root) and host_path_is_within(path, root)) for root in ctx["args"].get("host_roots") or []]):
                     return {
