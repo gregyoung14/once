@@ -18386,3 +18386,29 @@ result = repr([
         r#"[True, ["./Feature"]]"#
     );
 }
+
+#[test]
+fn prelude_xcode_script_path_resolves_relative_paths_against_srcroot() {
+    let prelude = format!(
+        "{}\ndef _xcode_workspace_root():\n    return \"/ws/\"\n",
+        xcode_prelude_source()
+    );
+    let path = |value: &str, srcroot: &str| {
+        eval_prelude_function_in(
+            &prelude,
+            "_xcode_script_path",
+            &format!(r#"("{value}", {{"SRCROOT": "{srcroot}"}})"#),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        path("Vendor/Plugin.app", "/ws/App"),
+        r#""App/Vendor/Plugin.app""#
+    );
+    assert_eq!(
+        path("$(SRCROOT)/Generated/Flags.swift", "/ws/App"),
+        r#""App/Generated/Flags.swift""#
+    );
+    assert_eq!(path("Vendor/Plugin.app", "App"), r#""Vendor/Plugin.app""#);
+}
