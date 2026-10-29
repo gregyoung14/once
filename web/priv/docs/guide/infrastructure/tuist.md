@@ -1,12 +1,12 @@
 # Tuist
 
-[Tuist](https://tuist.dev) lets Once share cache entries across machines.
-Configure it when developers and coding agents should reuse the same action
-results.
+[Tuist](https://tuist.dev) provides shared caching, live run reporting and
+application previews for Once. Configure the capabilities your project needs
+independently.
 
 ::: info Trigger orchestration is coming
 Tuist support for [Once triggers](/guide/infrastructure/triggers) is coming.
-This page covers the shared-cache integration available today, not CI
+This page covers caching, run reporting and application previews, not CI
 orchestration.
 :::
 
@@ -48,8 +48,8 @@ Sign in once:
 once auth login --provider tuist
 ```
 
-Once reuses the stored session for cache reads and writes. Remove it when the
-machine should no longer access the provider:
+Once reuses the stored session for cache reads, cache writes and preview
+publication. Remove it when the machine should no longer access the provider:
 
 ```sh
 once auth logout --provider tuist
@@ -76,6 +76,53 @@ The second machine should report a cache hit and restore
 `build/greeting.txt`. Because its local cache has no matching entry, the hit
 confirms that Tuist supplied the recorded result.
 
+## Publish Application Previews
+
+Configure Tuist as the artifact publication provider in the repository root
+`once.toml`. If the project already defines this provider for caching, reuse
+that definition and add only the artifact binding:
+
+```toml
+[infrastructures.tuist]
+kind = "tuist"
+account = "acme"
+project = "application"
+
+[infrastructure.artifacts]
+name = "tuist"
+```
+
+```sh
+once auth login --provider tuist
+once artifact publish MyApplication --track review
+```
+
+`apple_application` supplies the bundle and native metadata when exporting on
+macOS. Its `dev.once.apple-install.v1` interface describes the platform, SDK
+variant, bundle identifier and minimum OS. Applications are a generic artifact
+category; this interface describes installation specifically on Apple platforms.
+
+The Tuist adapter uses the existing authentication flow, streams multipart
+uploads, and returns a human preview URL only after completion. No executable
+inspection or toolchain-specific build logic lives in the adapter. See
+[Artifacts](/guide/infrastructure/artifacts) for the
+provider-neutral export and publication model.
+
+### Supported Formats And Limits
+
+Tuist's current preview API supports app bundles, IPAs and APKs, not arbitrary
+artifact manifests. The adapter requires one artifact with
+`dev.tuist.preview.v1`, pointing to an upload payload and a
+`spec.metadata_payload` containing the native request JSON. Custom producers
+are responsible for making that metadata consistent with their payload.
+
+This compatibility path uploads the selected payload, not the complete Once
+manifest set. It does not promise atomic variant publication, custom retention
+or retry-safe receipts. Duplicate builds fail explicitly, even if the previous
+bytes have expired. An interrupted upload or unconfirmed completion is an
+error; do not blindly retry. The URL identifies the preview, not permanent byte
+availability. Generic Tuist artifact storage needs additional server support.
+
 ## Follow Runs Live
 
 Once streams build and test runs to Tuist when the provider is configured and
@@ -94,8 +141,8 @@ Choose the authentication method supported by the environment.
 
 ### Account Token
 
-Set `TUIST_TOKEN` to a Tuist account token with cache access when the runner can
-store a long-lived secret:
+Set `TUIST_TOKEN` to a Tuist account token authorized for the project's operations
+when the runner can store a long-lived secret:
 
 ```sh
 TUIST_TOKEN=tuist_... ./scripts/greet.sh
@@ -129,7 +176,7 @@ The resulting session remains available for the rest of the job.
 
 ## Connection recovery
 
-Once retries transient failures during blob existence checks, uploads, and
+Once retries transient cache failures during blob existence checks, uploads, and
 action-result publication with at most three attempts per RPC. This includes
 HTTP/2 connection retirement, where the cache asks the client to use a new
 connection. Interrupted uploads restart from the beginning with a fresh upload

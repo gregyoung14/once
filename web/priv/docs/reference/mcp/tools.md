@@ -71,7 +71,7 @@ Requires `once mcp --allow-run`. Matches `once artifact export <target>`. Packag
 
 Explicitly publish exported artifacts through named infrastructure.
 
-Requires `once mcp --allow-run` and authorization to publish to the selected infrastructure. Matches `once artifact publish <target>`. Defaults to [infrastructure.artifacts]; provider overrides its name. local retains arbitrary artifact types. Tuist currently accepts only one dev.tuist.preview.v1 artifact through its legacy preview API, without atomic set publication or idempotent retries. A cache hit never skips publication. Publishing does not start preview compute. config accepts KEY=VALUE overrides; track is publication context, not content identity.
+Requires `once mcp --allow-run` and authorization to publish to the selected infrastructure. Matches `once artifact publish <target>`. Defaults to [infrastructure.artifacts]; provider overrides its name. local retains arbitrary artifact types. Check the selected provider's supported formats and retry guarantees before publishing or retrying. A cache hit never skips publication. Publishing does not run the published content. config accepts KEY=VALUE overrides; track is publication context, not content identity.
 
 **Input schema**
 

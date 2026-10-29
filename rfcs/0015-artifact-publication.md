@@ -6,10 +6,11 @@ Accepted for implementation
 
 ## Decision
 
-Once produces and publishes artifacts. Infrastructure turns publications into
-previews. An artifact is immutable content and typed consumption metadata; a
-publication adds destination, target, source revision, access and retention.
-A running preview is a separate infrastructure-owned instance, not an artifact.
+Once produces and publishes artifacts. An artifact is immutable content and
+typed consumption metadata; a publication adds destination, target, source
+revision, access and retention. Infrastructure decides how people download,
+install, serve or run the published content. Those experiences are not Once
+concepts and do not change artifact identity.
 
 The generic model accepts any payload media type and zero or more named,
 versioned consumption contracts. Unknown contracts remain distributable but
@@ -30,7 +31,7 @@ An interface key is a namespaced versioned contract identifier; its value is a
 JSON object governed by that contract. The generic envelope validates bounds
 and structure, not ecosystem semantics. Contract authors publish schemas and
 validate requirements in their modules; consumers validate supported contracts
-before creating a preview. An unknown interface is never permission to fetch
+before using the content. An unknown interface is never permission to fetch
 or execute a handler.
 
 The built-in `artifact` target packages explicitly selected sources. Other
@@ -86,9 +87,9 @@ are surfaced rather than hidden. A generic Tuist publication service needs
 server support for immutable artifact descriptors, explicit grouping,
 idempotent commit receipts and retention independent of cache eviction.
 
-## Preview lifecycle and non-goals
+## Consumer responsibilities and non-goals
 
-Infrastructure owns preview activation, isolation, routing, secret bindings,
+Infrastructure owns installation, activation, isolation, routing, secret bindings,
 resource allocation, leases and cleanup. Publishing does not start compute or
 grant access to a device or secret. Public static roots must be explicit and
 served from isolated origins. Device provisioning and code-signing eligibility

@@ -8,9 +8,9 @@ Once works locally without configuration. Infrastructure becomes useful when
 you want to run an action on another machine or share a cached result with
 another developer or coding agent.
 
-[Artifacts and previews](/guide/infrastructure/artifacts) describes a third
+[Artifacts](/guide/infrastructure/artifacts) describes a third
 independent capability: retain immutable build products for distribution.
-Once publishes the content; infrastructure owns previews and their lifecycle.
+Once publishes the content; infrastructure decides how people use it.
 
 ## Build an Integration
 
@@ -87,7 +87,7 @@ It can also use either capability on its own.
 | [Microsandbox](/guide/infrastructure/microsandbox) | Execution | Local image | Validate an action boundary on the current computer. |
 | [E2B](/guide/infrastructure/e2b) | Execution | Hosted template | Start a prepared hosted environment quickly. |
 | [Daytona](/guide/infrastructure/daytona) | Execution | Hosted container image | Build a hosted environment from a familiar image. |
-| [Tuist](/guide/infrastructure/tuist) | Shared cache | Not applicable | Reuse action results across machines. |
+| [Tuist](/guide/infrastructure/tuist) | Shared cache, artifacts | Not applicable | Reuse action results and share installable applications. |
 
 ## Keep A Local Escape Hatch
 

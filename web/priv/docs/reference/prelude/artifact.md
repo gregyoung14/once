@@ -19,5 +19,5 @@ Each interface binds `payload = "content"` to a contract-owned `spec` object.
 
 Discover complete starters with `once query example artifact artifact-static-site`
 and `once query example artifact artifact-download`. See
-[Artifacts and previews](/guide/infrastructure/artifacts) for configuration,
+[Artifacts](/guide/infrastructure/artifacts) for configuration,
 publication and consumer responsibilities.

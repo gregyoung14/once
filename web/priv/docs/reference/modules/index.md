@@ -1525,7 +1525,7 @@ Selectors are explicit variant facts, not inferred from names or workers.
 Declare packaging actions only for `ctx["capability"] == "artifact"` when
 ordinary builds should not create distributable packages. Publication runs
 outside the cached action graph, including when packaging is a cache hit.
-See [Artifacts and previews](/guide/infrastructure/artifacts) for content
+See [Artifacts](/guide/infrastructure/artifacts) for content
 identity, consumer responsibilities, configuration and adapter limits.
 
 Use `toolchain_identity` for tool versions, resolved compiler paths, platform
