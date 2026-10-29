@@ -2102,7 +2102,7 @@ def _android_binary_impl(ctx):
     unsigned_apk = _android_package_unsigned_apk(ctx, tools, resource_apk, dex_dir, dex_hash, native_libraries)
     aligned_apk = _android_zipalign(ctx, tools, unsigned_apk)
     apk, debug_keystore = _android_sign_or_copy(ctx, attrs, tools, aligned_apk)
-    return {
+    provider = {
         "label_id": ctx["label"]["id"],
         "target_kind": "android_binary",
         "application_id": attrs.get("application_id") or "",
@@ -2118,6 +2118,46 @@ def _android_binary_impl(ctx):
         "android_native_libraries": native_libraries,
         "affected_inputs": _android_source_inputs(ctx, attrs, True) + [manifest],
     }
+    if ctx["capability"] == "artifact":
+        metadata = declare_output("artifact/metadata.json")
+        signing = _android_attr(attrs, "signing", "debug")
+        expand_actions(
+            implementation = "android_artifact_metadata_plan",
+            inputs = [apk],
+            outputs = [metadata],
+            args = {"apk": apk, "metadata": metadata, "aapt2": tools["aapt2"], "apksigner": tools["apksigner"], "env": _android_env(tools), "signing": signing, "version_name": _android_attr(attrs, "version_name", "1.0")},
+        )
+        provider["artifact_info"] = _artifact_info([{
+            "name": "product",
+            "payloads": {"apk": {"path": apk, "media_type": "application/vnd.android.package-archive"}, "metadata": {"path": metadata, "media_type": "application/json"}},
+            "interfaces": {"dev.once.android-install.v1": {"payload": "apk", "spec": {"metadata_payload": "metadata"}}},
+            "selectors": {"platform": "android"},
+        }], automatic_publication = signing == "debug" and not provider["instrumentation_target"])
+    return provider
+
+def android_artifact_metadata_plan(ctx):
+    spec = ctx["args"]
+    apk = workspace_root() + "/" + spec["apk"]
+    badging = host_command([spec["aapt2"], "dump", "badging", apk], env = spec["env"])
+    package = [line for line in badging.split("\n") if line.startswith("package: ")]
+    if len(package) != 1:
+        fail("The APK has no unique package metadata")
+    identity = package[0]
+    certificates = []
+    if spec["signing"] != "none":
+        verification = host_command([spec["apksigner"], "verify", "--print-certs", apk], env = spec["env"])
+        certificates = [line.split(": ", 1)[1] for line in verification.split("\n") if " certificate SHA-256 digest: " in line]
+        if not certificates:
+            fail("The APK has no verified signing certificate")
+    write_path(spec["metadata"], _json_encode({
+        "schema": "once.android_application.v1",
+        "application_id": identity.split("name='", 1)[1].split("'", 1)[0],
+        "version_code": identity.split("versionCode='", 1)[1].split("'", 1)[0],
+        "version_name": spec["version_name"],
+        "minimum_sdk": [line.split("'", 2)[1] for line in badging.split("\n") if line.startswith("sdkVersion:")],
+        "certificate_sha256": certificates,
+        "signature_verified": len(certificates) > 0,
+    }))
 
 _ANDROID_RESOURCE_ATTRS = [
     attr("manifest", "string", default = "AndroidManifest.xml", docs = "Package-relative AndroidManifest.xml path.", configurable = False),
@@ -2409,10 +2449,11 @@ android_binary = target_kind(
     deps = [
         dep("deps", ["android_library", "android_resource", "android_native_library"], "Android libraries, resources, and native shared libraries packaged into the APK."),
     ],
-    providers = ["android_application", "android_apk"],
+    providers = ["android_application", "android_apk", "once_artifact_info"],
     capabilities = [
         capability("build", ["default", "apk", "dex", "resources"]),
         capability("run", ["default"], ["apk"]),
+        capability("artifact", ["default"]),
     ],
     source_references = _ANDROID_BINARY_SOURCE_REFERENCES,
     examples = [

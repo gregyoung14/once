@@ -19,6 +19,7 @@ pub struct InfrastructureConfig {
     pub cache: Option<CacheProviderConfig>,
     pub execution: Option<ExecutionProviderConfig>,
     pub artifacts: Option<NamedCacheProviderConfig>,
+    pub publish_on_build: Vec<String>,
     pub providers: BTreeMap<String, InfrastructureProviderConfig>,
 }
 
@@ -69,6 +70,7 @@ pub(crate) struct InfrastructureToml {
     pub cache: Option<CacheProviderToml>,
     pub execution: Option<NamedCacheProviderToml>,
     pub artifacts: Option<NamedCacheProviderToml>,
+    pub publish_on_build: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

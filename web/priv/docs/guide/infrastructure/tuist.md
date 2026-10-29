@@ -1,7 +1,8 @@
 # Tuist
 
 [Tuist](https://tuist.dev) provides shared caching, live run reporting and
-application previews for Once. Configure the capabilities your project needs
+artifact publication for Once, with application previews for supported native
+interfaces. Configure the capabilities your project needs
 independently.
 
 ::: info Trigger orchestration is coming
@@ -48,7 +49,7 @@ Sign in once:
 once auth login --provider tuist
 ```
 
-Once reuses the stored session for cache reads, cache writes and preview
+Once reuses the stored session for cache reads, cache writes and artifact
 publication. Remove it when the machine should no longer access the provider:
 
 ```sh
@@ -97,31 +98,63 @@ once auth login --provider tuist
 once artifact publish MyApplication --track review
 ```
 
-`apple_application` supplies the bundle and native metadata when exporting on
-macOS. Its `dev.once.apple-install.v1` interface describes the platform, SDK
-variant, bundle identifier and minimum OS. Applications are a generic artifact
-category; this interface describes installation specifically on Apple platforms.
+Tuist receives the full immutable artifact closure through its authenticated
+project artifact service, not a selected preview payload. The adapter uses
+existing Tuist authentication and streams content without inspecting native
+executables. A matching remote receipt confirms publication and returns the
+project's previews URL. Preview projection happens asynchronously, so this
+receipt does not mean an application is already available to install.
 
-The Tuist adapter uses the existing authentication flow, streams multipart
-uploads, and returns a human preview URL only after completion. No executable
-inspection or toolchain-specific build logic lives in the adapter. See
-[Artifacts](/guide/infrastructure/artifacts) for the
-provider-neutral export and publication model.
+To publish after successful builds, add an explicit policy and authorize this
+machine and workspace:
+
+```toml
+[infrastructure]
+publish_on_build = ["MyApplication"]
+```
+
+```sh
+once artifact publish MyApplication --allow-on-build
+once build MyApplication
+```
+
+All requested builds must succeed, and the producer must approve the entire
+closure for automatic publication. No artifact-publication request occurs when
+the policy or local authorization is absent. Authorization binds the exact
+endpoint and target to Tuist's stable project destination, `project:<project_id>`.
+Changing the endpoint, workspace or target requires new authorization; a changed
+stable destination is rejected before upload. See
+[Artifacts](/guide/infrastructure/artifacts#publish-after-successful-builds)
+for the provider-neutral policy and replay behavior.
 
 ### Supported Formats And Limits
 
-Tuist's current preview API supports app bundles, IPAs and APKs, not arbitrary
-artifact manifests. The adapter requires one artifact with
-`dev.tuist.preview.v1`, pointing to an upload payload and a
-`spec.metadata_payload` containing the native request JSON. Custom producers
-are responsible for making that metadata consistent with their payload.
+The receiver retains arbitrary artifact payloads and unknown interfaces without
+executing them. Metadata documents are limited to one mebibyte and the full
+closure to 20 GiB. Known native interfaces additionally create previews using
+the project's default preview visibility and existing Tuist distribution surfaces.
+Generic artifact contents remain private even in public projects:
 
-This compatibility path uploads the selected payload, not the complete Once
-manifest set. It does not promise atomic variant publication, custom retention
-or retry-safe receipts. Duplicate builds fail explicitly, even if the previous
-bytes have expired. An interrupted upload or unconfirmed completion is an
-error; do not blindly retry. The URL identifies the preview, not permanent byte
-availability. Generic Tuist artifact storage needs additional server support.
+- `apple_application` exports `dev.once.apple-install.v2` on macOS, alongside
+  its v1 installation description. The v2 interface points to the bundle ZIP
+  and `spec.metadata_payload` with `once.apple_application.v1` metadata.
+  Ad-hoc signed macOS and simulator applications are eligible for automatic
+  publication and preview projection. Physical-device applications are not.
+- `android_binary` exports `dev.once.android-install.v1`, pointing to the APK
+  and `spec.metadata_payload` with `once.android_application.v1` metadata.
+  Debug-signed, non-instrumentation APKs approve automatic publication.
+  Unsigned APKs do not produce installable previews.
+
+Native producers validate signatures and collect metadata; the generic adapter
+does not. Unknown interfaces remain available through authenticated artifact
+downloads even when no preview is projected.
+
+The same intent is looked up remotely before transfer. A verified retained
+receipt avoids another upload; an unconfirmed completion can be recovered by
+replaying the same intent. Publications expire after 30 days on hosted Tuist,
+or according to the self-hosted app-preview retention setting. Expired records
+remain as tombstones and cannot be reactivated by replaying the same intent.
+The returned URL is not a permanent-byte availability guarantee.
 
 ## Follow Runs Live
 

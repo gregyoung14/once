@@ -59,7 +59,7 @@ Tool override attrs are also available for `javac`, `jar`, `java`,
 
 ## Providers
 
-The target emits `android_application` and `android_apk`.
+The target emits `android_application`, `android_apk` and `once_artifact_info`.
 
 ## Capabilities
 
@@ -67,6 +67,7 @@ The target emits `android_application` and `android_apk`.
 | --- | --- | --- |
 | `build` | `default`, `apk`, `dex`, `resources` |  |
 | `run` | `default` | `apk` |
+| `artifact` | `default` |  |
 
 ## Source References
 
@@ -108,6 +109,22 @@ changing the local key invalidates cached signing output.
 not supported because action metadata and process arguments are not treated
 as secret channels. `signing = "none"` leaves the APK unsigned after
 zipalign. Production signing is not implemented yet.
+
+## Artifacts
+
+The `artifact` capability exports one `product` member with `apk` and `metadata`
+payloads. `dev.once.android-install.v1` points to `apk` and names `metadata`
+through `spec.metadata_payload`. The `once.android_application.v1` metadata
+records `application_id`, `version_code`, `version_name`, `minimum_sdk`,
+`certificate_sha256` and `signature_verified`. Package identity and minimum SDK
+come from `aapt2 dump badging`; signed APK certificates come from
+`apksigner verify --print-certs`.
+
+The v2 producer declaration approves the entire closure for automatic
+publication only for debug-signed, non-instrumentation APKs. Unsigned and
+instrumentation packages do not approve it. No upload happens from an ordinary
+build without the separate policy and destination authorization described in
+[Artifacts](/guide/infrastructure/artifacts#publish-after-successful-builds).
 
 ## Running
 

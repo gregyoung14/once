@@ -15,6 +15,8 @@ pub struct ArtifactExport {
     pub root: ArtifactDescriptor,
     pub directory: PathBuf,
     pub artifacts: ArtifactSet,
+    #[serde(default)]
+    pub automatic_publication: bool,
 }
 
 pub async fn export_artifacts(
@@ -91,6 +93,7 @@ pub async fn export_artifacts(
         root,
         directory: destination,
         artifacts,
+        automatic_publication: info.automatic_publication,
     })
 }
 

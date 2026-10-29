@@ -47,6 +47,7 @@ impl Server {
                 )?,
                 provider: args.provider,
                 track: args.track,
+                allow_on_build: false,
                 config: args.config,
                 sandbox: SandboxMode::Off,
             }

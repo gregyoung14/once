@@ -25,6 +25,9 @@ pub enum ArtifactCmd {
         /// Optional distribution track. Does not change artifact content identity.
         #[usage(long)]
         track: Option<String>,
+        /// Authorize future opted-in builds of this target to publish to this destination.
+        #[usage(long)]
+        allow_on_build: bool,
         #[usage(long, default = "off")]
         sandbox: SandboxMode,
         #[usage(long, value_name = "KEY=VALUE")]

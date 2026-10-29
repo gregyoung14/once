@@ -459,6 +459,16 @@ async fn dispatch_build(
         ))
         .await?;
     }
+    commands::artifacts::after_build(
+        workspace,
+        &cache,
+        &targets,
+        sandbox,
+        resource_limits.clone(),
+        &resolved,
+        output,
+    )
+    .await?;
     Ok(ExitCode::SUCCESS)
 }
 

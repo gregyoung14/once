@@ -1,4 +1,9 @@
+mod automation;
+mod publication;
+mod service;
 mod tuist;
+
+pub use automation::after_build;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -6,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use once_cas::CacheProvider;
 use once_core::artifacts::ArtifactDescriptor;
-use once_core::{ResourceLimits, ResourcePool, ResourceRequest, Xdg};
+use once_core::{ResourceLimits, ResourcePool, ResourceRequest};
 use once_frontend::{InfrastructureProviderConfig, NamedCacheProviderConfig};
 use serde::Serialize;
 use serde_json::Value;
@@ -33,6 +38,18 @@ pub async fn execute(
     limits: ResourceLimits,
     resolved: &ResolvedConfiguration,
 ) -> Result<Value> {
+    execute_with_policy(workspace, cache, cmd, limits, resolved, false).await
+}
+
+async fn execute_with_policy(
+    workspace: &Path,
+    cache: &CacheProvider,
+    cmd: ArtifactCmd,
+    limits: ResourceLimits,
+    resolved: &ResolvedConfiguration,
+    automatic: bool,
+) -> Result<Value> {
+    let mut allow_on_build = false;
     let (target, destination, sandbox, binding, track) = match cmd {
         ArtifactCmd::Export {
             target,
@@ -51,8 +68,10 @@ pub async fn execute(
             provider,
             track,
             sandbox,
+            allow_on_build: allow,
             ..
         } => {
+            allow_on_build = allow;
             let binding = resolve_provider(workspace, provider.as_deref())?;
             (
                 target,
@@ -82,6 +101,10 @@ pub async fn execute(
     let Some((binding, provider)) = binding else {
         return Ok(serde_json::to_value(package)?);
     };
+    if automatic && !package.automatic_publication {
+        tracing::info!(%target, "producer did not approve automatic publication");
+        return Ok(Value::Null);
+    }
     let pool = Arc::new(ResourcePool::new(limits));
     let _permit = pool
         .acquire_required(ResourceRequest::new(1, 4 * 1024 * 1024))
@@ -93,27 +116,23 @@ pub async fn execute(
         track,
         git_commit: git_value(workspace, &["rev-parse", "--verify", "HEAD"]),
         git_branch: git_value(workspace, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
-        provider: binding.name,
+        provider: binding.name.clone(),
         url: String::new(),
     };
-    publication.url = match provider {
-        InfrastructureProviderConfig::Local => {
-            reqwest::Url::from_directory_path(&package.directory)
-                .map_err(|()| anyhow::anyhow!("artifact export directory must be absolute"))?
-                .to_string()
-        }
-        InfrastructureProviderConfig::Tuist(config) => {
-            let config = once_cas::TuistCacheConfig {
-                url: config.url,
-                account: binding.account.or(config.account),
-                project: binding.project.or(config.project),
-                oauth_client_id: config.oauth_client_id,
-                provider_name: publication.provider.clone(),
-            };
-            tuist::publish(&package, &config, &Xdg::from_env(), &publication).await?
-        }
-        _ => bail!("selected infrastructure does not support artifact publication"),
+    let Some(url) = publication::publish(
+        workspace,
+        &package,
+        &publication,
+        binding,
+        provider,
+        automatic,
+        allow_on_build,
+    )
+    .await?
+    else {
+        return Ok(Value::Null);
     };
+    publication.url = url;
     persist_receipt(workspace, &publication).await?;
     tracing::info!(artifact_digest = %publication.artifact.digest, provider = %publication.provider, target = %publication.target, "published artifact set");
     Ok(serde_json::to_value(publication)?)
