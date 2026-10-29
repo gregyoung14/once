@@ -131,6 +131,8 @@ def _apple_scan_records(scan):
     return records
 
 def _apple_module_input(path):
+    if path.startswith("/"):
+        path = _apple_normalize_absolute_path(path)
     if ".." in path.split("/"):
         fail("compiler module path escaped the workspace: " + path)
     root = workspace_root() + "/"
@@ -139,6 +141,19 @@ def _apple_module_input(path):
     if path.startswith("/"):
         return ""
     return path
+
+def _apple_normalize_absolute_path(path):
+    # SDK module maps reference headers as `Headers/../Frameworks/...`.
+    parts = []
+    for part in path.split("/"):
+        if part == "" or part == ".":
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/" + "/".join(parts)
 
 def _apple_module_record_details(entry):
     kind = _apple_scan_key(entry["reference"]).split(":")[0]
