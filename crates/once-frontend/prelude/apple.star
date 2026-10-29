@@ -3316,6 +3316,15 @@ def _apple_materialize_resources(ctx, raw_resources, destination, platform, mini
                 return True
         return False
 
+    catalogs = []
+    for resource in resources:
+        if resource in resource_trees:
+            continue
+        for source in _apple_resource_tree_files(resource) if _apple_is_directory(resource) else [resource]:
+            catalog = _apple_asset_catalog_root(source)
+            if catalog and source != catalog + "/Contents.json" and catalog not in catalogs:
+                catalogs.append(catalog)
+
     ibtool = None
     xcstringstool = None
     osacompile = None
@@ -3326,7 +3335,7 @@ def _apple_materialize_resources(ctx, raw_resources, destination, platform, mini
             continue
         source_files = _apple_resource_tree_files(resource) if _apple_is_directory(resource) else [resource]
         for source in source_files:
-            if belongs_to_model(source):
+            if belongs_to_model(source) or _apple_asset_catalog_root(source):
                 continue
             relative = _apple_resource_output_prefix(source, resource, resource in structured_resources)
             if source.endswith(".applescript"):
@@ -3449,7 +3458,36 @@ def _apple_materialize_resources(ctx, raw_resources, destination, platform, mini
                 toolchain_identity = momc["identity"],
                 identifier = identifier_prefix + "_model_" + model_name,
             )
+    if catalogs:
+        actool = _resolve_actool(xcode_developer_dir)
+        sdk_variant = (ctx.get("attr") or {}).get("sdk_variant") or "simulator"
+        output_dir = ctx["build_dir"] + "/" + destination
+        asset_car = declare_resource_output("Assets.car", catalogs[0])
+        run_action(
+            display_name = "Compile asset catalogs · " + module_name,
+            source_files = _action_source_files(catalogs),
+            argv = [actool["actool_path"]] + catalogs + [
+                "--compile",
+                output_dir,
+                "--platform",
+                _apple_actool_platform(platform, sdk_variant),
+                "--minimum-deployment-target",
+                minimum_os,
+            ],
+            inputs = catalogs,
+            outputs = [asset_car],
+            create_dirs = [output_dir],
+            env = actool["env"],
+            toolchain_identity = actool["identity"],
+            identifier = identifier_prefix + "_asset_catalogs",
+        )
     return outputs
+
+def _apple_asset_catalog_root(path):
+    index = path.find(".xcassets/")
+    if index >= 0:
+        return path[:index + len(".xcassets")]
+    return path if path.endswith(".xcassets") else ""
 
 def _apple_create_resource_bundle(ctx, resources, structured_resources, bundle_name, bundle_id, platform, minimum_os, xcode_developer_dir, module_name):
     name = bundle_name if bundle_name.endswith(".bundle") else bundle_name + ".bundle"

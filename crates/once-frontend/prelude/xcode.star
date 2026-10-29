@@ -2431,6 +2431,74 @@ def _xcode_local_package_products(ctx, wanted, cache = None):
                 remaining.pop(product_name)
     return resolved
 
+def _xcode_path_is_within(path, roots):
+    for root in roots:
+        root = root.rstrip("/")
+        if root and (path == root or path.startswith(root + "/")):
+            return True
+    return False
+
+_XCODE_IMPLICIT_RESOURCE_BUNDLES = [".xcassets", ".xcdatamodeld", ".xcdatamodel", ".xcmappingmodel"]
+_XCODE_IMPLICIT_RESOURCE_FILES = [".xib", ".storyboard", ".xcstrings"]
+
+def _xcode_implicit_resource_root(relative):
+    parts = relative.split("/")
+    for index in range(len(parts)):
+        if any([parts[index].endswith(suffix) for suffix in _XCODE_IMPLICIT_RESOURCE_BUNDLES]):
+            return "/".join(parts[:index + 1])
+    if any([relative.endswith(suffix) for suffix in _XCODE_IMPLICIT_RESOURCE_FILES]):
+        return relative
+    return ""
+
+def _xcode_swift_package_implicit_resource_roots(target_path, target_absolute):
+    paths = []
+    if target_path.startswith(".once/"):
+        names = []
+        for suffix in _XCODE_IMPLICIT_RESOURCE_BUNDLES + _XCODE_IMPLICIT_RESOURCE_FILES:
+            names.extend(["-o", "-name", "*" + suffix] if names else ["-name", "*" + suffix])
+        for path in host_command([host_which("find"), target_absolute, "("] + names + [")", "-prune", "-print"], check = False).split("\n"):
+            if path.startswith(target_absolute + "/"):
+                paths.append(path[len(target_absolute) + 1:])
+    else:
+        for path in glob([target_path + "/**"]):
+            if path.startswith(target_path + "/"):
+                paths.append(path[len(target_path) + 1:])
+    roots = []
+    for path in paths:
+        root = _xcode_implicit_resource_root(path)
+        if root and root not in roots:
+            roots.append(root)
+    return roots
+
+def _xcode_swift_package_with_implicit_resources(package_dir, absolute, info):
+    # SwiftPM processes these resource types without a `resources` declaration
+    # and still generates `Bundle.module` for the target.
+    targets = []
+    changed = False
+    for target in info.get("targets") or []:
+        if (target.get("type") or "") not in ["regular", "executable", "test"]:
+            targets.append(target)
+            continue
+        relative_target = _xcode_swift_package_target_path(target)
+        target_path = _xcode_join(package_dir, relative_target) if package_dir else relative_target
+        resources = list(target.get("resources") or [])
+        declared = [resource.get("path") or "" for resource in resources]
+        excluded = target.get("exclude") or []
+        for root in _xcode_swift_package_implicit_resource_roots(target_path, absolute + "/" + relative_target):
+            if not _xcode_path_is_within(root, declared + excluded):
+                resources.append({"path": root, "rule": {"process": {}}})
+                declared.append(root)
+        if len(resources) != len(target.get("resources") or []):
+            target = dict(target)
+            target["resources"] = resources
+            changed = True
+        targets.append(target)
+    if not changed:
+        return info
+    info = dict(info)
+    info["targets"] = targets
+    return info
+
 def _xcode_swift_package_info(ctx, package_dir, identity = "", cache = None):
     # `swift package dump-package` starts Swift and reparses the whole
     # manifest for every call, and a typical Xcode workspace passes the same
@@ -2493,6 +2561,7 @@ def _xcode_swift_package_info(ctx, package_dir, identity = "", cache = None):
             targets.append(target)
         info = dict(info)
         info["targets"] = targets
+    info = _xcode_swift_package_with_implicit_resources(package_dir, absolute, info)
     if cache != None:
         cache[absolute] = {"info": info}
     return {

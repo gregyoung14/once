@@ -18386,3 +18386,66 @@ result = repr([
         r#"[True, ["./Feature"]]"#
     );
 }
+
+#[test]
+fn prelude_xcode_swift_package_info_adds_undeclared_resource_types() {
+    let source = format!(
+        r#"{}
+def host_which(name):
+    return name
+
+def host_command(argv, env = None, cwd = None, merge_stderr = None, check = None, max_output_bytes = None):
+    return "\n".join([
+        "/ws/.once/pkg/Sources/Feature/Assets.xcassets",
+        "/ws/.once/pkg/Sources/Feature/Declared/Icons.xcassets",
+        "/ws/.once/pkg/Sources/Feature/Old/Legacy.xib",
+    ])
+
+def glob(patterns):
+    return [
+        "Local/Sources/Feature/Model.xcdatamodeld/Model.xcdatamodel/contents",
+        "Local/Sources/Feature/Views/Card.xib",
+        "Local/Sources/Feature/Feature.swift",
+    ]
+
+def info():
+    return {{"targets": [
+        {{"name": "Feature", "type": "regular", "resources": [{{"path": "Declared", "rule": {{"process": {{}}}}}}], "exclude": ["Old"]}},
+        {{"name": "Macros", "type": "macro"}},
+    ]}}
+
+remote = _xcode_swift_package_with_implicit_resources(".once/pkg", "/ws/.once/pkg", info())
+local = _xcode_swift_package_with_implicit_resources("Local", "/ws/Local", info())
+result = repr([[target.get("resources") for target in package["targets"]] for package in [remote, local]])
+"#,
+        xcode_prelude_source()
+    );
+
+    assert_eq!(
+        eval_prelude_source_to_repr(source).unwrap(),
+        r#"[[[{"path": "Declared", "rule": {"process": {}}}, {"path": "Assets.xcassets", "rule": {"process": {}}}], None], [[{"path": "Declared", "rule": {"process": {}}}, {"path": "Model.xcdatamodeld", "rule": {"process": {}}}, {"path": "Views/Card.xib", "rule": {"process": {}}}], None]]"#
+    );
+}
+
+#[test]
+fn prelude_apple_asset_catalog_root_finds_the_enclosing_catalog() {
+    let prelude = apple_prelude_source();
+    let root = |path: &str| {
+        eval_prelude_function_in(
+            &prelude,
+            "_apple_asset_catalog_root",
+            &format!(r#"("{path}")"#),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        root("Pkg/Resources/Images.xcassets/Logo.imageset/Contents.json"),
+        r#""Pkg/Resources/Images.xcassets""#
+    );
+    assert_eq!(
+        root("Pkg/Resources/Images.xcassets"),
+        r#""Pkg/Resources/Images.xcassets""#
+    );
+    assert_eq!(root("Pkg/Resources/strings.json"), r#""""#);
+}
