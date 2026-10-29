@@ -5436,7 +5436,7 @@ def _apple_application_impl(ctx):
                 transitive_generated_headers.append(header)
     if swift_objc_header and swift_objc_header not in transitive_generated_headers:
         transitive_generated_headers.append(swift_objc_header)
-    return {
+    provider = {
         "label_id": ctx["label"]["id"],
         "target_kind": "apple_application",
         "app_path": app_path,
@@ -5461,6 +5461,9 @@ def _apple_application_impl(ctx):
         "transitive_framework_files": dep_framework_files,
         "transitive_vfs_overlays": dep_vfs_overlays,
     }
+    if ctx["capability"] == "artifact":
+        return _apple_export_artifact(ctx, provider, info_plist, minimum_os, arch)
+    return provider
 
 def _apple_thinning_application(deps, label_id):
     if len(deps) != 1:
@@ -7726,10 +7729,11 @@ apple_application = target_kind(
     deps = [
         dep("deps", ["apple_linkable", "apple_framework", "apple_resource", "apple_application", "apple_swift_plugin", "native_linkable"], "Libraries, frameworks, resources, application extensions, native linkables, and Swift compiler plugins embedded in the app"),
     ],
-    providers = ["apple_application", "apple_bundle"],
+    providers = ["apple_application", "apple_bundle", "once_artifact_info"],
     capabilities = [
         capability("build", ["default", "bundle", "dsyms"]),
         capability("run", ["default"], ["bundle"]),
+        capability("artifact", ["default", "artifact"]),
     ],
     examples = [
         example(

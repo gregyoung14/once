@@ -289,9 +289,13 @@ fn prelude_globals(builder: &mut GlobalsBuilder) {
             return Ok(String::new());
         }
         observe_host_path(Path::new(path))?;
-        let target = std::fs::read_link(path)
-            .map(|target| target.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let target = match std::fs::read_link(path) {
+            Ok(target) => target
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow!("host symbolic link `{path}` has a non-UTF-8 target"))?,
+            Err(_) => String::new(),
+        };
         observe(Observation::SymlinkTarget {
             path: path.to_string(),
             target: target.clone(),
@@ -1115,7 +1119,7 @@ fn prelude_globals(builder: &mut GlobalsBuilder) {
         }
         let entries = unpack_archive_entries(entries)?;
         let format = parse_archive_format(format.as_deref())?;
-        if uncompressed_sha256_output.is_some() && format == DeclaredArchiveFormat::Tar {
+        if uncompressed_sha256_output.is_some() && format != DeclaredArchiveFormat::TarGz {
             anyhow::bail!(
                 "`write_archive.uncompressed_sha256_output` requires `format = \"tar.gz\"`"
             );
@@ -1515,8 +1519,9 @@ fn parse_archive_format(format: Option<&str>) -> Result<DeclaredArchiveFormat> {
     match format.unwrap_or("tar") {
         "tar" => Ok(DeclaredArchiveFormat::Tar),
         "tar.gz" => Ok(DeclaredArchiveFormat::TarGz),
+        "zip" => Ok(DeclaredArchiveFormat::Zip),
         other => Err(anyhow!(
-            "expected `write_archive.format` to be `tar` or `tar.gz`, got `{other}`"
+            "expected `write_archive.format` to be `tar`, `tar.gz` or `zip`, got `{other}`"
         )),
     }
 }
@@ -2099,12 +2104,10 @@ pub(super) fn first_stale_observation(
 /// Replay a recorded answer about one host file's size or link destination.
 fn file_attribute_holds(observation: &Observation) -> bool {
     match observation {
-        Observation::SymlinkTarget { path, target } => {
-            std::fs::read_link(path)
-                .map(|actual| actual.to_string_lossy().into_owned())
-                .unwrap_or_default()
-                == *target
-        }
+        Observation::SymlinkTarget { path, target } => match std::fs::read_link(path) {
+            Ok(actual) => actual.to_str().is_some_and(|actual| actual == target),
+            Err(_) => target.is_empty(),
+        },
         Observation::FileSize { path, bytes } => std::fs::metadata(path)
             .is_ok_and(|metadata| i64::try_from(metadata.len()).ok().as_ref() == Some(bytes)),
         Observation::FileExists { path, exists } => Path::new(path).is_file() == *exists,

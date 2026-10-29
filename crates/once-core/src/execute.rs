@@ -1210,7 +1210,7 @@ fn reject_overlapping_host_tree_paths(source: &Path, destination: &Path) -> Resu
 /// Canonicalize the longest existing prefix of `path` (resolving any symlinks
 /// there) and re-append the not-yet-created remainder lexically, so a
 /// destination that does not exist on disk can still be compared safely.
-fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     loop {

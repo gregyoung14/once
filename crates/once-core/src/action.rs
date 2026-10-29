@@ -292,6 +292,7 @@ pub enum ArchiveFormat {
     /// Tar compressed as a gzip stream with a fixed header, so identical
     /// entries compress to identical bytes on every machine.
     TarGz,
+    Zip,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

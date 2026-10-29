@@ -1,0 +1,1 @@
+Arbitrary artifacts do not need an executable interface.

@@ -22,6 +22,7 @@ use once_core::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod artifacts;
 mod script;
 mod tools;
 mod verification;
@@ -339,6 +340,9 @@ impl Server {
             "once_run_trigger" => self.tool_run_trigger(&call.arguments),
             "once_query_targets" => self.tool_query_targets(&call.arguments),
             "once_query_capabilities" => self.tool_query_capabilities(&call.arguments),
+            "once_query_artifacts" => self.tool_query_artifacts(&call.arguments),
+            "once_export_artifacts" => self.tool_artifacts(&call.arguments, false),
+            "once_publish_artifacts" => self.tool_artifacts(&call.arguments, true),
             "once_get_target" => self.tool_get_target(&call.arguments),
             "once_query_tests" => self.tool_query_tests(),
             "once_query_affected_tests" => self.tool_query_affected_tests(&call.arguments),
@@ -1797,6 +1801,7 @@ demo_kind = target_kind(
         assert_eq!(
             names,
             vec![
+                "once_query_artifacts".to_string(),
                 "once_query_workspace".to_string(),
                 "once_list_triggers".to_string(),
                 "once_validate_trigger".to_string(),
@@ -2102,6 +2107,8 @@ script_runtime = "sh"
         let tmp = TempDir::new().unwrap();
         for tool in [
             "once_build_target",
+            "once_export_artifacts",
+            "once_publish_artifacts",
             "once_lint_target",
             "once_run_target",
             "once_start_target",

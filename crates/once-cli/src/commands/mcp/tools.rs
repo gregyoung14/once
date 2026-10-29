@@ -36,6 +36,8 @@ pub(super) fn tool_requires_allow_run(name: &str) -> bool {
         "once_run_tests"
             | "once_exec_script"
             | "once_build_target"
+            | "once_export_artifacts"
+            | "once_publish_artifacts"
             | "once_lint_target"
             | "once_validate_actions"
             | "once_run_target"
@@ -85,7 +87,7 @@ fn tool_annotations(name: &str) -> Value {
         "readOnlyHint": read_only,
         "destructiveHint": destructive,
         "idempotentHint": idempotent,
-        "openWorldHint": name == "once_fetch_external_source",
+        "openWorldHint": matches!(name, "once_fetch_external_source" | "once_publish_artifacts"),
     })
 }
 
@@ -108,6 +110,27 @@ pub struct ToolDefinition {
 #[allow(clippy::too_many_lines)]
 pub fn tool_catalog() -> Vec<ToolDefinition> {
     vec![
+        ToolDefinition {
+            name: "once_query_artifacts",
+            description: "Inspect a target's portable artifact export contract without building.",
+            long_description: "Matches `once query artifacts <target>`. Returns capability support, provider declaration shape, metadata bounds, and publication commands. Unknown versioned interfaces are preserved as data, never executed automatically.",
+            input_schema: json!({"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}),
+            example_return: r#"{"schema":"once.artifact_contract.v1","target":"site","supported":true}"#,
+        },
+        ToolDefinition {
+            name: "once_export_artifacts",
+            description: "Build and export a self-contained content-addressed artifact set.",
+            long_description: "Requires `once mcp --allow-run`. Matches `once artifact export <target>`. Packages declared outputs using bounded streaming copies. Does not publish remotely or start compute. The output option selects the parent directory; the package directory is named by immutable root digest. config accepts KEY=VALUE configuration overrides.",
+            input_schema: json!({"type": "object", "properties": {"target": {"type": "string"}, "output": {"type": "string"}, "config": {"type": "array", "items": {"type": "string"}}}, "required": ["target"]}),
+            example_return: r#"{"schema":"once.artifact_export.v1","directory":"/work/project/.once/artifacts/<digest>"}"#,
+        },
+        ToolDefinition {
+            name: "once_publish_artifacts",
+            description: "Explicitly publish exported artifacts through named infrastructure.",
+            long_description: "Requires `once mcp --allow-run` and authorization to publish to the selected infrastructure. Matches `once artifact publish <target>`. Defaults to [infrastructure.artifacts]; provider overrides its name. local retains arbitrary artifact types. Tuist currently accepts only one dev.tuist.preview.v1 artifact through its legacy preview API, without atomic set publication or idempotent retries. A cache hit never skips publication. Publishing does not start preview compute. config accepts KEY=VALUE overrides; track is publication context, not content identity.",
+            input_schema: json!({"type": "object", "properties": {"target": {"type": "string"}, "provider": {"type": "string"}, "track": {"type": "string"}, "config": {"type": "array", "items": {"type": "string"}}}, "required": ["target"]}),
+            example_return: r#"{"schema":"once.artifact_publication.v1","provider":"local","target":"site","url":"file:///work/project/.once/artifacts/<digest>/"}"#,
+        },
         ToolDefinition {
             name: "once_query_workspace",
             description: "Return the configured workspace root, root manifest state, graph loading state, and next calls.",

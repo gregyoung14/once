@@ -16,6 +16,14 @@ application imports directly. Once links the direct dynamic boundary, embeds
 its complete framework closure, removes duplicate paths, signs every embedded
 framework, and then signs the application.
 
+The `artifact` capability packages the completed application as a ZIP without
+publishing it during ordinary builds. On macOS it also exports native preview
+metadata for [Tuist publication](/guide/infrastructure/artifacts#publish-an-application-to-tuist).
+The provider adds `once_artifact_info`; its interfaces describe the bundle,
+platform, SDK variant, bundle identifier and minimum operating system.
+Packaging records declared executable permissions and preserves symlinks.
+Device signing and provisioning remain the producer's responsibility.
+
 macOS applications use the native `Contents` layout: executables in
 `Contents/MacOS`, resources and dependency resource bundles in
 `Contents/Resources`, and frameworks in `Contents/Frameworks`. The linker

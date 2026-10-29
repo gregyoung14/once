@@ -161,6 +161,7 @@ defmodule OnceSiteWeb.Docs.Sidebar do
             label: "Become a Provider",
             slug: "/docs/guide/infrastructure/providers"
           },
+          %Item{label: "Artifacts and Previews", slug: "/docs/guide/infrastructure/artifacts"},
           %Item{label: "Connect A Project", slug: "/docs/guide/infrastructure/connect"},
           %Item{label: "Remote Execution", slug: "/docs/guide/infrastructure/remote-execution"},
           %Item{label: "Triggers (Experimental)", slug: "/docs/guide/infrastructure/triggers"},
@@ -232,6 +233,7 @@ defmodule OnceSiteWeb.Docs.Sidebar do
         label: "Commands",
         items: [
           %Item{label: "Overview", slug: "/docs/reference/cli"},
+          %Item{label: "artifact", slug: "/docs/reference/cli/artifact"},
           %Item{label: "auth", slug: "/docs/reference/cli/auth"},
           %Item{label: "build", slug: "/docs/reference/cli/build"},
           %Item{label: "cache", slug: "/docs/reference/cli/cache"},
@@ -262,7 +264,7 @@ defmodule OnceSiteWeb.Docs.Sidebar do
                 apple_executable apple_resource_bundle apple_thinned_package apple_test_bundle
                 apple_xcframework_import swift_package_workspace swift_package_dependencies swift_package_pin)
               ),
-              target_group("Core", ~w(archive_download script)),
+              target_group("Core", ~w(archive_download artifact script)),
               target_group("Containers", ~w(dockerfile_image oci_layer oci_image oci_index
                 oci_pull oci_import oci_load oci_push)),
               target_group("Shell", ~w(shellspec_test)),

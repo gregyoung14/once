@@ -295,6 +295,11 @@ pub fn load_infrastructure_toml_str(
         .execution
         .map(|raw| raw.into_config(path, "infrastructure.execution"))
         .transpose()?;
+    let artifacts = manifest
+        .infrastructure
+        .artifacts
+        .map(|raw| raw.into_config(path, "infrastructure.artifacts"))
+        .transpose()?;
     let providers = manifest
         .infrastructures
         .into_iter()
@@ -307,6 +312,7 @@ pub fn load_infrastructure_toml_str(
     Ok(crate::cache_provider::InfrastructureConfig {
         cache,
         execution,
+        artifacts,
         providers,
     })
 }

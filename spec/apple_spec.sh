@@ -278,7 +278,7 @@ SH
     The status should be success
     The stdout should include 'apps/ios/AppCore (apple_library) [build]'
     The stdout should include 'apps/ios/DesignSystem (apple_framework) [build]'
-    The stdout should include 'apps/ios/App (apple_application) [build, run]'
+    The stdout should include 'apps/ios/App (apple_application) [build, run, artifact]'
     The stdout should include 'apps/ios/AppTests (apple_test_bundle) [build, test]'
   End
 
@@ -292,6 +292,7 @@ SH
     The stdout should include '"output_groups":["default","bundle","dsyms"]'
     The stdout should include '"name":"run"'
     The stdout should include '"requires_outputs":["bundle"]'
+    The stdout should include '"name":"artifact"'
   End
 
   It 'builds Apple application artifacts through the graph command'

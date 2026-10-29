@@ -128,7 +128,9 @@ discovery.
 - `docs`: short human-readable target kind description.
 - `attrs`: `attr(...)` declarations. Supported types include `string`,
   `bool`, `int`, `float`, `list<string>`, `map<string, string>`,
-  `target`, and nested values used by `select`.
+  `target`, `any`, and nested values used by `select`. Use `any` for
+  contract-owned structured data, including nested `map<string, any>` values;
+  the contract owner must validate its semantics.
 - `deps`: `dep(...)` declarations that name expected providers.
 - `providers`: provider names this target kind can return.
 - `capabilities`: command surfaces this target kind supports, such as
@@ -645,7 +647,8 @@ separate update workflow.
   command under the same limit.
 - `host_symlink_target(path)` returns where a host symbolic link points, as
   written, or an empty string when the path is not a link. A planner uses it to
-  declare the files a linked input depends on.
+  declare the files a linked input depends on. Non-UTF-8 link targets are
+  rejected rather than converted to different paths.
 - `host_file_size(path)` returns the size in bytes of a host file, which a
   deferred planner uses to describe an artifact produced by an earlier action.
 - `host_file_exists(path)` checks whether a host path is currently a
@@ -741,6 +744,13 @@ Built-in history currently covers Rust compilation/build scripts/test-runner com
   that carries no timestamp, name, or operating system, so identical entries
   produce identical bytes on every machine; `sha256_output` then digests the
   compressed bytes and `uncompressed_sha256_output` digests the tar inside.
+  With `format = "zip"`, entries use fixed ZIP timestamps, declared UNIX
+  permissions and symlink targets. ZIP64 supports individual files larger
+  than 4 GiB. ZIP does not preserve numeric ownership or entry modification
+  times. `sha256_output` digests the ZIP bytes; `uncompressed_sha256_output`
+  is supported only for `tar.gz`. Archive and digest outputs must not overlap
+  any source file, source tree, or each other, including through aliases.
+  Output files must not be symbolic links.
 - `download_and_extract(url, sha256, destination, authorization_env = None)`
   streams a checksum-pinned [ZIP archive](https://www.loc.gov/preservation/digital/formats/fdd/fdd000354.shtml)
   into a declared directory output. An optional environment-variable name
@@ -1476,6 +1486,47 @@ other kind.
 Provider records are the cross-target kind contract. Prefer small, typed,
 documented fields such as output paths, transitive inputs, flags, and
 metadata. Avoid making consumers branch on a dependency target kind.
+
+### Artifact providers
+
+Expose `capability("artifact", ["default", "artifact"])` and declare the
+`once_artifact_info` provider to support export and publication. Return:
+
+```python
+{
+    "artifact_info": {
+        "schema": "once.artifact_info.v1",
+        "artifacts": [{
+            "name": "product",
+            "payloads": {"content": {"path": output, "media_type": "application/zip"}},
+            "interfaces": {},
+            "selectors": {"os": "linux", "arch": "aarch64"},
+        }],
+    },
+}
+```
+
+Each payload must be an exact declared output file inside the workspace,
+including after symlink resolution. Package directories with `write_archive`.
+Artifact and payload names use 1 to 128 ASCII letters, digits, dots,
+underscores or hyphens. A provider exports 1 to 128 artifacts, each with 1 to
+128 payloads and at most 32 interfaces and 32 selectors. Provider metadata
+and each exported metadata document are limited to one mebibyte.
+
+The built-in `artifact` and `apple_application` kinds export one member named
+`product`. Native target names do not become restricted artifact identifiers.
+
+Interfaces map namespaced versioned identifiers to
+`{"payload": "content", "spec": {...}}`. The payload must exist. Unknown
+interfaces are retained without executing anything. The producer validates
+contract semantics, including runtime closure and platform compatibility.
+Selectors are explicit variant facts, not inferred from names or workers.
+
+Declare packaging actions only for `ctx["capability"] == "artifact"` when
+ordinary builds should not create distributable packages. Publication runs
+outside the cached action graph, including when packaging is a cache hit.
+See [Artifacts and previews](/guide/infrastructure/artifacts) for content
+identity, consumer responsibilities, configuration and adapter limits.
 
 Use `toolchain_identity` for tool versions, resolved compiler paths, platform
 tool selection, generated file contents, and other non-source inputs that

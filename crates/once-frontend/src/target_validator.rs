@@ -430,6 +430,7 @@ fn check_type(value: &JsonValue, ty: &str) -> Result<(), String> {
         return Ok(());
     }
     match ty {
+        "any" => Ok(()),
         "string" | "target" => match value {
             JsonValue::String(_) => Ok(()),
             _ => Err(format!("expected a string, got {}", json_type(value))),

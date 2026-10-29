@@ -39,6 +39,7 @@ These tables are read only from the root manifest:
 | `[infrastructures.<name>]` | Declares a named infrastructure provider. |
 | `[infrastructure.cache]` | Chooses the shared cache provider. |
 | `[infrastructure.execution]` | Chooses the remote execution provider. |
+| `[infrastructure.artifacts]` | Chooses the artifact publication provider. |
 
 Package manifests that declare `[modules]` are rejected. Keep shared module
 and infrastructure configuration at the workspace root so every package sees

@@ -93,6 +93,24 @@ result = repr([
 }
 
 #[test]
+fn apple_artifact_contract_uses_consumer_platforms_and_stable_member_names() {
+    assert_eq!(
+        evaluate(
+            r#"
+def host_os():
+    return "linux"
+def artifact(platform, variant):
+    provider = {"platform": platform, "sdk_variant": variant, "product_name": "App", "app_path": "out/App.app", "app_files": [], "bundle_id": "dev.example.App"}
+    result = _apple_export_artifact({"label": {"id": "Ice Cubes", "name": "Ice Cubes"}}, provider, "out/Info.plist", "2.0", "arm64")["artifact_info"]["artifacts"][0]
+    return [result["name"], result["selectors"], result["interfaces"]["dev.once.apple-install.v1"]["spec"]["platform"]]
+result = repr([artifact("xros", "simulator"), artifact("visionos", "device"), artifact("macosx", "simulator"), artifact("ios", "simulator")])
+"#
+        ),
+        r#"[["product", {"platform": "visionos", "sdk_variant": "simulator", "architecture": "arm64"}, "visionos"], ["product", {"platform": "visionos", "sdk_variant": "device", "architecture": "arm64"}, "visionos"], ["product", {"platform": "macos", "sdk_variant": "device", "architecture": "arm64"}, "macos"], ["product", {"platform": "ios", "sdk_variant": "simulator", "architecture": "arm64"}, "ios"]]"#
+    );
+}
+
+#[test]
 fn go_pure_off_means_cgo_is_enabled() {
     assert_eq!(
         evaluate(

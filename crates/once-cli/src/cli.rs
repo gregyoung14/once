@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use once_core::{LintSeverity, NetworkPolicy, SandboxMode, WorkspacePath};
 
+mod artifact;
 mod auth;
 mod cache;
 mod edit;
@@ -13,6 +14,7 @@ mod query;
 mod runtime;
 mod toolchain;
 
+pub use artifact::ArtifactCmd;
 pub use auth::AuthCmd;
 pub(crate) use cache::OutputDigest;
 pub use cache::{CacheActionCmd, CacheBlobCmd, CacheCmd};
@@ -293,6 +295,12 @@ pub enum Cmd {
         /// Target id, such as `services/api/Api` or `./Api`. Omit it to
         /// build every workspace-owned build target discovered in the graph.
         target: Option<String>,
+    },
+
+    /// Export and publish immutable build artifacts without starting preview compute.
+    Artifact {
+        #[usage(subcommand)]
+        cmd: Option<ArtifactCmd>,
     },
 
     /// Run static analysis for a declared target.
@@ -867,6 +875,7 @@ impl Cli {
                 cmd: Some(CacheCmd::Action { cmd: None }),
             } => Some(&["cache", "action"]),
             Cmd::Auth { cmd: None } => Some(&["auth"]),
+            Cmd::Artifact { cmd: None } => Some(&["artifact"]),
             Cmd::Toolchain { cmd: None } => Some(&["toolchain"]),
             Cmd::Query {
                 expression: None,
@@ -898,6 +907,13 @@ impl Cmd {
     pub fn surface_path(&self) -> Vec<&'static str> {
         match self {
             Self::Build { .. } => vec!["build"],
+            Self::Artifact { cmd } => {
+                let mut path = vec!["artifact"];
+                if let Some(cmd) = cmd {
+                    path.extend(cmd.surface_path());
+                }
+                path
+            }
             Self::Lint { .. } => vec!["lint"],
             Self::Run { .. } => vec!["run"],
             Self::Exec { .. } => vec!["exec"],

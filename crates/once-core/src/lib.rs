@@ -6,6 +6,7 @@
 //! buffered.
 
 mod action;
+pub mod artifacts;
 pub use once_presentation::ActionHistoryKey;
 mod archive;
 mod contract;
