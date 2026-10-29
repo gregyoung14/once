@@ -16,7 +16,7 @@ top-to-bottom cache integration guide.
   E2B, and Daytona.
 - **[Artifacts](/guide/infrastructure/artifacts):** retain immutable build
   products for distribution. Local publication accepts arbitrary payloads;
-  the Tuist compatibility adapter accepts supported application previews.
+  see each provider's guide for supported formats and publication limits.
 
 Once owns graph analysis, dependency ordering, action identity, and cache
 policy. Providers do not need to interpret target kinds or implement the

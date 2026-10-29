@@ -297,7 +297,7 @@ pub enum Cmd {
         target: Option<String>,
     },
 
-    /// Export and publish immutable build artifacts without starting preview compute.
+    /// Export and publish immutable build artifacts.
     Artifact {
         #[usage(subcommand)]
         cmd: Option<ArtifactCmd>,
