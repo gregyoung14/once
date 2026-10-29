@@ -1,4 +1,4 @@
-use super::{eval_prelude_source_to_repr, xcode_prelude_source};
+use super::{eval_prelude_function_in, eval_prelude_source_to_repr, xcode_prelude_source};
 
 /// Swift Package Manager hands the linker every object file a target
 /// produced, so a file whose only contribution is a protocol conformance
@@ -116,4 +116,40 @@ result = repr([
         result,
         r#"[["./SwiftPackage_appauth-ios_Core", "./SwiftPackage_appauth-ios_Extras", "./SwiftPackage_LocalAlias_Local", "./SwiftPackage_scope.registry_Registered", "./Resolve"], ["./SwiftPackage_LocalAlias_Local_MacroHost", "./SwiftPackage_scope.registry_Registered_MacroHost", "./Resolve"], ["./SwiftPackage_appauth-ios_Core_MacroHost", "./SwiftPackage_appauth-ios_Extras_MacroHost"], ["macos", ["./SwiftPackage_macro-tools_Builder", "./SwiftPackage_appauth-ios_Core_MacroHost", "./SwiftPackage_appauth-ios_Extras_MacroHost"]]]"#
     );
+}
+
+#[test]
+fn prelude_xcode_swift_package_dependencies_resolve_a_declared_package_name() {
+    let prelude = xcode_prelude_source();
+    let call = |aliases: &str| {
+        eval_prelude_function_in(
+            &prelude,
+            "_xcode_swift_package_dependencies",
+            &format!(
+                r#"(
+                    {{"dependencies": [{{"product": ["AppAuth", "AppAuth", None, None]}}]}},
+                    "googlesignin-ios",
+                    {{}},
+                    {{"appauth-ios\x1fAppAuth": "AppAuthTarget"}},
+                    "ios",
+                    [],
+                    {{}},
+                    "",
+                    {aliases},
+                )"#
+            ),
+        )
+        .unwrap()
+    };
+    let aliases = r#"_xcode_swift_package_dependency_aliases({
+        "dependencies": [{
+            "sourceControl": [{
+                "identity": "appauth-ios",
+                "nameForTargetDependencyResolutionOnly": "AppAuth",
+            }],
+        }],
+    })"#;
+
+    assert_eq!(call("{}"), "[]");
+    assert_eq!(call(aliases), r#"["./AppAuthTarget"]"#);
 }

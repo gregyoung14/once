@@ -18386,39 +18386,3 @@ result = repr([
         r#"[True, ["./Feature"]]"#
     );
 }
-
-#[test]
-fn prelude_xcode_swift_package_dependencies_resolve_a_declared_package_name() {
-    let prelude = xcode_prelude_source();
-    let call = |aliases: &str| {
-        eval_prelude_function_in(
-            &prelude,
-            "_xcode_swift_package_dependencies",
-            &format!(
-                r#"(
-                    {{"dependencies": [{{"product": ["AppAuth", "AppAuth", None, None]}}]}},
-                    "googlesignin-ios",
-                    {{}},
-                    {{"appauth-ios\x1fAppAuth": "AppAuthTarget"}},
-                    "ios",
-                    [],
-                    {{}},
-                    "",
-                    {aliases},
-                )"#
-            ),
-        )
-        .unwrap()
-    };
-    let aliases = r#"_xcode_swift_package_dependency_aliases({
-        "dependencies": [{
-            "sourceControl": [{
-                "identity": "appauth-ios",
-                "nameForTargetDependencyResolutionOnly": "AppAuth",
-            }],
-        }],
-    })"#;
-
-    assert_eq!(call("{}"), "[]");
-    assert_eq!(call(aliases), r#"["./AppAuthTarget"]"#);
-}
