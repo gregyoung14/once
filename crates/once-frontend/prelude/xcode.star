@@ -3191,7 +3191,7 @@ def _xcode_swift_package_trait_flags(traits):
         flags.extend(["-D", trait])
     return flags
 
-def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None):
+def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None, debug = None):
     # Lower source package targets as ordinary Apple libraries. Products group
     # one or more targets, so consumers receive the complete product closure.
     target_ids = {}
@@ -3238,7 +3238,9 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
                 host_product_ids[product_name] = host_product_id
 
     specs = []
-    debug_defines = ["DEBUG"] if configuration.lower() == "debug" else []
+    if debug == None:
+        debug = configuration.lower() == "debug"
+    debug_defines = ["DEBUG"] if debug else []
     for package in package_infos:
         identity = package["identity"]
         package_path = package["path"]
@@ -3442,6 +3444,18 @@ def _xcode_digits(text):
             return out
         out = out * 10 + digit
     return out
+
+def _xcode_configuration_is_debug(configuration, settings):
+    # Custom configurations such as `Development` build packages for debugging
+    # when the project configures them that way, not only one named `Debug`.
+    if configuration.lower() == "debug":
+        return True
+    conditions = settings.get("SWIFT_ACTIVE_COMPILATION_CONDITIONS") or []
+    if type(conditions) != "list":
+        conditions = str(conditions).split(" ")
+    if "DEBUG" in conditions:
+        return True
+    return _xcode_scalar(settings.get("SWIFT_OPTIMIZATION_LEVEL")) == "-Onone"
 
 def _xcode_spm_min_os(ctx, objects, native_targets, platform, configuration, project_settings, path_maps):
     key = {
@@ -4816,6 +4830,7 @@ def _xcode_workspace_resolver(ctx):
                 configuration,
                 target_prefix = "XcodePackage_" + _xcode_sanitized_target_name(ctx["label"]["id"]) + suffix,
                 root_identities = _unique([ref["identity"] for ref in package_refs.values()] + [package["identity"] for package in local_package_infos]),
+                debug = _xcode_configuration_is_debug(configuration, project_settings),
             )
 
         # Shared enumeration cache for Xcode 16+ file-system synchronized

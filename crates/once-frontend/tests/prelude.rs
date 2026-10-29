@@ -18322,7 +18322,7 @@ def host_file_exists(path):
 def host_file_read(path):
     return ""
 
-def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {{}}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None):
+def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {{}}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None, debug = None):
     return {{
         "specs": [{{
             "name": "XcodePackage_swift-argument-parser_changelog-authors",
@@ -18384,5 +18384,29 @@ result = repr([
     assert_eq!(
         eval_prelude_source_to_repr(explicit).unwrap(),
         r#"[True, ["./Feature"]]"#
+    );
+}
+
+#[test]
+fn prelude_xcode_configuration_is_debug_reads_project_settings() {
+    let prelude = xcode_prelude_source();
+    let is_debug = |call: &str| {
+        eval_prelude_function_in(&prelude, "_xcode_configuration_is_debug", call).unwrap()
+    };
+
+    assert_eq!(is_debug(r#"("Debug", {})"#), "True");
+    assert_eq!(
+        is_debug(
+            r#"("Development", {"SWIFT_ACTIVE_COMPILATION_CONDITIONS": "DEBUG SWIFT_MOCKING_ENABLED"})"#
+        ),
+        "True"
+    );
+    assert_eq!(
+        is_debug(r#"("Staging", {"SWIFT_OPTIMIZATION_LEVEL": "-Onone"})"#),
+        "True"
+    );
+    assert_eq!(
+        is_debug(r#"("App Store", {"SWIFT_ACTIVE_COMPILATION_CONDITIONS": "RELEASE"})"#),
+        "False"
     );
 }
