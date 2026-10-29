@@ -8436,7 +8436,7 @@ result = repr(provider["test_bundle_path"])
             action
                 .outputs
                 .iter()
-                .any(|output| output.ends_with("Contents/Resources/Fixtures/Nested/fixture.json"))
+                .any(|output| output.ends_with("Contents/Resources/Fixtures"))
         })
         .unwrap_or_else(|| {
             panic!(
@@ -8448,17 +8448,15 @@ result = repr(provider["test_bundle_path"])
                     .collect::<Vec<_>>()
             )
         });
-    assert_eq!(resource.inputs, ["tests/Fixtures/Nested/fixture.json"]);
+    assert_eq!(resource.inputs, ["tests/Fixtures"]);
     assert_eq!(
         resource.outputs,
-        [
-            ".once/out/tests/PluginTests/PluginTests.xctest/Contents/Resources/Fixtures/Nested/fixture.json"
-        ]
+        [".once/out/tests/PluginTests/PluginTests.xctest/Contents/Resources/Fixtures"]
     );
     assert!(codesign
         .inputs
         .iter()
-        .any(|input| input.ends_with("Contents/Resources/Fixtures/Nested/fixture.json")));
+        .any(|input| input.ends_with("Contents/Resources/Fixtures")));
     assert!(action_has_input_suffix(
         codesign,
         "Contents/Frameworks/Support.framework"
@@ -8478,7 +8476,7 @@ result = repr(provider["test_bundle_path"])
     ));
     assert!(action_has_input_suffix(
         runner,
-        "Contents/Resources/Fixtures/Nested/fixture.json"
+        "Contents/Resources/Fixtures"
     ));
     // The XCTest runner is deliberately non-cacheable: a passing test's
     // outcome depends on simulator state, network, and other runtime
