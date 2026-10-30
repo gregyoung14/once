@@ -1999,6 +1999,10 @@ def _xcode_script_path(value, subs):
     path = _xcode_resolve_vars(value or "", subs)
     if not path or path.startswith("$("):
         return ""
+    # Xcode resolves relative script input and output paths against `SRCROOT`.
+    source_root = str(subs.get("SRCROOT") or "")
+    if not path.startswith("/") and source_root.startswith("/"):
+        path = source_root + "/" + path
     return _xcode_workspace_relative(_xcode_normalize_path(path))
 
 def _xcode_shell_phase_paths(phase, paths_key, file_lists_key, subs):
@@ -2754,15 +2758,28 @@ def _xcode_remote_swift_package_info(ctx, identity, pin, url = "", checkout_root
         if not _xcode_host_directory_exists(absolute):
             host_command([host_which("mkdir"), "-p", _parent_dir(absolute)])
             host_command([git, "clone", "--no-checkout", url or pin.get("location") or "", absolute])
-        host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision])
+        _xcode_git_ensure_revision(git, absolute, revision)
         host_command([git, "-C", absolute, "checkout", "--detach", revision])
     else:
         current = host_command([git, "-C", absolute, "rev-parse", "HEAD"]).strip()
         if current != revision:
-            host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision])
+            _xcode_git_ensure_revision(git, absolute, revision)
             host_command([git, "-C", absolute, "checkout", "--detach", revision])
     info = _xcode_swift_package_info(ctx, package_dir, identity, cache = cache)
     return info
+
+def _xcode_git_ensure_revision(git, absolute, revision):
+    # A full clone usually already holds the pinned commit. Otherwise prefer a
+    # shallow fetch, but some hosts (Buf's generated-SDK Git endpoints, for
+    # example) reject shallow clients, so fall back to an ordinary fetch.
+    # Host commands are memoized by argv, so each presence check uses a
+    # distinct form.
+    if host_command([git, "-C", absolute, "cat-file", "-t", revision + "^{commit}"], check = False).strip() == "commit":
+        return
+    host_command([git, "-C", absolute, "fetch", "--depth", "1", "origin", revision], check = False)
+    if host_command([git, "-C", absolute, "rev-parse", "--verify", "--quiet", revision + "^{commit}"], check = False).strip():
+        return
+    host_command([git, "-C", absolute, "fetch", "origin", revision])
 
 def _xcode_package_resolved_pins_at(package_path):
     if not package_path:
@@ -3081,7 +3098,7 @@ def _xcode_package_condition_allows(condition, platform, enabled_traits = []):
     traits = (condition or {}).get("traits") or []
     return not traits or any([trait in enabled_traits for trait in traits])
 
-def _xcode_swift_package_dependencies(target, identity, target_ids, product_ids, platform, enabled_traits = [], lazy_products = {}, lazy_dependency = ""):
+def _xcode_swift_package_dependencies(target, identity, target_ids, product_ids, platform, enabled_traits = [], lazy_products = {}, lazy_dependency = "", package_aliases = {}):
     deps = []
     for dependency in target.get("dependencies") or []:
         for key in ["byName", "product", "target"]:
@@ -3099,6 +3116,10 @@ def _xcode_swift_package_dependencies(target, identity, target_ids, product_ids,
                 package_identity = values[1]
             name = values[0]
             product_targets = product_ids.get(package_identity + "\x1f" + name) or product_ids.get(package_identity.lower() + "\x1f" + name)
+            alias = package_aliases.get(package_identity.lower()) if key == "product" else None
+            if not product_targets and alias:
+                package_identity = alias
+                product_targets = product_ids.get(alias + "\x1f" + name) or product_ids.get(alias.lower() + "\x1f" + name)
             if key == "product":
                 dependency_ids = product_targets
                 if len(values) < 2 or not values[1]:
@@ -3117,8 +3138,21 @@ def _xcode_swift_package_dependencies(target, identity, target_ids, product_ids,
                 deps.append("./" + lazy_dependency)
     return deps
 
-def _xcode_swift_package_depends_on_macro(target, identity, target_ids, product_ids, platform, macro_target_ids, enabled_traits = [], lazy_products = {}, lazy_dependency = ""):
-    for dependency in _xcode_swift_package_dependencies(target, identity, target_ids, product_ids, platform, enabled_traits, lazy_products, lazy_dependency):
+def _xcode_swift_package_dependency_aliases(info):
+    # `.package(name:url:)` lets a target name a remote dependency by something
+    # other than its identity, as in `.product(name: "AppAuth", package: "AppAuth")`
+    # for `AppAuth-iOS`.
+    aliases = {}
+    for dependency in info.get("dependencies") or []:
+        for entry in dependency.get("sourceControl") or []:
+            name = entry.get("nameForTargetDependencyResolutionOnly") or ""
+            identity = entry.get("identity") or ""
+            if name and identity and name.lower() != identity.lower():
+                aliases[name.lower()] = identity
+    return aliases
+
+def _xcode_swift_package_depends_on_macro(target, identity, target_ids, product_ids, platform, macro_target_ids, enabled_traits = [], lazy_products = {}, lazy_dependency = "", package_aliases = {}):
+    for dependency in _xcode_swift_package_dependencies(target, identity, target_ids, product_ids, platform, enabled_traits, lazy_products, lazy_dependency, package_aliases):
         if macro_target_ids.get(dependency[2:]):
             return True
     return False
@@ -3166,13 +3200,16 @@ def _xcode_swift_package_name_flags(package):
         return []
     return ["-package-name", package["info"].get("name") or package["identity"]]
 
-def _xcode_swift_package_target_flags(target, platform, default_language_mode, enabled_traits = []):
+def _xcode_swift_package_target_flags(target, platform, default_language_mode, enabled_traits = [], configuration = "debug"):
     swift_flags = []
     clang_flags = []
     header_search_paths = []
     swift_language_mode = default_language_mode
     for setting in target.get("settings") or []:
-        if not _xcode_package_condition_allows(setting.get("condition") or {}, platform, enabled_traits):
+        condition = setting.get("condition") or {}
+        if condition.get("config") and condition["config"] != configuration:
+            continue
+        if not _xcode_package_condition_allows(condition, platform, enabled_traits):
             continue
         kind = setting.get("kind") or {}
         flags = (kind.get("unsafeFlags") or {}).get("_0") or []
@@ -3266,6 +3303,11 @@ def _xcode_swift_package_trait_flags(traits):
         flags.extend(["-D", trait])
     return flags
 
+def _xcode_swift_package_configuration(configuration):
+    # Match Swift Build's BuildParameters.packageConfigurationOverride.
+    name = configuration.lower()
+    return "debug" if "debug" in name or "development" in name else "release"
+
 def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None):
     # Lower source package targets as ordinary Apple libraries. Products group
     # one or more targets, so consumers receive the complete product closure.
@@ -3313,11 +3355,13 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
                 host_product_ids[product_name] = host_product_id
 
     specs = []
-    debug_defines = ["DEBUG"] if configuration.lower() == "debug" else []
+    package_configuration = _xcode_swift_package_configuration(configuration)
+    debug_defines = ["DEBUG"] if package_configuration == "debug" else []
     for package in package_infos:
         identity = package["identity"]
         package_path = package["path"]
         package_traits = resolved_traits[identity.lower()]
+        package_aliases = _xcode_swift_package_dependency_aliases(package["info"])
         package_minimum_os = _xcode_swift_package_minimum_os(package, platform, minimum_os)
         package_host_minimum_os = _xcode_swift_package_minimum_os(package, "macos", "13.0")
         for target in package["info"].get("targets") or []:
@@ -3330,7 +3374,7 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
                 modulemap = _xcode_swift_package_system_modulemap(package_path, target)
                 if not modulemap:
                     fail("Swift package system target `" + identity + "/" + name + "` has no module.modulemap")
-                dependencies = _xcode_swift_package_dependencies(target, identity, target_ids, product_ids, platform, package_traits, lazy_products, lazy_dependency)
+                dependencies = _xcode_swift_package_dependencies(target, identity, target_ids, product_ids, platform, package_traits, lazy_products, lazy_dependency, package_aliases)
                 headers = _xcode_swift_package_system_module_headers(package_path, target)
                 specs.append({
                     "name": target_id,
@@ -3382,8 +3426,8 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
             uses_swift_testing = any(["import Testing" in host_file_read(_xcode_abs(source)) for source in sources if source.endswith(".swift")])
             uses_xctest = any(["import XCTest" in host_file_read(_xcode_abs(source)) for source in sources if source.endswith(".swift")])
             if target_type == "macro":
-                flags = _xcode_swift_package_target_flags(target, "macos", default_language_mode, package_traits)
-                dependencies = _xcode_swift_package_dependencies(target, identity, host_target_ids, host_product_ids, "macos", package_traits, lazy_products, lazy_dependency)
+                flags = _xcode_swift_package_target_flags(target, "macos", default_language_mode, package_traits, package_configuration)
+                dependencies = _xcode_swift_package_dependencies(target, identity, host_target_ids, host_product_ids, "macos", package_traits, lazy_products, lazy_dependency, package_aliases)
                 specs.append({
                     "name": target_id,
                     "kind": "swift_macro",
@@ -3412,6 +3456,7 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
                 package_traits,
                 lazy_products,
                 lazy_dependency,
+                package_aliases,
             )
             variants = [{
                 "id": target_id,
@@ -3433,14 +3478,14 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
             for variant in variants:
                 variant_id = variant["id"]
                 variant_platform = variant["platform"]
-                flags = _xcode_swift_package_target_flags(target, variant_platform, default_language_mode, package_traits)
+                flags = _xcode_swift_package_target_flags(target, variant_platform, default_language_mode, package_traits, package_configuration)
                 prebuild_actions = []
                 core_data = _xcode_datamodel_sources(ctx, _xcode_swift_package_target_datamodels(package_path, target), name, "", variant_id)
                 prebuild_actions.extend(core_data["actions"])
                 resource_accessor = _xcode_swift_package_resource_accessor(package, target, variant_id, any([source.endswith(".swift") for source in sources]), target_type == "test")
                 if resource_accessor:
                     prebuild_actions.append(resource_accessor)
-                dependencies = _xcode_swift_package_dependencies(target, identity, variant["target_ids"], variant["product_ids"], variant_platform, package_traits, lazy_products, lazy_dependency)
+                dependencies = _xcode_swift_package_dependencies(target, identity, variant["target_ids"], variant["product_ids"], variant_platform, package_traits, lazy_products, lazy_dependency, package_aliases)
                 resource_paths = _xcode_swift_package_resource_paths(package_path, target)
                 structured_resource_paths = _xcode_swift_package_structured_resource_paths(package_path, target)
                 resource_bundle_name = _xcode_swift_package_resource_bundle_name(package, target) if resource_paths else ""
@@ -4578,6 +4623,8 @@ def _xcode_application_attrs(ctx, target, settings, subs, platform, files):
         # error and fails the build.
         if app_icon and _xcode_app_icon_exists(files["asset_catalogs"], app_icon):
             attrs["app_icon"] = app_icon
+        if _xcode_scalar(settings.get("ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS")) == "NO":
+            attrs["asset_symbols"] = False
     if files["resources"]:
         attrs["resources"] = files["resources"]
     if files["structured_resources"]:
