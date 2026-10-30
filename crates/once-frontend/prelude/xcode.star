@@ -3091,13 +3091,16 @@ def _xcode_swift_package_name_flags(package):
         return []
     return ["-package-name", package["info"].get("name") or package["identity"]]
 
-def _xcode_swift_package_target_flags(target, platform, default_language_mode, enabled_traits = []):
+def _xcode_swift_package_target_flags(target, platform, default_language_mode, enabled_traits = [], configuration = "debug"):
     swift_flags = []
     clang_flags = []
     header_search_paths = []
     swift_language_mode = default_language_mode
     for setting in target.get("settings") or []:
-        if not _xcode_package_condition_allows(setting.get("condition") or {}, platform, enabled_traits):
+        condition = setting.get("condition") or {}
+        if condition.get("config") and condition["config"] != configuration:
+            continue
+        if not _xcode_package_condition_allows(condition, platform, enabled_traits):
             continue
         kind = setting.get("kind") or {}
         flags = (kind.get("unsafeFlags") or {}).get("_0") or []
@@ -3191,6 +3194,11 @@ def _xcode_swift_package_trait_flags(traits):
         flags.extend(["-D", trait])
     return flags
 
+def _xcode_swift_package_configuration(configuration):
+    # Match Swift Build's BuildParameters.packageConfigurationOverride.
+    name = configuration.lower()
+    return "debug" if "debug" in name or "development" in name else "release"
+
 def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, sdk_variant, configuration = "Debug", lazy_products = {}, lazy_dependency = "", target_prefix = "SwiftPackage", root_identities = None):
     # Lower source package targets as ordinary Apple libraries. Products group
     # one or more targets, so consumers receive the complete product closure.
@@ -3238,7 +3246,8 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
                 host_product_ids[product_name] = host_product_id
 
     specs = []
-    debug_defines = ["DEBUG"] if configuration.lower() == "debug" else []
+    package_configuration = _xcode_swift_package_configuration(configuration)
+    debug_defines = ["DEBUG"] if package_configuration == "debug" else []
     for package in package_infos:
         identity = package["identity"]
         package_path = package["path"]
@@ -3307,7 +3316,7 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
             uses_swift_testing = any(["import Testing" in host_file_read(_xcode_abs(source)) for source in sources if source.endswith(".swift")])
             uses_xctest = any(["import XCTest" in host_file_read(_xcode_abs(source)) for source in sources if source.endswith(".swift")])
             if target_type == "macro":
-                flags = _xcode_swift_package_target_flags(target, "macos", default_language_mode, package_traits)
+                flags = _xcode_swift_package_target_flags(target, "macos", default_language_mode, package_traits, package_configuration)
                 dependencies = _xcode_swift_package_dependencies(target, identity, host_target_ids, host_product_ids, "macos", package_traits, lazy_products, lazy_dependency)
                 specs.append({
                     "name": target_id,
@@ -3358,7 +3367,7 @@ def _xcode_local_swift_package_specs(ctx, package_infos, platform, minimum_os, s
             for variant in variants:
                 variant_id = variant["id"]
                 variant_platform = variant["platform"]
-                flags = _xcode_swift_package_target_flags(target, variant_platform, default_language_mode, package_traits)
+                flags = _xcode_swift_package_target_flags(target, variant_platform, default_language_mode, package_traits, package_configuration)
                 prebuild_actions = []
                 core_data = _xcode_datamodel_sources(ctx, _xcode_swift_package_target_datamodels(package_path, target), name, "", variant_id)
                 prebuild_actions.extend(core_data["actions"])
