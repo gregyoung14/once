@@ -18454,6 +18454,22 @@ result = repr([
 }
 
 #[test]
+fn prelude_apple_module_scan_argv_drops_static_framework_binaries() {
+    let prelude = apple_prelude_source();
+    let out = eval_prelude_function_in(
+        &prelude,
+        "_apple_module_scan_argv",
+        r#"(["swiftc", "-emit-executable", "-F", "out/Kit.xcframework/ios-arm64-simulator", "App.swift", "out/Kit.xcframework/ios-arm64-simulator/Kit.framework/Kit", "out/libCore.a"], "cache")"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        out,
+        r#"["swiftc", "-scan-dependencies", "-wmo", "-F", "out/Kit.xcframework/ios-arm64-simulator", "App.swift", "-disable-bridging-pch", "-module-cache-path", "cache"]"#
+    );
+}
+
+#[test]
 fn prelude_apple_module_input_accepts_sdk_paths_with_parent_segments() {
     let prelude = apple_prelude_source();
     let out = eval_prelude_function_in(
