@@ -84,7 +84,7 @@ fn remote_swift_package_checks_out_pinned_commits_with_real_git() {
         let source = format!(
             r#"{}
 def host_which(name):
-    return {wrapper:?} if name == "git" else "/usr/bin/" + name
+    return {wrapper:?} if name == "git" else name
 
 def _xcode_swift_package_info(ctx, package_dir, identity, cache = None):
     return package_dir
